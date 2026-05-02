@@ -1,0 +1,437 @@
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
+use std::future::poll_fn;
+use std::hash::Hash;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Instant;
+
+use tokio::sync::watch;
+
+use crate::config::CacheConfig;
+use crate::lifecycle::LifecycleReason;
+use crate::policy::{Policy, Weight};
+
+#[derive(Clone)]
+pub(crate) enum FlightMsg<V> {
+    Ok(V),
+    Err(Arc<dyn Any + Send + Sync>),
+}
+
+impl<V: Clone> FlightMsg<V> {
+    pub(crate) fn from_result<E: Send + Sync + 'static>(r: Result<V, E>) -> Self {
+        match r {
+            Ok(v) => FlightMsg::Ok(v),
+            Err(e) => FlightMsg::Err(Arc::new(e)),
+        }
+    }
+
+    pub(crate) fn into_result<E: Clone + Send + Sync + 'static>(self) -> Result<V, E> {
+        match self {
+            FlightMsg::Ok(v) => Ok(v),
+            FlightMsg::Err(arc) => Err(Arc::downcast::<E>(arc)
+                .expect("miss flight error type mismatch")
+                .as_ref()
+                .clone()),
+        }
+    }
+}
+
+pub(crate) struct MissFlight<V> {
+    pub(crate) settle: watch::Sender<Option<FlightMsg<V>>>,
+    pub(crate) _hold: watch::Receiver<Option<FlightMsg<V>>>,
+}
+
+pub(crate) struct Inner<K: 'static, V: 'static> {
+    pub(crate) config: CacheConfig<K, V>,
+    pub(crate) state: Mutex<State<K, V>>,
+}
+
+pub(crate) struct State<K, V> {
+    pub(crate) entries: HashMap<K, MapSlot<V>>,
+    pub(crate) refresh_inflight: HashSet<K>,
+}
+
+pub(crate) enum MapSlot<V> {
+    Ready(CacheEntry<V>),
+    Miss(Arc<MissFlight<V>>),
+}
+
+pub(crate) struct CacheEntry<V> {
+    pub(crate) value: V,
+    pub(crate) written_at: Instant,
+    pub(crate) deadline: Option<Instant>,
+}
+
+impl<K, V> Inner<K, V>
+where
+    K: Eq + Hash + Clone + Send + Sync,
+    V: Clone + Send + Sync,
+{
+    pub(crate) fn new(config: CacheConfig<K, V>) -> Self {
+        Self {
+            config,
+            state: Mutex::new(State {
+                entries: HashMap::new(),
+                refresh_inflight: HashSet::new(),
+            }),
+        }
+    }
+
+    fn recompute_total_weight(&self, st: &State<K, V>) -> u64
+    where
+        K: 'static,
+        V: 'static,
+    {
+        st.entries
+            .iter()
+            .filter_map(|(k, s)| match s {
+                MapSlot::Ready(e) => Some(self.config.policy.weight(k, &e.value).get()),
+                MapSlot::Miss(_) => None,
+            })
+            .sum()
+    }
+
+    pub(crate) fn get_served(&self, key: &K) -> Option<V>
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let now = Instant::now();
+        let mut st = self.state.lock().expect("cache lock");
+        let slot = st.entries.get_mut(key)?;
+        let MapSlot::Ready(e) = slot else {
+            return None;
+        };
+        if !entry_is_served(key, e, self.config.policy.as_ref(), now) {
+            let v = e.value.clone();
+            st.entries.remove(key);
+            drop(st);
+            self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
+            return None;
+        }
+        update_read_deadline(key, e, self.config.policy.as_ref(), now);
+        Some(e.value.clone())
+    }
+
+    pub(crate) fn insert(&self, key: K, value: V) -> Option<V>
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let now = Instant::now();
+        let new_w = self.config.policy.weight(&key, &value).get();
+        let mut st = self.state.lock().expect("cache lock");
+
+        let prev = match st.entries.remove(&key) {
+            Some(MapSlot::Ready(old)) => {
+                self.notify_lifecycle(
+                    LifecycleReason::Updated,
+                    key.clone(),
+                    Some(old.value.clone()),
+                );
+                Some(old.value)
+            }
+            Some(MapSlot::Miss(_)) | None => None,
+        };
+
+        let pending = self.evict_until_fit(&mut st, Weight::new(new_w), &key);
+
+        let deadline = deadline_after_write(self.config.policy.as_ref(), &key, &value, now);
+        st.entries.insert(
+            key,
+            MapSlot::Ready(CacheEntry {
+                value,
+                written_at: now,
+                deadline,
+            }),
+        );
+        drop(st);
+        for (ek, ev) in pending {
+            self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
+        }
+        prev
+    }
+
+    pub(crate) fn remove(&self, key: &K) -> Option<V>
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let mut st = self.state.lock().expect("cache lock");
+        match st.entries.remove(key)? {
+            MapSlot::Ready(e) => {
+                let v = e.value.clone();
+                drop(st);
+                self.notify_lifecycle(LifecycleReason::Removed, key.clone(), Some(v));
+                Some(e.value)
+            }
+            MapSlot::Miss(_) => None,
+        }
+    }
+
+    fn evict_until_fit(&self, st: &mut State<K, V>, add_w: Weight, skip_key: &K) -> Vec<(K, V)>
+    where
+        K: Clone + Eq + Hash + 'static,
+        V: Clone + 'static,
+    {
+        let max = self.config.max_weight.get();
+        let mut pending = Vec::new();
+        while self.recompute_total_weight(st) + add_w.get() > max {
+            let keys: Vec<K> = st
+                .entries
+                .iter()
+                .filter_map(|(k, s)| match s {
+                    MapSlot::Ready(_) => Some(k.clone()),
+                    MapSlot::Miss(_) => None,
+                })
+                .collect();
+            if keys.is_empty() {
+                break;
+            }
+            let victim = keys.iter().position(|k| k != skip_key).unwrap_or(0);
+            let vk = keys[victim].clone();
+            if let Some(MapSlot::Ready(e)) = st.entries.remove(&vk) {
+                pending.push((vk, e.value));
+            } else {
+                break;
+            }
+        }
+        pending
+    }
+
+    fn notify_lifecycle(&self, reason: LifecycleReason, key: K, value: Option<V>)
+    where
+        K: 'static,
+        V: 'static,
+    {
+        if let Some(l) = self.config.lifecycle_listener.as_ref() {
+            l.on_event(reason, key, value);
+        }
+    }
+
+    pub(crate) async fn try_get_with<F, Fut, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<V, E>>,
+        E: Clone + Send + Sync + 'static,
+        K: Eq + Hash + Clone + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        loop {
+            if let Some(v) = self.get_served(&key) {
+                return Ok(v);
+            }
+
+            if let Some(flight) = {
+                let st = self.state.lock().expect("cache lock");
+                match st.entries.get(&key) {
+                    Some(MapSlot::Miss(f)) => Some(Arc::clone(f)),
+                    _ => None,
+                }
+            } {
+                let mut rx = flight.settle.subscribe();
+                loop {
+                    {
+                        let cur = rx.borrow();
+                        if let Some(m) = cur.as_ref() {
+                            return m.clone().into_result::<E>();
+                        }
+                    }
+                    rx.changed().await.expect("miss settle watch");
+                }
+            }
+
+            enum MissStep<V> {
+                Wait(Arc<MissFlight<V>>),
+                Retry,
+                Leader { miss: Arc<MissFlight<V>> },
+            }
+
+            let step = {
+                let mut st = self.state.lock().expect("cache lock");
+                if let Some(MapSlot::Ready(e)) = st.entries.get(&key) {
+                    let now = Instant::now();
+                    if entry_is_served(&key, e, self.config.policy.as_ref(), now) {
+                        return Ok(e.value.clone());
+                    }
+                }
+                match st.entries.get(&key) {
+                    Some(MapSlot::Miss(f)) => MissStep::Wait(Arc::clone(f)),
+                    Some(MapSlot::Ready(_)) => MissStep::Retry,
+                    None => {
+                        let (settle_tx, settle_rx) = watch::channel::<Option<FlightMsg<V>>>(None);
+                        let miss = Arc::new(MissFlight {
+                            settle: settle_tx,
+                            _hold: settle_rx,
+                        });
+                        st.entries
+                            .insert(key.clone(), MapSlot::Miss(Arc::clone(&miss)));
+                        MissStep::Leader { miss }
+                    }
+                }
+            };
+
+            match step {
+                MissStep::Wait(f) => {
+                    let mut rx = f.settle.subscribe();
+                    loop {
+                        {
+                            let cur = rx.borrow();
+                            if let Some(m) = cur.as_ref() {
+                                return m.clone().into_result::<E>();
+                            }
+                        }
+                        rx.changed().await.expect("miss settle watch");
+                    }
+                }
+                MissStep::Retry => continue,
+                MissStep::Leader { miss } => {
+                    let mut first_poll = true;
+                    poll_fn(|cx| {
+                        if first_poll {
+                            first_poll = false;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        }
+                    })
+                    .await;
+                    let fut = init();
+                    let res = fut.await;
+                    let mut st = self.state.lock().expect("cache lock");
+                    st.entries.remove(&key);
+                    let _ = miss.settle.send(Some(FlightMsg::from_result(res.clone())));
+
+                    match &res {
+                        Ok(v) => {
+                            let now = Instant::now();
+                            let deadline =
+                                deadline_after_write(self.config.policy.as_ref(), &key, v, now);
+                            let pending = self.evict_until_fit(
+                                &mut st,
+                                self.config.policy.weight(&key, v),
+                                &key,
+                            );
+                            st.entries.insert(
+                                key.clone(),
+                                MapSlot::Ready(CacheEntry {
+                                    value: v.clone(),
+                                    written_at: now,
+                                    deadline,
+                                }),
+                            );
+                            drop(st);
+                            for (ek, ev) in pending {
+                                self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
+                            }
+                            return res;
+                        }
+                        Err(_) => {}
+                    }
+                    drop(st);
+                    return res;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refresh_inflight_remove(&self, key: &K)
+    where
+        K: Eq + Hash,
+    {
+        self.state
+            .lock()
+            .expect("cache lock")
+            .refresh_inflight
+            .remove(key);
+    }
+
+    pub(crate) fn apply_refresh_ok(&self, key: &K, v: V)
+    where
+        K: Eq + Hash + Clone + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        let mut st = self.state.lock().expect("cache lock");
+        st.entries.remove(key);
+        let now = Instant::now();
+        let deadline = deadline_after_write(self.config.policy.as_ref(), key, &v, now);
+        let w = self.config.policy.weight(key, &v);
+        let pending = self.evict_until_fit(&mut st, w, key);
+        st.entries.insert(
+            key.clone(),
+            MapSlot::Ready(CacheEntry {
+                value: v,
+                written_at: now,
+                deadline,
+            }),
+        );
+        drop(st);
+        for (ek, ev) in pending {
+            self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
+        }
+    }
+}
+
+fn deadline_after_write<K, V>(
+    policy: &(dyn Policy<K, V> + Send + Sync),
+    key: &K,
+    value: &V,
+    now: Instant,
+) -> Option<Instant>
+where
+    K: 'static,
+    V: 'static,
+{
+    let d = policy.expire_after_write(key, value, now);
+    if d >= crate::policy::TIME_UNBOUNDED / 2 {
+        None
+    } else {
+        now.checked_add(d)
+    }
+}
+
+fn entry_is_served<K, V>(
+    key: &K,
+    e: &CacheEntry<V>,
+    policy: &(dyn Policy<K, V> + Send + Sync),
+    now: Instant,
+) -> bool
+where
+    K: 'static,
+    V: 'static,
+{
+    if let Some(dl) = e.deadline {
+        if now >= dl {
+            return false;
+        }
+    }
+    let time_remaining = e
+        .deadline
+        .map(|dl| dl.saturating_duration_since(now))
+        .unwrap_or(crate::policy::TIME_UNBOUNDED);
+    let _ = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
+    true
+}
+
+fn update_read_deadline<K, V>(
+    key: &K,
+    e: &mut CacheEntry<V>,
+    policy: &(dyn Policy<K, V> + Send + Sync),
+    now: Instant,
+) where
+    K: 'static,
+    V: 'static,
+{
+    let time_remaining = e
+        .deadline
+        .map(|dl| dl.saturating_duration_since(now))
+        .unwrap_or(crate::policy::TIME_UNBOUNDED);
+    let d = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
+    if d >= crate::policy::TIME_UNBOUNDED / 2 {
+        e.deadline = None;
+    } else {
+        e.deadline = now.checked_add(d);
+    }
+}

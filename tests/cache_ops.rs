@@ -1,13 +1,12 @@
-//! **TDD / contract tests** for cache **data paths** (`get`, `insert`, miss helpers, `revalidate`, …).
+//! **Contract tests** for cache **data paths** (`get`, `insert`, miss helpers, `revalidate`, …).
 //!
-//! `Cache` operation bodies are still `todo!()`. **`cargo test --test cache_ops`** fails until the
-//! core is implemented (red phase). Run **`cargo test --test cache_surface`** and **`cargo test --lib`**
-//! for green checks (`RefreshWork` / `OkIntoResult` unit tests live under `src/cache.rs`).
+//! Run **`cargo test --test cache_ops`** for these checks. Use **`cargo test --test cache_surface`**
+//! and **`cargo test --lib`** for builder/introspection and small compile-only tests.
 //!
-//! **Revalidate + data plane (once wired):** after `try_revalidate` returns `Submitted` and the
-//! executor runs the `RefreshWork` job future to completion, `Cache::get` must show the refreshed
-//! value for that key. Init errors may be returned from `try_revalidate` or only after the async
-//! job—see `try_revalidate_initializer_error_propagates_as_err`.
+//! **Revalidate and data plane:** after `try_revalidate` returns `Submitted` and the executor runs
+//! the `RefreshWork` job future to completion, `Cache::get` must show the refreshed value for that
+//! key. Init errors may be returned from `try_revalidate` or only after the async job—see
+//! `try_revalidate_initializer_error_propagates_as_err`.
 //!
 //! Prefer `get_with` + `.await` inside `#[tokio::test]` over `get_with_blocking` on the Tokio worker
 //! when the initializer would need the same runtime (see crate rustdoc on blocking hazards).
@@ -365,8 +364,9 @@ mod miss {
 }
 
 mod revalidate_tests {
-    //! Scheduling-only contract today; once `try_revalidate` runs jobs, pair with an executor that
-    //! drives `RefreshWork` to completion and assert `get` / lifecycle (see `src/cache.rs` tests).
+    //! Executor scheduling and `SkippedInFlight` behaviour. For end-to-end refresh (get reflects
+    //! new value after `RefreshWork` completes), drive a real executor in tests and assert `get` /
+    //! lifecycle as needed.
 
     use super::*;
 
@@ -445,9 +445,9 @@ mod revalidate_tests {
     }
 }
 
-// Revalidate data plane (when core exists): after Submitted and the executor runs RefreshWork to
-// Ready, get must reflect the new value; on refresh Err, get keeps the prior value unless the
-// contract says otherwise; document whether try_revalidate Err(E) is sync-only or also async.
+// Revalidate data plane: after `Submitted` and the executor runs `RefreshWork` to completion,
+// `get` should reflect the new value; on refresh `Err`, document or test whether `get` keeps the prior
+// value. `try_revalidate` may return `Err(E)` synchronously (first-poll ready) or only via the job.
 
 mod capacity {
     use super::*;

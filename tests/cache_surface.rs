@@ -1,5 +1,4 @@
-//! Integration tests for cache **construction and introspection** only.
-//! These must stay green while cache data paths are still `todo!()`.
+//! Integration tests for cache **construction and introspection**.
 //! Cache-driven lifecycle behaviour is covered in `tests/cache_ops.rs` (`lifecycle` module).
 
 use std::cmp::Ordering;

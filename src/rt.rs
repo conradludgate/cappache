@@ -28,19 +28,17 @@ pub trait Executor<Fut> {
     fn execute(&self, fut: Fut);
 }
 
-/// Whether [`Cache::revalidate`](crate::Cache::revalidate) submitted work to the [`Executor`].
+/// Whether [`Cache::revalidate`](crate::Cache::revalidate) or [`Cache::try_revalidate`](crate::Cache::try_revalidate)
+/// submitted work to the [`Executor`].
 ///
-/// **Phase A:** [`Cache::revalidate`](crate::Cache::revalidate) is still a stub (`todo!()`), so this
-/// enum is **not** returned from a working implementation yet—only the type and variants are stable
-/// for documentation and future behavior.
-///
-/// When the cache core is implemented, **`SkippedInFlight`** means a refresh was already running
-/// for that key and a second backend call was not started.
+/// **`SkippedInFlight`** means a refresh was already in flight for that key (per
+/// [`Cache::try_revalidate`](crate::Cache::try_revalidate)’s `refresh_inflight` tracking) and a second
+/// backend call was not started.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RevalidateScheduled {
-    /// A refresh job was handed to the [`Executor`] (implementation pending).
+    /// A refresh job was handed to the [`Executor`].
     Submitted,
-    /// A refresh was already in flight for this key (implementation pending).
+    /// A refresh was already in flight for this key.
     SkippedInFlight,
 }

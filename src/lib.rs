@@ -2,9 +2,10 @@
 
 //! Clache (Conrad Ludgate cache): a safe Rust concurrent cache API.
 //!
-//! This crate is **`#![deny(unsafe_code)]`**. Cache method bodies are still [`todo!()`] while the
-//! shape stabilizes; [`Cache::get_with_blocking`](crate::Cache::get_with_blocking) uses an
-//! internal park-based driver (not part of the public API).
+//! This crate is **`#![deny(unsafe_code)]`**. The in-memory [`Cache`](crate::Cache) implements
+//! synchronous `get` / `insert` / `remove`, async miss helpers, and executor-driven refresh;
+//! [`Cache::get_with_blocking`](crate::Cache::get_with_blocking) uses an internal park-based driver
+//! (not part of the public API).
 //!
 //! ## Overview
 //!
@@ -17,7 +18,7 @@
 //! - [`Cache::get`], [`Cache::insert`], and [`Cache::remove`] are **synchronous**; miss-path helpers are
 //!   async [`Cache::try_get_with`] / [`Cache::get_with`], with [`Cache::get_with_blocking`] for callers without an async runtime.
 //! - Caller-driven background refresh: [`Cache::try_revalidate`], [`Cache::revalidate`] with an [`Executor`]
-//!   from the [`rt`] module (API stubs; bodies still [`todo!()`]).
+//!   from the [`rt`] module.
 //! - Fallible miss path uses **`E: Clone`** on [`Cache::try_get_with`] / [`Cache::try_revalidate`] instead of `Arc<E>`;
 //!   [`Cache::get_with`] / [`Cache::revalidate`] use [`Infallible`](std::convert::Infallible) as the error type ([`OkIntoResult`] bridges `V` → `Result<V, Infallible>` for executor bounds on `revalidate`).
 //!

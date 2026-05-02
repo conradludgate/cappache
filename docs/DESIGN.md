@@ -1,12 +1,12 @@
 # Clache — design notes (non-normative)
 
-This document captures **implementation intent** for future phases. The **normative** contract is the
+This document captures **non-normative implementation intent** and possible follow-ups. The **normative** contract is the
 public Rust API and doc comments on types and methods.
 
 ## Performance targets
 
 - **O(1) worst case** for `**get` / `insert` / `remove`** (including structural work those operations
-trigger) is a **target** for a future implementation.
+trigger) is a **target** for the current implementation and later refinements.
 - Time-based eviction driven by the `Policy` trait may remain **lazy** (on access,
 opportunistic sweeps, and/or background work) and need not meet the same worst-case bound.
 
@@ -30,7 +30,7 @@ lock-freedom is relaxed). Draining strategy and bounds are **TBD**.
 
 ## Async miss path (`try_get_with`, `get_with`)
 
-- A future implementation must **not** hold the cache’s **synchronous mutex across `.await`**.
+- The implementation must **not** hold the cache’s **synchronous mutex across `.await`**.
 Prefer short critical sections and staging (reserve / compute outside / install inside, striping,
 etc.).
 - `**try_get_with**` returns `Result<V, E>` with `**E: Clone**` (not `Arc<E>`). `**get_with**` uses
@@ -47,23 +47,20 @@ current thread. `**get` / `insert` / `remove`** are synchronous only. That drive
 - Do not use blocking `get_with_blocking` from async worker threads when the initializer may depend on
 that same runtime (deadlock risk). Prefer the async miss helpers there.
 
-## Caller-driven `revalidate` (API phase)
+## Caller-driven `revalidate`
 
 - `**Cache::try_revalidate**` / `**Cache::revalidate(key, executor, init)**` schedule a background refresh using an injected
 `[Executor](https://docs.rs/hyper/latest/hyper/rt/trait.Executor.html)`-style hook from the
 `[rt](../src/rt.rs)` module (same pattern as [hyper’s `Executor](https://docs.rs/hyper/latest/hyper/rt/trait.Executor.html)`).
 There is **no** `revalidate_blocking` — refresh is meant to be **spawned**, not park-driven.
 `**try_revalidate`** uses `**Result<V, E>**` with `**E: Clone**`; `**revalidate**` delegates to it using `**OkIntoResult<Fut>**` (`Infallible` errors).
-- **Phase A (current):** signatures, [`Executor`], [`RevalidateScheduled`](../src/rt.rs), and
-  [`RefreshWork`](../src/cache.rs) exist; **`RefreshWork` polls the inner initializer future** so
-  executors can drive jobs in tests. [`Cache::try_revalidate`](../src/cache.rs) body is still
-  [`todo!()`]: no per-key single-flight or cache map updates yet.
-- **Phase B (later):** one in-flight slot per key shared with `**try_get_with` on miss** (per lane); install new
-`V` without `remove`-for-refresh; old `V` visible until install. The cache does **not** decide
-application staleness — the caller chooses when to call `revalidate` / `try_revalidate`.
+- **Implemented:** [`Executor`], [`RevalidateScheduled`](../src/rt.rs), and [`RefreshWork`](../src/cache/mod.rs); per-key
+  `refresh_inflight` prevents overlapping refresh jobs for the same key. **`RefreshWork`** is a [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html) that polls the initializer and applies a successful value via `apply_refresh_ok`.
+- **Miss vs refresh:** `**try_get_with**` miss coalescing and `**try_revalidate**` use separate coordination; they do not assume a unified `(key, TypeId)` lane unless you explicitly unify them later.
+- **Possible follow-up:** unify or further coordinate miss and refresh lanes; install refreshed `V` without a full `remove`-for-refresh while keeping old `V` visible until install. The cache does **not** decide application staleness — the caller chooses when to call `revalidate` / `try_revalidate`.
 - **Bounds:** `get_with` / `try_get_with` initializer futures need **not** be `Send` when you only `.await`
 locally (e.g. `LocalSet`). The `revalidate` / `try_revalidate` job passed to `Executor::execute` will typically need
-`**Send` + `'static`** for runtimes like `tokio::spawn` once implemented.
+`**Send` + `'static`** for runtimes like `tokio::spawn`.
 
 ## Architecture sketch
 
