@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clache::{
-    Cache, CacheBuilder, DefaultPolicy, Executor, LifecycleListener, LifecycleReason,
+    Cache, CacheBuilder, DefaultPolicy, Executor, IdleTimeout, LifecycleListener, LifecycleReason,
     RevalidateScheduled, TtlFromWrite, Weight,
 };
 
@@ -684,6 +684,67 @@ mod lanes {
             assert_eq!(rev_res, RevalidateScheduled::Submitted);
             assert_eq!(ex.executed_count(), 1);
             assert_eq!(miss_calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+    }
+}
+
+mod policy_time {
+    //! Wall-clock tests for [`TtlFromWrite`] and [`IdleTimeout`] against [`Cache::get`] / deadlines.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn idle_timeout_expires_after_idle_without_reads() {
+        with_timeout(Duration::from_secs(30), async {
+            let idle = Duration::from_millis(90);
+            let cache = Cache::<K, V>::new(
+                CacheBuilder::<K, V>::new()
+                    .max_weight(Weight::new(100))
+                    .policy(Arc::new(IdleTimeout::new(idle, DefaultPolicy)))
+                    .build(),
+            );
+            cache.insert("k".into(), "v".into());
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert_eq!(cache.get(&"k".into()), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_read_extends_deadline() {
+        with_timeout(Duration::from_secs(30), async {
+            let idle = Duration::from_millis(100);
+            let cache = Cache::<K, V>::new(
+                CacheBuilder::<K, V>::new()
+                    .max_weight(Weight::new(100))
+                    .policy(Arc::new(IdleTimeout::new(idle, DefaultPolicy)))
+                    .build(),
+            );
+            cache.insert("k".into(), "v".into());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(cache.get(&"k".into()), Some("v".into()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(cache.get(&"k".into()), Some("v".into()));
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert_eq!(cache.get(&"k".into()), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ttl_from_write_expires_after_ttl_without_reads() {
+        with_timeout(Duration::from_secs(30), async {
+            let ttl = Duration::from_millis(80);
+            let cache = Cache::<K, V>::new(
+                CacheBuilder::<K, V>::new()
+                    .max_weight(Weight::new(100))
+                    .policy(Arc::new(TtlFromWrite::new(ttl, DefaultPolicy)))
+                    .build(),
+            );
+            cache.insert("k".into(), "v".into());
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert_eq!(cache.get(&"k".into()), None);
         })
         .await;
     }

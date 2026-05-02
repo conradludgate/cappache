@@ -1,8 +1,12 @@
 //! Per-entry [`Policy`]: weight and how long an entry may live after reads and writes.
 //!
-//! The cache core (when implemented) keeps **one** monotonic deadline per entry. Each hook returns
-//! a [`Duration`] used with the event’s anchor time; use [`TIME_UNBOUNDED`] when this hook should
+//! The cache keeps **one** monotonic deadline per entry. Each hook returns a
+//! [`Duration`] used with the event’s anchor time; use [`TIME_UNBOUNDED`] when this hook should
 //! not impose a finite time bound.
+//!
+//! **Read path:** whether an entry may be returned is decided from **materialized** state (the
+//! stored deadline) only. [`Policy::expire_after_read`] is called **after** a confirmed live hit to
+//! compute the **next** deadline (see cache implementation).
 //!
 //! **TTL- and TTI-style helpers** ([`TtlFromWrite`], [`IdleTimeout`]) wrap a generic inner **`P:
 //! Policy<K, V>`** and, on each expiry hook, return the **shorter** of the inner policy’s duration
@@ -37,8 +41,11 @@ pub const TIME_UNBOUNDED: Duration = Duration::from_secs(365 * 24 * 3600 * 100);
 pub trait Policy<K, V>: Send + Sync {
     fn weight(&self, key: &K, value: &V) -> Weight;
 
-    /// `time_remaining` is the cache’s view of how long until the current deadline at `read_at`
-    /// (`Duration::ZERO` when no deadline is set yet).
+    /// Returns how long this entry may remain after **`read_at`** (a successful read that served the value).
+    ///
+    /// The cache applies this **only after** confirming the entry is still live from the stored
+    /// deadline; it is **not** consulted to reject the current `get`. `time_remaining` is how long
+    /// that deadline allows from `read_at` (unbounded when no deadline is set).
     fn expire_after_read(
         &self,
         key: &K,

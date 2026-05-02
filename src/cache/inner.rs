@@ -50,6 +50,8 @@ pub(crate) struct Inner<K: 'static, V: 'static> {
 pub(crate) struct State<K, V> {
     pub(crate) entries: HashMap<K, MapSlot<V>>,
     pub(crate) refresh_inflight: HashSet<K>,
+    /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over [`MapSlot::Ready`] entries only.
+    pub(crate) total_weight: u64,
 }
 
 pub(crate) enum MapSlot<V> {
@@ -74,22 +76,17 @@ where
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 refresh_inflight: HashSet::new(),
+                total_weight: 0,
             }),
         }
     }
 
-    fn recompute_total_weight(&self, st: &State<K, V>) -> u64
+    fn ready_entry_weight(&self, key: &K, e: &CacheEntry<V>) -> u64
     where
         K: 'static,
         V: 'static,
     {
-        st.entries
-            .iter()
-            .filter_map(|(k, s)| match s {
-                MapSlot::Ready(e) => Some(self.config.policy.weight(k, &e.value).get()),
-                MapSlot::Miss(_) => None,
-            })
-            .sum()
+        self.config.policy.weight(key, &e.value).get()
     }
 
     pub(crate) fn get_served(&self, key: &K) -> Option<V>
@@ -99,17 +96,24 @@ where
     {
         let now = Instant::now();
         let mut st = self.state.lock().expect("cache lock");
+        let expired = match st.entries.get(key) {
+            Some(MapSlot::Ready(e)) => !entry_is_served(e, now),
+            _ => false,
+        };
+        if expired {
+            if let Some(MapSlot::Ready(e)) = st.entries.remove(key) {
+                let w = self.ready_entry_weight(key, &e);
+                st.total_weight = st.total_weight.saturating_sub(w);
+                let v = e.value.clone();
+                drop(st);
+                self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
+            }
+            return None;
+        }
         let slot = st.entries.get_mut(key)?;
         let MapSlot::Ready(e) = slot else {
             return None;
         };
-        if !entry_is_served(key, e, self.config.policy.as_ref(), now) {
-            let v = e.value.clone();
-            st.entries.remove(key);
-            drop(st);
-            self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
-            return None;
-        }
         update_read_deadline(key, e, self.config.policy.as_ref(), now);
         Some(e.value.clone())
     }
@@ -121,15 +125,14 @@ where
     {
         let now = Instant::now();
         let new_w = self.config.policy.weight(&key, &value).get();
+        let key_for_updated = key.clone();
         let mut st = self.state.lock().expect("cache lock");
 
         let prev = match st.entries.remove(&key) {
             Some(MapSlot::Ready(old)) => {
-                self.notify_lifecycle(
-                    LifecycleReason::Updated,
-                    key.clone(),
-                    Some(old.value.clone()),
-                );
+                st.total_weight = st
+                    .total_weight
+                    .saturating_sub(self.ready_entry_weight(&key, &old));
                 Some(old.value)
             }
             Some(MapSlot::Miss(_)) | None => None,
@@ -138,6 +141,7 @@ where
         let pending = self.evict_until_fit(&mut st, Weight::new(new_w), &key);
 
         let deadline = deadline_after_write(self.config.policy.as_ref(), &key, &value, now);
+        st.total_weight = st.total_weight.saturating_add(new_w);
         st.entries.insert(
             key,
             MapSlot::Ready(CacheEntry {
@@ -147,6 +151,9 @@ where
             }),
         );
         drop(st);
+        if let Some(ref v) = prev {
+            self.notify_lifecycle(LifecycleReason::Updated, key_for_updated, Some(v.clone()));
+        }
         for (ek, ev) in pending {
             self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
         }
@@ -161,6 +168,9 @@ where
         let mut st = self.state.lock().expect("cache lock");
         match st.entries.remove(key)? {
             MapSlot::Ready(e) => {
+                st.total_weight = st
+                    .total_weight
+                    .saturating_sub(self.ready_entry_weight(key, &e));
                 let v = e.value.clone();
                 drop(st);
                 self.notify_lifecycle(LifecycleReason::Removed, key.clone(), Some(v));
@@ -177,7 +187,7 @@ where
     {
         let max = self.config.max_weight.get();
         let mut pending = Vec::new();
-        while self.recompute_total_weight(st) + add_w.get() > max {
+        while st.total_weight.saturating_add(add_w.get()) > max {
             let keys: Vec<K> = st
                 .entries
                 .iter()
@@ -192,6 +202,8 @@ where
             let victim = keys.iter().position(|k| k != skip_key).unwrap_or(0);
             let vk = keys[victim].clone();
             if let Some(MapSlot::Ready(e)) = st.entries.remove(&vk) {
+                let w = self.ready_entry_weight(&vk, &e);
+                st.total_weight = st.total_weight.saturating_sub(w);
                 pending.push((vk, e.value));
             } else {
                 break;
@@ -252,7 +264,7 @@ where
                 let mut st = self.state.lock().expect("cache lock");
                 if let Some(MapSlot::Ready(e)) = st.entries.get(&key) {
                     let now = Instant::now();
-                    if entry_is_served(&key, e, self.config.policy.as_ref(), now) {
+                    if entry_is_served(e, now) {
                         return Ok(e.value.clone());
                     }
                 }
@@ -304,31 +316,26 @@ where
                     st.entries.remove(&key);
                     let _ = miss.settle.send(Some(FlightMsg::from_result(res.clone())));
 
-                    match &res {
-                        Ok(v) => {
-                            let now = Instant::now();
-                            let deadline =
-                                deadline_after_write(self.config.policy.as_ref(), &key, v, now);
-                            let pending = self.evict_until_fit(
-                                &mut st,
-                                self.config.policy.weight(&key, v),
-                                &key,
-                            );
-                            st.entries.insert(
-                                key.clone(),
-                                MapSlot::Ready(CacheEntry {
-                                    value: v.clone(),
-                                    written_at: now,
-                                    deadline,
-                                }),
-                            );
-                            drop(st);
-                            for (ek, ev) in pending {
-                                self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
-                            }
-                            return res;
+                    if let Ok(v) = &res {
+                        let now = Instant::now();
+                        let deadline =
+                            deadline_after_write(self.config.policy.as_ref(), &key, v, now);
+                        let nw = self.config.policy.weight(&key, v).get();
+                        let pending = self.evict_until_fit(&mut st, Weight::new(nw), &key);
+                        st.total_weight = st.total_weight.saturating_add(nw);
+                        st.entries.insert(
+                            key.clone(),
+                            MapSlot::Ready(CacheEntry {
+                                value: v.clone(),
+                                written_at: now,
+                                deadline,
+                            }),
+                        );
+                        drop(st);
+                        for (ek, ev) in pending {
+                            self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
                         }
-                        Err(_) => {}
+                        return res;
                     }
                     drop(st);
                     return res;
@@ -354,11 +361,21 @@ where
         V: Clone + Send + Sync + 'static,
     {
         let mut st = self.state.lock().expect("cache lock");
-        st.entries.remove(key);
+        let displaced = match st.entries.remove(key) {
+            Some(MapSlot::Ready(e)) => {
+                st.total_weight = st
+                    .total_weight
+                    .saturating_sub(self.ready_entry_weight(key, &e));
+                Some(e.value)
+            }
+            Some(MapSlot::Miss(_)) | None => None,
+        };
         let now = Instant::now();
         let deadline = deadline_after_write(self.config.policy.as_ref(), key, &v, now);
         let w = self.config.policy.weight(key, &v);
+        let nw = w.get();
         let pending = self.evict_until_fit(&mut st, w, key);
+        st.total_weight = st.total_weight.saturating_add(nw);
         st.entries.insert(
             key.clone(),
             MapSlot::Ready(CacheEntry {
@@ -368,6 +385,7 @@ where
             }),
         );
         drop(st);
+        drop(displaced);
         for (ek, ev) in pending {
             self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
         }
@@ -392,27 +410,12 @@ where
     }
 }
 
-fn entry_is_served<K, V>(
-    key: &K,
-    e: &CacheEntry<V>,
-    policy: &(dyn Policy<K, V> + Send + Sync),
-    now: Instant,
-) -> bool
-where
-    K: 'static,
-    V: 'static,
-{
-    if let Some(dl) = e.deadline {
-        if now >= dl {
-            return false;
-        }
-    }
-    let time_remaining = e
-        .deadline
-        .map(|dl| dl.saturating_duration_since(now))
-        .unwrap_or(crate::policy::TIME_UNBOUNDED);
-    let _ = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
-    true
+/// Whether the entry may be returned for a read at `now`, using only materialized [`CacheEntry::deadline`].
+///
+/// [`Policy::expire_after_read`](crate::policy::Policy::expire_after_read) runs only after a live hit
+/// in [`update_read_deadline`] to compute the next deadline.
+fn entry_is_served<V>(e: &CacheEntry<V>, now: Instant) -> bool {
+    !matches!(e.deadline, Some(dl) if now >= dl)
 }
 
 fn update_read_deadline<K, V>(

@@ -193,7 +193,7 @@ where
 
         let mut fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>> = Box::pin(init(&key));
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(Err(e)) => {
                 self.inner.refresh_inflight_remove(&key);

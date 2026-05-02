@@ -2,6 +2,8 @@
 
 Concurrent cache for Rust (API-first development).
 
+**MSRV:** Rust **1.95** (`rust-version` in `Cargo.toml`).
+
 - Crate is `#![deny(unsafe_code)]`.
 - The cache implements synchronous **`get` / `insert` / `remove`**, async **`try_get_with`** / **`get_with`** (single-flight miss coalescing), and **`try_revalidate`** / **`revalidate`** (per-key refresh in flight, `Executor`-driven jobs).
 - **`get_with_blocking`** is for callers without an async runtime (internal park-based driver, not exported)—**do not** use it from async worker threads if the initializer needs that same runtime.

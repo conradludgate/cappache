@@ -7,6 +7,7 @@ public Rust API and doc comments on types and methods.
 
 - **O(1) worst case** for `**get` / `insert` / `remove`** (including structural work those operations
 trigger) is a **target** for the current implementation and later refinements.
+- **Weight budget:** the cache keeps a running **total weight** of `**Ready**` entries so over-capacity checks avoid a full map scan each time. **Victim selection** for eviction may still scan keys (or use a richer structure later), so worst-case eviction work is not yet the full O(1) story.
 - Time-based eviction driven by the `Policy` trait may remain **lazy** (on access,
 opportunistic sweeps, and/or background work) and need not meet the same worst-case bound.
 
@@ -14,16 +15,14 @@ opportunistic sweeps, and/or background work) and need not meet the same worst-c
 
 - Capacity and time-based cleanups may be **deferred**; there is no guarantee of immediate eviction
 on expiry or over-weight.
-- `**Policy`** (the `policy` module) is stored on the cache as `CacheConfig::policy`. The cache core
-should keep **one deadline per entry** derived from `expire_after_read` / `expire_after_write` and
-anchor instants. **TTL- and TTI-style behavior** are obtained by choosing a concrete `Policy`
-implementation (e.g. `TtlFromWrite` / `IdleTimeout` wrapping another `Policy`), not by separate built-in TTL/TTI flags on the cache.
+- `**Policy`** (the `policy` module) is stored on the cache as `CacheConfig::policy`. The cache keeps **one deadline per entry** derived from `expire_after_write` on install and from `expire_after_read` **only after** a confirmed live hit (materialized deadline gates `get`; the read hook updates the next deadline). **TTL- and TTI-style behavior** come from concrete `Policy` implementations (e.g. `TtlFromWrite` / `IdleTimeout` wrapping another `Policy`), not separate built-in TTL/TTI flags on the cache.
 
 ## Deferred `Drop` (QuickCache-style)
 
 - Avoid running heavy `**Drop`** while holding the **primary cache lock**.
 - After releasing the lock, move evicted or replaced **handles** into a **handoff buffer**; drop
-outside the critical section.
+outside the critical section. **Implemented today** for size evictions and for **replace** / **refresh**
+displaced values (previous `V` is dropped after the lock is released). A larger bounded handoff queue remains optional if producer pressure ever requires it.
 - **Enqueue** after the lock should be **cheap and non-blocking** where possible (e.g. a small
 dependency with encapsulated `unsafe` for a segment queue, or `std::sync::mpsc` if strict
 lock-freedom is relaxed). Draining strategy and bounds are **TBD**.
@@ -91,10 +90,11 @@ flowchart LR
 
 ## Open questions
 
-- MSRV and `Send` bounds on stored values and initializer futures (`get_with` / `try_get_with` vs `revalidate` / `try_revalidate` split is documented above).
-- Whether `get_with` should also expose a bare `Future` builder for external executors beyond
-`get_with_blocking`.
-- Handoff queue draining and memory bounds if producers outpace consumers.
+- **`Send` bounds** on stored values and initializer futures (`get_with` / `try_get_with` vs `revalidate` / `try_revalidate` split is documented above).
+- **Bare `Future` for `get_with` (beyond `get_with_blocking`):** left **open**. Bias **against** adding a detached miss future: callers can **drop it without polling**, which risks stranded in-flight work or surprising behavior for other waiters on the same key. Prefer **`async fn get_with`** plus **`get_with_blocking`** unless a concrete integration needs a third path.
+- **Handoff queue bounds:** only becomes important if you add a **persistent** async drain or unbounded producer pressure on a deferred-drop queue. Until then, note “not applicable” for the current immediate `Vec` handoff after each operation.
+
+**MSRV:** **1.95** (declared in `Cargo.toml` as `rust-version`).
 
 ## Published docs
 

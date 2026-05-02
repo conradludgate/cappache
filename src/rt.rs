@@ -1,7 +1,9 @@
 //! Hooks for driving asynchronous work with the caller’s runtime.
 //!
 //! [`Executor`] is shaped like [hyper’s `Executor`](https://docs.rs/hyper/latest/hyper/rt/trait.Executor.html):
-//! a small abstraction so **`clache`** stays executor-agnostic (no Tokio dependency).
+//! a small abstraction so **callers** pick the runtime. The cache implementation may use
+//! `tokio::sync` internally for miss coalescing; that is an implementation detail, not part of this
+//! module’s contract.
 //!
 //! Use it with [`Cache::revalidate`](crate::Cache::revalidate) / [`Cache::try_revalidate`](crate::Cache::try_revalidate)
 //! to **spawn** background refresh jobs.
