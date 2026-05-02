@@ -80,32 +80,33 @@ where
     }
 }
 
-/// Job future type for [`Cache::revalidate`](Cache::revalidate)’s [`crate::rt::Executor`] bound.
-///
-/// You do **not** construct this type. The cache will build it in a later phase: it will own the
-/// per-key single-flight, run your `init(key)` future, install the new `V`, and wake waiters—same
-/// gate as a **miss** on [`try_get_with`](Cache::try_get_with) / [`get_with`](Cache::get_with).
-///
-/// Today it exists so call sites type-check against **`Executor<RefreshWork<Fut>>`** (same
-/// pattern as hyper’s `Executor` over concrete connection futures). [`poll`](Future::poll) is
-/// [`todo!()`] until then.
-pub struct RefreshWork<Fut> {
-    pub(crate) _marker: PhantomData<Fut>,
-}
-
-impl<Fut> Default for RefreshWork<Fut> {
-    fn default() -> Self {
-        Self {
-            _marker: PhantomData,
-        }
+// Refresh work job: see `Cache::try_revalidate` / `Cache::revalidate` and `Executor<RefreshWork<_>>`.
+pin_project! {
+    #[doc(alias = "refresh job")]
+    pub struct RefreshWork<Fut> {
+        #[pin]
+        inner: Fut,
     }
 }
 
-impl<Fut> Future for RefreshWork<Fut> {
+impl<Fut> RefreshWork<Fut> {
+    #[allow(dead_code)]
+    pub(crate) fn new(inner: Fut) -> Self {
+        Self { inner }
+    }
+}
+
+impl<Fut> Future for RefreshWork<Fut>
+where
+    Fut: Future,
+{
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project().inner.poll(cx) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -299,5 +300,57 @@ where
     #[must_use]
     pub fn lifecycle_listener(&self) -> Option<&Arc<dyn LifecycleListener<K, V> + Send + Sync>> {
         self.config.lifecycle_listener.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod refresh_work_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::RefreshWork;
+    use crate::rt::Executor;
+
+    struct BlockOnExecutor;
+
+    impl<Fut> Executor<Fut> for BlockOnExecutor
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        fn execute(&self, fut: Fut) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(fut);
+        }
+    }
+
+    #[test]
+    fn refresh_work_runs_inner_future_under_executor() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        BlockOnExecutor.execute(RefreshWork::new(async move {
+            h.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_work_await_completes_when_inner_completes() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        RefreshWork::new(async move {
+            h.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_work_ok_into_result_inner_polls() {
+        use super::OkIntoResult;
+        let out = RefreshWork::new(OkIntoResult::new(async { "x".to_string() })).await;
+        assert_eq!(out, ());
     }
 }

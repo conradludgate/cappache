@@ -96,4 +96,11 @@ mod compile_tests {
             DefaultPolicy,
         ));
     }
+
+    #[test]
+    fn typical_async_revalidate_init_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'static>>>(
+        );
+    }
 }

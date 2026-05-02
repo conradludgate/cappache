@@ -54,9 +54,10 @@ that same runtime (deadlock risk). Prefer the async miss helpers there.
 `[rt](../src/rt.rs)` module (same pattern as [hyper’s `Executor](https://docs.rs/hyper/latest/hyper/rt/trait.Executor.html)`).
 There is **no** `revalidate_blocking` — refresh is meant to be **spawned**, not park-driven.
 `**try_revalidate`** uses `**Result<V, E>**` with `**E: Clone**`; `**revalidate**` delegates to it using `**OkIntoResult<Fut>**` (`Infallible` errors).
-- **Phase A (current):** signatures, [`Executor`], `[RevalidateScheduled](../src/rt.rs)`, and
-`[RefreshWork](../src/cache.rs)` stub exist; **bodies are still `todo!()`**. No real per-key
-single-flight or `execute` wiring yet.
+- **Phase A (current):** signatures, [`Executor`], [`RevalidateScheduled`](../src/rt.rs), and
+  [`RefreshWork`](../src/cache.rs) exist; **`RefreshWork` polls the inner initializer future** so
+  executors can drive jobs in tests. [`Cache::try_revalidate`](../src/cache.rs) body is still
+  [`todo!()`]: no per-key single-flight or cache map updates yet.
 - **Phase B (later):** one in-flight slot per key shared with `**try_get_with` on miss** (per lane); install new
 `V` without `remove`-for-refresh; old `V` visible until install. The cache does **not** decide
 application staleness — the caller chooses when to call `revalidate` / `try_revalidate`.
