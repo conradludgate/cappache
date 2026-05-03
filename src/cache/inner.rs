@@ -166,9 +166,24 @@ where
 
 pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) config: CacheConfig<K, V, P>,
-    /// All `Ready` / `Miss` map state. **`std::sync::Mutex` only** — never `tokio::sync::Mutex`; the
-    /// lock is released before awaiting user `init` futures in [`Self::try_get_with`].
-    pub(crate) state: Mutex<State<K, V>>,
+    /// Per-shard state, addressed by `hash(key) & shard_mask`. Power-of-
+    /// two shard count so the mask is always `len - 1`. Single-key paths
+    /// take exactly one lock; multi-key paths fold across all shards.
+    /// **`std::sync::Mutex` only** — never `tokio::sync::Mutex`; the lock
+    /// is released before awaiting user `init` futures in
+    /// [`Self::try_get_with`].
+    pub(crate) shards: Box<[Mutex<State<K, V>>]>,
+    pub(crate) shard_mask: u64,
+    /// Hasher used both to pick a shard and (per shard) to hash table
+    /// entries. Stored at the `Inner` level so all shards share the same
+    /// seed — that keeps a key's bucket position stable across `Cache`
+    /// clones and across shard boundaries during `clear`/iteration.
+    pub(crate) hasher: DefaultHashBuilder,
+    /// Per-shard weight cap: `ceil(max_weight / shards.len())`. With more
+    /// than one shard the observed total weight may exceed
+    /// `config.max_weight` by up to `shards.len() - 1` units of rounding
+    /// slack; pass `.shards(1)` for a strict global cap.
+    pub(crate) shard_max_weight: u64,
 }
 
 /// Stable handle into [`Slab`]. `NonZeroU32` caps slab population at 2^32-2,
@@ -273,12 +288,6 @@ pub(crate) struct State<K, V> {
     /// `(K, TypeId<E>)` lane so a `try_get_with::<…, E1>` call cannot
     /// deadlock waiting on a leader that will publish an unrelated `E2`.
     pub(crate) entries: HashTable<SlotId>,
-    /// Single hasher used for every `entries` operation. Holding one per
-    /// state (rather than building a fresh one inside each helper) means
-    /// hashed bytes match between the install and lookup paths and avoids
-    /// re-deriving the seed on every call. `DefaultHashBuilder` is
-    /// `foldhash` in hashbrown 0.17.
-    pub(crate) hasher: DefaultHashBuilder,
     /// Per-key vector of in-flight miss lanes, deduped by the leader's `E`
     /// type. Single lane is the common case; multiple lanes appear only when
     /// concurrent `try_get_with` calls disagree on `E`.
@@ -565,7 +574,12 @@ impl ExpiryHeap {
 /// tuple is dropped (the caller is about to replace this slot anyway and
 /// will push a fresh tuple), but the existing slot is left in place so the
 /// caller can read its old value or fire a different lifecycle reason.
-fn drain_expired<K, V>(st: &mut State<K, V>, now: Instant, skip_key: Option<&K>) -> Vec<(K, V)>
+fn drain_expired<K, V>(
+    st: &mut State<K, V>,
+    hasher: &DefaultHashBuilder,
+    now: Instant,
+    skip_key: Option<&K>,
+) -> Vec<(K, V)>
 where
     K: Eq + Hash,
 {
@@ -586,7 +600,7 @@ where
         {
             continue;
         }
-        if let Some((k, v, _)) = evict_slot(st, top.slot) {
+        if let Some((k, v, _)) = evict_slot(st, hasher, top.slot) {
             out.push((k, v));
         }
     }
@@ -665,7 +679,7 @@ where
         }
         // Tolerate poisoning: the leader might already be unwinding from a
         // panic in `init`, and double-panicking from Drop aborts the process.
-        let mut st = match self.inner.state.lock() {
+        let mut st = match self.inner.shard_for(self.key).lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -681,13 +695,16 @@ where
 /// slot was already free (defensive — should not happen under our invariants).
 /// Stale tuples in `state.expiry` are not removed here; lazy validation on
 /// pop discards them once the slot is recycled.
-fn evict_slot<K, V>(st: &mut State<K, V>, id: SlotId) -> Option<(K, V, u64)>
+fn evict_slot<K, V>(
+    st: &mut State<K, V>,
+    hasher: &DefaultHashBuilder,
+    id: SlotId,
+) -> Option<(K, V, u64)>
 where
     K: Eq + Hash,
 {
     let State {
         entries,
-        hasher,
         slab,
         evict_list,
         total_weight,
@@ -695,9 +712,9 @@ where
     } = st;
     evict_list.unlink(slab, id);
     // Take the slot out first so the entries removal can compare against
-    // a slab that no longer holds `id` — `entries_remove`'s probe checks
-    // `slab.get(id)`, which now returns `None`, so we use the taken
-    // entry's key and an inline `find_entry` instead.
+    // a slab that no longer holds `id` — the probe predicate uses
+    // `slab.get(id)`, which now returns `None`, so we hash by the taken
+    // entry's key and match buckets by `SlotId` directly.
     let entry_slot = slab.remove(id)?;
     *total_weight = total_weight.saturating_sub(entry_slot.weight);
     let h = hash_key(hasher, &entry_slot.key);
@@ -713,6 +730,7 @@ where
 /// invariant cannot be silently dropped.
 fn install_ready<K, V>(
     st: &mut State<K, V>,
+    hasher: &DefaultHashBuilder,
     key: K,
     entry: CacheEntry<V>,
     weight: u64,
@@ -722,7 +740,6 @@ where
 {
     let State {
         entries,
-        hasher,
         slab,
         evict_list,
         expiry,
@@ -755,6 +772,27 @@ where
     id
 }
 
+impl<K, V, P> Inner<K, V, P> {
+    /// Locks the shard responsible for `key`. Single-key paths funnel
+    /// through here so the shard mapping is centralised; cross-shard work
+    /// (`len`, `weight`, `clear`) iterates `self.shards` directly.
+    ///
+    /// Kept on a bound-free impl block so that the `LeaderGuard::drop`
+    /// path can call it without re-asserting the full `Inner` bounds.
+    fn shard_for<Q>(&self, key: &Q) -> &Mutex<State<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
+        let h = hash_key(&self.hasher, key);
+        // Power-of-two shard count, so `h & mask` is in range. With
+        // `shard_mask == 0` this collapses to shard 0 (the .shards(1)
+        // case), matching the original single-mutex behaviour.
+        let idx = (h & self.shard_mask) as usize;
+        &self.shards[idx]
+    }
+}
+
 impl<K, V, P> Inner<K, V, P>
 where
     K: Eq + Hash + Clone + Send + Sync,
@@ -762,21 +800,37 @@ where
     P: Policy<K, V>,
 {
     pub(crate) fn new(config: CacheConfig<K, V, P>) -> Self {
-        // Pre-size both the lookup map and the slab to the cache's weight budget so
-        // steady-state inserts never trigger a one-shot O(n) rehash. `weight ≥ 1`
-        // is the working assumption that bounds entry count by `max_weight`.
-        let initial_capacity = capacity_hint_from_max_weight(config.max_weight.get());
+        let shard_count = config.shards.max(1).next_power_of_two();
+        let max_weight = config.max_weight.get();
+        // Round up so the per-shard sum is at least `max_weight`. With more
+        // than one shard total observed weight may exceed `max_weight` by
+        // up to `shard_count - 1` (rounding); callers wanting a strict
+        // global cap pass `.shards(1)`.
+        let shard_max_weight = max_weight.div_ceil(shard_count as u64).max(1);
+        // Pre-size each shard for its share of the budget. `weight >= 1`
+        // is the working assumption that bounds per-shard entry count by
+        // `shard_max_weight`.
+        let initial_capacity = capacity_hint_from_max_weight(shard_max_weight);
+        let shards = (0..shard_count)
+            .map(|_| {
+                Mutex::new(State {
+                    entries: HashTable::with_capacity(initial_capacity),
+                    inflight: HashMap::new(),
+                    slab: Slab::with_capacity(initial_capacity),
+                    evict_list: EvictList::default(),
+                    expiry: ExpiryHeap::default(),
+                    total_weight: 0,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let shard_mask = (shard_count as u64) - 1;
         Self {
             config,
-            state: Mutex::new(State {
-                entries: HashTable::with_capacity(initial_capacity),
-                hasher: DefaultHashBuilder::default(),
-                inflight: HashMap::new(),
-                slab: Slab::with_capacity(initial_capacity),
-                evict_list: EvictList::default(),
-                expiry: ExpiryHeap::default(),
-                total_weight: 0,
-            }),
+            shards,
+            shard_mask,
+            hasher: DefaultHashBuilder::default(),
+            shard_max_weight,
         }
     }
 
@@ -787,9 +841,9 @@ where
         V: 'static,
     {
         let now = Instant::now();
-        let mut st = self.state.lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
 
-        let id = entries_find(&st.entries, &st.hasher, &st.slab, key)?;
+        let id = entries_find(&st.entries, &self.hasher, &st.slab, key)?;
 
         // Fast-path read: borrow the slot to inspect the deadline; if expired,
         // drop the borrow and fall into the eviction path below.
@@ -800,7 +854,7 @@ where
         if expired {
             // Use the slot's owned key for the lifecycle event so callers
             // querying with a borrowed `Q` need not own a `K`.
-            let (k, v, _) = evict_slot(&mut st, id)?;
+            let (k, v, _) = evict_slot(&mut st, &self.hasher, id)?;
             drop(st);
             self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
             return None;
@@ -831,8 +885,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let st = self.state.lock().expect("cache mutex poisoned");
-        let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) else {
+        let st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) else {
             return false;
         };
         // Read-only check: do not evict expired entries here; let the next
@@ -844,63 +898,73 @@ where
             .is_some_and(|es| entry_is_served(&es.entry, now))
     }
 
+    /// Sums per-shard `slab.len()`. Briefly takes each shard's lock in
+    /// turn; not snapshot-consistent under concurrent mutation, but each
+    /// shard's contribution is taken atomically.
     pub(crate) fn len(&self) -> usize {
-        self.state
-            .lock()
-            .expect("cache mutex poisoned")
-            .slab
-            .len()
+        self.shards
+            .iter()
+            .map(|s| s.lock().expect("cache mutex poisoned").slab.len())
+            .sum()
     }
 
+    /// Sums per-shard `total_weight`. Same consistency caveat as
+    /// [`Self::len`].
     pub(crate) fn weight(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("cache mutex poisoned")
-            .total_weight
+        self.shards
+            .iter()
+            .map(|s| s.lock().expect("cache mutex poisoned").total_weight)
+            .sum()
     }
 
-    /// Drains every `Ready` slot, fires `Removed` for each one outside the
-    /// lock, and cancels every in-flight miss lane so any waiter sees a
-    /// retry signal rather than blocking forever on an abandoned flight.
+    /// Drains every `Ready` slot across every shard, fires `Removed` for
+    /// each one outside the locks, and cancels every in-flight miss lane
+    /// so any waiter sees a retry signal rather than blocking forever on
+    /// an abandoned flight. Walks shards in deterministic index order so
+    /// `Removed` callbacks observe a stable cross-shard sequence.
     pub(crate) fn clear(&self)
     where
         K: 'static,
         V: 'static,
     {
-        let mut st = self.state.lock().expect("cache mutex poisoned");
-        let State {
-            entries,
-            inflight,
-            slab,
-            evict_list,
-            expiry,
-            total_weight,
-            ..
-        } = &mut *st;
-        let mut drained: Vec<(K, V)> = Vec::with_capacity(slab.len());
-        while let Some(tail) = evict_list.tail {
-            evict_list.unlink(slab, tail);
-            if let Some(entry_slot) = slab.remove(tail) {
-                drained.push((entry_slot.key, entry_slot.entry.value));
+        for shard in &self.shards {
+            let mut st = shard.lock().expect("cache mutex poisoned");
+            let State {
+                entries,
+                inflight,
+                slab,
+                evict_list,
+                expiry,
+                total_weight,
+                ..
+            } = &mut *st;
+            let mut drained: Vec<(K, V)> = Vec::with_capacity(slab.len());
+            while let Some(tail) = evict_list.tail {
+                evict_list.unlink(slab, tail);
+                if let Some(entry_slot) = slab.remove(tail) {
+                    drained.push((entry_slot.key, entry_slot.entry.value));
+                }
             }
-        }
-        entries.clear();
-        expiry.clear();
-        *total_weight = 0;
+            entries.clear();
+            expiry.clear();
+            *total_weight = 0;
 
-        // Cancel pending miss lanes before releasing the lock so followers
-        // see Cancelled instead of waiting on a sender we are about to drop.
-        let cancelled: Vec<Vec<InflightLane<V>>> = inflight.drain().map(|(_, v)| v).collect();
-        drop(st);
+            // Cancel pending miss lanes before releasing the lock so
+            // followers see Cancelled instead of waiting on a sender we
+            // are about to drop.
+            let cancelled: Vec<Vec<InflightLane<V>>> =
+                inflight.drain().map(|(_, v)| v).collect();
+            drop(st);
 
-        for lanes in &cancelled {
-            for lane in lanes {
-                lane.cancel();
+            for lanes in &cancelled {
+                for lane in lanes {
+                    lane.cancel();
+                }
             }
-        }
 
-        for (k, v) in drained {
-            self.notify_lifecycle(LifecycleReason::Removed, k, Some(v));
+            for (k, v) in drained {
+                self.notify_lifecycle(LifecycleReason::Removed, k, Some(v));
+            }
         }
     }
 
@@ -912,12 +976,12 @@ where
         let now = Instant::now();
         let new_w = self.config.policy.weight(&key, &value).get();
         let key_for_updated = key.clone();
-        let mut st = self.state.lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(&key).lock().expect("cache mutex poisoned");
 
         // Single lookup: cache the existing slot id, then derive both the
         // returned `prev` value and the displaced-slot eviction from it.
         // Avoids two passes through `entries.find` per insert.
-        let existing_id = entries_find(&st.entries, &st.hasher, &st.slab, &key);
+        let existing_id = entries_find(&st.entries, &self.hasher, &st.slab, &key);
         let prev = existing_id.and_then(|id| st.slab.get(id).map(|es| es.entry.value.clone()));
 
         let reclaimed = self.reclaim(&mut st, new_w, &key, now);
@@ -925,12 +989,13 @@ where
         // `reclaim` never evicts `skip_key`, so `existing_id` is still valid
         // here if it was valid before the call.
         if let Some(id) = existing_id {
-            let _ = evict_slot(&mut st, id);
+            let _ = evict_slot(&mut st, &self.hasher, id);
         }
 
         let deadline = deadline_after_write(&self.config.policy, &key, &value, now);
         install_ready(
             &mut st,
+            &self.hasher,
             key,
             CacheEntry {
                 value,
@@ -954,9 +1019,9 @@ where
         Q: Hash + Eq + ?Sized,
         V: 'static,
     {
-        let mut st = self.state.lock().expect("cache mutex poisoned");
-        let id = entries_find(&st.entries, &st.hasher, &st.slab, key)?;
-        let (k, v, _) = evict_slot(&mut st, id)?;
+        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let id = entries_find(&st.entries, &self.hasher, &st.slab, key)?;
+        let (k, v, _) = evict_slot(&mut st, &self.hasher, id)?;
         drop(st);
         let v_for_listener = v.clone();
         self.notify_lifecycle(LifecycleReason::Removed, k, Some(v_for_listener));
@@ -989,18 +1054,18 @@ where
         K: 'static,
         V: 'static,
     {
-        let expired = drain_expired(st, now, Some(skip_key));
+        let expired = drain_expired(st, &self.hasher, now, Some(skip_key));
 
         // Hoist the existing-slot weight lookup out of the loop: the
         // skip_key short-circuit means its slot is never reclaimed in this
         // pass, so its weight is invariant across iterations. Only
         // `state.total_weight` changes per iteration; the projection then
         // becomes a couple of arithmetic ops instead of a HashTable probe.
-        let displaced_weight = entries_find(&st.entries, &st.hasher, &st.slab, skip_key)
+        let displaced_weight = entries_find(&st.entries, &self.hasher, &st.slab, skip_key)
             .and_then(|id| st.slab.get(id))
             .map_or(0, |es| es.weight);
 
-        let max = self.config.max_weight.get();
+        let max = self.shard_max_weight;
         let mut evicted = Vec::new();
         loop {
             if !Self::projected_weight_over_capacity(st, displaced_weight, add_w, max) {
@@ -1022,7 +1087,7 @@ where
                 evict_list.promote_to_mru(slab, tail_id);
                 continue;
             }
-            let Some((k, v, _)) = evict_slot(st, tail_id) else {
+            let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
                 break;
             };
             evicted.push((k, v));
@@ -1082,6 +1147,7 @@ where
         let reclaimed = self.reclaim(st, nw, key, now);
         install_ready(
             st,
+            &self.hasher,
             key.clone(),
             CacheEntry {
                 value: v.clone(),
@@ -1102,24 +1168,25 @@ where
         E: Clone + Send + Sync + 'static,
     {
         let now = Instant::now();
-        let mut st = self.state.lock().expect("cache mutex poisoned");
+        let shard = self.shard_for(key);
+        let mut st = shard.lock().expect("cache mutex poisoned");
 
-        if let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) {
+        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let expired = st
                 .slab
                 .get(id)
                 .is_some_and(|es| !entry_is_served(&es.entry, now));
             if expired
-                && let Some((_, v, _)) = evict_slot(&mut st, id)
+                && let Some((_, v, _)) = evict_slot(&mut st, &self.hasher, id)
             {
                 drop(st);
                 self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
-                st = self.state.lock().expect("cache mutex poisoned");
+                st = shard.lock().expect("cache mutex poisoned");
             }
         }
 
         let now = Instant::now();
-        if let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) {
+        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let still_served = st
                 .slab
                 .get(id)
@@ -1196,7 +1263,11 @@ where
                     };
                     let fut = init();
                     let res = fut.await;
-                    let mut st = guard.inner.state.lock().expect("cache mutex poisoned");
+                    let mut st = guard
+                        .inner
+                        .shard_for(&key)
+                        .lock()
+                        .expect("cache mutex poisoned");
                     remove_lane(&mut st, &key, &guard.flight_any);
 
                     let reclaimed = if let Ok(v) = &res {
@@ -1233,8 +1304,8 @@ where
     where
         K: Eq + Hash,
     {
-        let mut st = self.state.lock().expect("cache mutex poisoned");
-        let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) else {
+        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) else {
             return RefreshGate::AbsentKey;
         };
         let Some(es) = st.slab.get_mut(id) else {
@@ -1257,8 +1328,8 @@ where
     where
         K: Eq + Hash,
     {
-        let mut st = self.state.lock().expect("cache mutex poisoned");
-        if let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key)
+        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key)
             && let Some(es) = st.slab.get_mut(id)
         {
             es.refresh_inflight = false;
@@ -1270,17 +1341,18 @@ where
         K: 'static,
         V: 'static,
     {
-        let mut st = self.state.lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
         let now = Instant::now();
         let nw = self.config.policy.weight(key, &v).get();
         let reclaimed = self.reclaim(&mut st, nw, key, now);
-        let displaced = match entries_find(&st.entries, &st.hasher, &st.slab, key) {
-            Some(id) => evict_slot(&mut st, id).map(|(_, v, _)| v),
+        let displaced = match entries_find(&st.entries, &self.hasher, &st.slab, key) {
+            Some(id) => evict_slot(&mut st, &self.hasher, id).map(|(_, v, _)| v),
             None => None,
         };
         let deadline = deadline_after_write(&self.config.policy, key, &v, now);
         install_ready(
             &mut st,
+            &self.hasher,
             key.clone(),
             CacheEntry {
                 value: v,

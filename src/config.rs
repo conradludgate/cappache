@@ -29,6 +29,11 @@ where
 {
     pub max_weight: Weight,
     pub policy: P,
+    /// Requested shard count. Rounded up to the next power of two at
+    /// cache construction; minimum 1. With `shards > 1` the observed
+    /// total weight may exceed `max_weight` by up to `shards - 1` units
+    /// of rounding slack — set to 1 for a strict global cap.
+    pub shards: usize,
     pub(crate) lifecycle_listener: Option<Arc<dyn LifecycleListener<K, V> + Send + Sync>>,
     pub(crate) _marker: PhantomData<(K, V)>,
 }
@@ -47,6 +52,7 @@ where
 {
     max_weight: Weight,
     policy: P,
+    shards: usize,
     lifecycle_listener: Option<Arc<dyn LifecycleListener<K, V> + Send + Sync>>,
     _marker: PhantomData<(K, V)>,
 }
@@ -60,10 +66,23 @@ where
         Self {
             max_weight: Weight::ZERO,
             policy: Arc::new(DefaultPolicy),
+            shards: default_shard_count(),
             lifecycle_listener: None,
             _marker: PhantomData,
         }
     }
+}
+
+/// Default shard count = next-power-of-two of available parallelism,
+/// minimum 1. Picked to spread per-shard contention across cores
+/// without inflating per-cache memory beyond what callers expect.
+/// Fall back to 1 when the runtime can't report parallelism.
+fn default_shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .next_power_of_two()
+        .max(1)
 }
 
 impl<K, V> CacheBuilder<K, V, DynPolicy<K, V>>
@@ -104,9 +123,22 @@ where
         CacheBuilder {
             max_weight: self.max_weight,
             policy,
+            shards: self.shards,
             lifecycle_listener: self.lifecycle_listener,
             _marker: PhantomData,
         }
+    }
+
+    /// Sets the requested shard count (rounded up to a power of two,
+    /// minimum 1). With more than one shard, each shard enforces a
+    /// rounded-up share of [`Self::max_weight`], so the observed total
+    /// weight may overshoot by up to `shards - 1` units. Pass `1` for a
+    /// strict global cap (also useful for capacity tests that assume a
+    /// single LRU).
+    #[must_use]
+    pub fn shards(mut self, shards: usize) -> Self {
+        self.shards = shards.max(1);
+        self
     }
 
     #[must_use]
@@ -136,6 +168,7 @@ where
         CacheConfig {
             max_weight: self.max_weight,
             policy: self.policy,
+            shards: self.shards,
             lifecycle_listener: self.lifecycle_listener,
             _marker: PhantomData,
         }
