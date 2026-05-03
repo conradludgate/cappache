@@ -157,6 +157,34 @@ where
         self.inner.contains_key(key)
     }
 
+    /// Number of `Ready` entries currently held. In-flight miss leaders are
+    /// not counted.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Equivalent to `self.len() == 0`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sum of [`Policy::weight`] over all `Ready` entries. Always ≤
+    /// [`Self::max_weight`].
+    #[must_use]
+    pub fn weight(&self) -> u64 {
+        self.inner.weight()
+    }
+
+    /// Removes every `Ready` entry, fires `Removed` lifecycle events for each
+    /// drained value, and cancels every in-flight miss lane (so any pending
+    /// `try_get_with` follower retries instead of waiting forever on a
+    /// flight that nobody will publish).
+    pub fn clear(&self) {
+        self.inner.clear();
+    }
+
     /// Runs the miss initializer for `key` when absent or not yet served, coalescing concurrent waiters.
     ///
     /// # Errors

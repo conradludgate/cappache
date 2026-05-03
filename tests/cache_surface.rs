@@ -258,3 +258,68 @@ async fn ok_into_result_await_yields_ok() {
     let out = OkIntoResult::new(async { 99_u32 }).await;
     assert_eq!(out, Ok(99));
 }
+
+#[test]
+fn len_is_empty_weight_track_inserts_and_removes() {
+    let cache = Cache::<String, String>::new(
+        CacheBuilder::new()
+            .max_weight(Weight::new(100))
+            .policy(Arc::new(DefaultPolicy))
+            .build(),
+    );
+    assert!(cache.is_empty());
+    assert_eq!(cache.len(), 0);
+    assert_eq!(cache.weight(), 0);
+
+    cache.insert("a".into(), "v".into());
+    cache.insert("b".into(), "v".into());
+    assert!(!cache.is_empty());
+    assert_eq!(cache.len(), 2);
+    // DefaultPolicy weights every entry as 1.
+    assert_eq!(cache.weight(), 2);
+
+    let _ = cache.remove("a");
+    assert_eq!(cache.len(), 1);
+    assert_eq!(cache.weight(), 1);
+}
+
+#[test]
+fn clear_drops_entries_and_fires_removed_for_each() {
+    use std::sync::Mutex;
+
+    type Events = Arc<Mutex<Vec<(LifecycleReason, String, Option<String>)>>>;
+    struct Recorder(Events);
+    impl LifecycleListener<String, String> for Recorder {
+        fn on_event(&self, r: LifecycleReason, k: String, v: Option<String>) {
+            self.0.lock().unwrap().push((r, k, v));
+        }
+    }
+
+    let events: Events = Arc::new(Mutex::new(Vec::new()));
+    let listener: Arc<dyn LifecycleListener<String, String> + Send + Sync> =
+        Arc::new(Recorder(Arc::clone(&events)));
+    let cache = Cache::<String, String>::new(
+        CacheBuilder::new()
+            .max_weight(Weight::new(100))
+            .policy(Arc::new(DefaultPolicy))
+            .lifecycle_listener(listener)
+            .build(),
+    );
+    cache.insert("a".into(), "va".into());
+    cache.insert("b".into(), "vb".into());
+
+    cache.clear();
+    assert_eq!(cache.len(), 0);
+    assert_eq!(cache.weight(), 0);
+    assert!(cache.get("a").is_none());
+
+    let log = events.lock().unwrap().clone();
+    let removed: Vec<_> = log
+        .into_iter()
+        .filter(|(r, _, _)| *r == LifecycleReason::Removed)
+        .map(|(_, k, _)| k)
+        .collect();
+    assert!(removed.contains(&"a".to_string()));
+    assert!(removed.contains(&"b".to_string()));
+    assert_eq!(removed.len(), 2);
+}

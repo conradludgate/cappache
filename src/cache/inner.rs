@@ -427,6 +427,10 @@ impl ExpiryHeap {
     fn pop(&mut self) -> Option<HeapKey> {
         self.0.pop().map(|Reverse(k)| k)
     }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// Drain entries whose materialised deadline is at or before `now`. Each
@@ -702,6 +706,66 @@ where
         st.slab
             .get(id)
             .is_some_and(|es| entry_is_served(&es.entry, now))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("cache mutex poisoned")
+            .slab
+            .len()
+    }
+
+    pub(crate) fn weight(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("cache mutex poisoned")
+            .total_weight
+    }
+
+    /// Drains every `Ready` slot, fires `Removed` for each one outside the
+    /// lock, and cancels every in-flight miss lane so any waiter sees a
+    /// retry signal rather than blocking forever on an abandoned flight.
+    pub(crate) fn clear(&self)
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let mut st = self.state.lock().expect("cache mutex poisoned");
+        let State {
+            entries,
+            inflight,
+            slab,
+            evict_list,
+            expiry,
+            total_weight,
+            ..
+        } = &mut *st;
+        let mut drained: Vec<(K, V)> = Vec::with_capacity(slab.len());
+        while let Some(tail) = evict_list.tail {
+            evict_list.unlink(slab, tail);
+            if let Some(entry_slot) = slab.remove(tail) {
+                drained.push((entry_slot.key, entry_slot.entry.value));
+            }
+        }
+        entries.clear();
+        expiry.clear();
+        *total_weight = 0;
+
+        // Cancel pending miss lanes before releasing the lock so followers
+        // see Cancelled instead of waiting on a sender we are about to drop.
+        let cancelled: Vec<Vec<InflightLane<V>>> = inflight.drain().map(|(_, v)| v).collect();
+        drop(st);
+
+        for lanes in &cancelled {
+            for lane in lanes {
+                lane.cancel();
+            }
+        }
+
+        for (k, v) in drained {
+            self.notify_lifecycle(LifecycleReason::Removed, k, Some(v));
+        }
     }
 
     pub(crate) fn insert(&self, key: K, value: V) -> Option<V>
