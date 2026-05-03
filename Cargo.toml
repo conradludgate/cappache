@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [dependencies]
+hashbrown = "0.17"
 pin-project-lite = "0.2"
 tokio = { version = "1", features = ["sync"] }
 

@@ -1,10 +1,11 @@
 use std::any::Any;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use hashbrown::{HashMap, HashSet};
 use tokio::sync::watch;
 
 use crate::config::CacheConfig;
