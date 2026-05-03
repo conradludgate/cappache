@@ -57,14 +57,17 @@ etc.).
 `**try_get_with**` vs `**revalidate**` may **not** dedupe with each other unless the design explicitly
 unifies those `TypeId` keys.
 
-## Blocking `get_with`
+## Sync miss-coalescing
 
-- `Cache::get_with_blocking` uses **[pollster](https://github.com/zesterer/pollster)** **0.4.0**
-`block_on` (condvar-backed wait) **inlined** in the `blocking` module.
-Until the future completes, callers without an async runtime can still run the initializer on the
-current thread. `**get` / `insert` / `remove`** are synchronous only. That driver is not public API.
-- Do not use blocking `get_with_blocking` from async worker threads when the initializer may depend on
-that same runtime (deadlock risk). Prefer the async miss helpers there.
+- `Cache::get_or_insert_with` is the sync counterpart to `get_with`. It single-flights through
+the same per-shard `inflight` map as `try_get_with`/`get_with`, but each lane carries a Condvar-backed
+`SyncMissFlight<V>` instead of a `tokio::sync::watch`. The shard `Mutex` is dropped before the user
+closure runs, so other keys remain responsive while one key's leader produces a value.
+- Sync and async lanes are tagged by `TypeId<E>` (sentinel `SyncMarker` for sync), mirroring the
+typed-lanes design: a sync caller never joins an async leader (and vice versa); both kinds run
+their own `init` if no compatible follower is found.
+- Do not call `get_or_insert_with` from a Tokio worker thread if the closure would itself block on
+that runtime — the current-thread block is a hard wait; prefer the async miss helpers there.
 
 ## Caller-driven `revalidate`
 
@@ -175,7 +178,7 @@ the primary signal — Criterion's per-bench diff is supporting evidence.
 ## Open questions
 
 - **`Send` bounds** on stored values and initializer futures (`get_with` / `try_get_with` vs `revalidate` / `try_revalidate` split is documented above).
-- **Bare `Future` for `get_with` (beyond `get_with_blocking`):** left **open**. Bias **against** adding a detached miss future: callers can **drop it without polling**, which risks stranded in-flight work or surprising behavior for other waiters on the same key. Prefer **`async fn get_with`** plus **`get_with_blocking`** unless a concrete integration needs a third path.
+- **Bare `Future` for `get_with`:** left **open**. Bias **against** adding a detached miss future: callers can **drop it without polling**, which risks stranded in-flight work or surprising behavior for other waiters on the same key. Prefer **`async fn get_with`** plus **`get_or_insert_with`** unless a concrete integration needs a third path.
 - **Handoff queue bounds:** only becomes important if you add a **persistent** async drain or unbounded producer pressure on a deferred-drop queue. Until then, note “not applicable” for the current immediate `Vec` handoff after each operation.
 
 **MSRV:** **1.95** (declared in `Cargo.toml` as `rust-version`).

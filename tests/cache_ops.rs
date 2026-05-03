@@ -8,8 +8,8 @@
 //! key. Init errors may be returned from `try_revalidate` or only after the async job—see
 //! `try_revalidate_initializer_error_propagates_as_err`.
 //!
-//! Prefer `get_with` + `.await` inside `#[tokio::test]` over `get_with_blocking` on the Tokio worker
-//! when the initializer would need the same runtime (see crate rustdoc on blocking hazards).
+//! Prefer `get_with` + `.await` inside `#[tokio::test]` over `get_or_insert_with` on the Tokio
+//! worker when the initializer would need the same runtime (see crate rustdoc on blocking hazards).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -316,13 +316,13 @@ mod miss {
     }
 
     #[test]
-    fn get_with_blocking_hit_does_not_run_initializer() {
+    fn get_or_insert_with_hit_does_not_run_initializer() {
         let cache = test_cache();
         let k = "block_hit".to_string();
         let _ = cache.insert(k.clone(), "cached".to_string());
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = Arc::clone(&calls);
-        let v = cache.get_with_blocking(k.clone(), || async move {
+        let v = cache.get_or_insert_with(k.clone(), |_| {
             calls_c.fetch_add(1, Ordering::SeqCst);
             "wrong".to_string()
         });
@@ -348,12 +348,51 @@ mod miss {
     }
 
     #[test]
-    fn get_with_blocking_miss_on_sync_thread() {
+    fn get_or_insert_with_miss_on_sync_thread() {
         let cache = test_cache();
         let k = "block1".to_string();
-        let v = cache.get_with_blocking(k.clone(), || async { "blocked".to_string() });
+        let v = cache.get_or_insert_with(k.clone(), |_| "blocked".to_string());
         assert_eq!(v, "blocked");
         assert_eq!(cache.get(&k), Some("blocked".to_string()));
+    }
+
+    /// Sync miss-coalescing: many sync waiters on the same key share one
+    /// init invocation. Mirrors the async `concurrent_get_with_same_key`
+    /// guarantee but exercises the Condvar-backed path.
+    #[test]
+    fn concurrent_get_or_insert_with_same_key_single_initializer() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let cache = Arc::new(test_cache());
+        let k = "shared".to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let cache = Arc::clone(&cache);
+            let k = k.clone();
+            let calls = Arc::clone(&calls);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                cache.get_or_insert_with(k.clone(), |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    "computed".to_string()
+                })
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), "computed");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "sync miss coalescing must run init exactly once across waiters",
+        );
     }
 }
 

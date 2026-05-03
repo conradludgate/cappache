@@ -13,11 +13,11 @@ use std::task::{Context, Poll, Waker};
 
 use pin_project_lite::pin_project;
 
+use crate::Weight;
 use crate::config::{CacheConfig, DynPolicy};
 use crate::lifecycle::LifecycleListener;
 use crate::policy::Policy;
 use crate::rt::{Executor, RevalidateScheduled};
-use crate::{Weight, blocking};
 
 pin_project! {
     /// Internal adapter wrapping a fallible miss future as `Result<_, Infallible>`
@@ -255,25 +255,17 @@ where
         .expect("infallible: get_with uses OkIntoResult")
     }
 
-    /// Like [`Self::get_with`], blocking the current thread until completion.
-    ///
-    /// # Panics
-    ///
-    /// Same as [`Self::get_with`].
-    pub fn get_with_blocking<F, Fut>(&self, key: K, init: F) -> V
+    /// Synchronous miss-coalescing variant of [`Self::get_with`]: blocks
+    /// the current thread on a Condvar until the leader publishes a
+    /// value. Does **not** drive any async runtime, so it is safe to use
+    /// outside (or inside) a Tokio context. The shard lock is released
+    /// before `init` runs, so other keys remain responsive while the
+    /// initializer is executing.
+    pub fn get_or_insert_with<F>(&self, key: K, init: F) -> V
     where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = V>,
+        F: FnOnce(&K) -> V,
     {
-        let inner = Arc::clone(&self.inner);
-        blocking::block_on(async move {
-            inner::Inner::try_get_with(&inner, key, || {
-                let f = init();
-                async move { Ok::<_, Infallible>(f.await) }
-            })
-            .await
-            .expect("infallible: get_with_blocking uses OkIntoResult")
-        })
+        inner::Inner::get_or_insert_with(&self.inner, key, init)
     }
 
     /// Schedules a refresh job on `executor` for `key`.

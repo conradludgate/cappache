@@ -4,9 +4,9 @@
 //! Clache (Conrad Ludgate cache): a safe Rust concurrent cache API.
 //!
 //! This crate is **`#![deny(unsafe_code)]`**. The in-memory [`Cache`](crate::Cache) implements
-//! synchronous `get` / `insert` / `remove`, async miss helpers, and executor-driven refresh;
-//! [`Cache::get_with_blocking`](crate::Cache::get_with_blocking) uses **[pollster](https://github.com/zesterer/pollster)**
-//! **0.4.0** logic inlined in [`blocking`](crate::blocking) (not part of the public API; see `third-party/pollster/`).
+//! synchronous `get` / `insert` / `remove`, async miss helpers, and executor-driven refresh.
+//! Sync miss-coalescing lives on [`Cache::get_or_insert_with`] (Condvar-backed; no async
+//! runtime needed) for callers outside Tokio.
 //!
 //! ## Overview
 //!
@@ -17,7 +17,8 @@
 //!   implementation (see [`policy::TtlFromWrite`], [`policy::IdleTimeout`], etc.).
 //! - Observe removals and updates through [`lifecycle::LifecycleReason`] and [`lifecycle::LifecycleListener`].
 //! - [`Cache::get`], [`Cache::insert`], and [`Cache::remove`] are **synchronous**; miss-path helpers are
-//!   async [`Cache::try_get_with`] / [`Cache::get_with`], with [`Cache::get_with_blocking`] for callers without an async runtime.
+//!   async [`Cache::try_get_with`] / [`Cache::get_with`], plus the sync
+//!   [`Cache::get_or_insert_with`] for callers without an async runtime.
 //! - Caller-driven background refresh: [`Cache::try_revalidate`], [`Cache::revalidate`] with an [`Executor`]
 //!   from the [`rt`] module.
 //! - Fallible miss path uses **`E: Clone`** on [`Cache::try_get_with`] / [`Cache::try_revalidate`] instead of `Arc<E>`;
@@ -32,7 +33,6 @@
 //! Non-normative implementation intent (O(1) targets, lazy maintenance, deferred drops) lives in
 //! [`DESIGN.md`](../docs/DESIGN.md) in the `docs/` folder.
 
-pub(crate) mod blocking;
 pub mod cache;
 pub mod config;
 pub mod lifecycle;

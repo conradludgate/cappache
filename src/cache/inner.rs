@@ -5,7 +5,7 @@ use std::collections::BinaryHeap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
@@ -92,6 +92,75 @@ where
     }
 }
 
+/// Per-key Condvar-backed coalescing point for the sync
+/// `get_or_insert_with` path. Lives alongside the async
+/// [`MissFlight<V, E>`] entries in `State::inflight` under a sentinel
+/// [`TypeId`] so the same in-flight book-keeping serves both worlds
+/// without depending on the tokio runtime.
+pub(crate) struct SyncMissFlight<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    state: Mutex<SyncFlightState<V>>,
+    cond: Condvar,
+}
+
+enum SyncFlightState<V> {
+    Pending,
+    Settled(V),
+    Cancelled,
+}
+
+impl<V> SyncMissFlight<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SyncFlightState::Pending),
+            cond: Condvar::new(),
+        }
+    }
+
+    fn publish(&self, v: V) {
+        let mut s = self.state.lock().expect("sync flight mutex poisoned");
+        *s = SyncFlightState::Settled(v);
+        self.cond.notify_all();
+    }
+
+    fn cancel(&self) {
+        let mut s = self.state.lock().expect("sync flight mutex poisoned");
+        if matches!(*s, SyncFlightState::Pending) {
+            *s = SyncFlightState::Cancelled;
+            self.cond.notify_all();
+        }
+    }
+
+    /// Returns `Some(v)` once the leader publishes a value. Returns
+    /// `None` when the leader cancelled (init future dropped or leader
+    /// guard fired); the caller is then expected to re-enter the probe
+    /// loop to either become leader or join a fresh follower.
+    fn wait(&self) -> Option<V> {
+        let mut s = self.state.lock().expect("sync flight mutex poisoned");
+        loop {
+            match &*s {
+                SyncFlightState::Pending => {
+                    s = self.cond.wait(s).expect("sync flight mutex poisoned");
+                }
+                SyncFlightState::Settled(v) => return Some(v.clone()),
+                SyncFlightState::Cancelled => return None,
+            }
+        }
+    }
+}
+
+/// Sentinel `E` used to tag sync lanes alongside the typed
+/// `try_get_with` lanes. Lookups for a sync lane go through
+/// [`InflightLane::downcast_sync`], not the generic `downcast::<E>` —
+/// the marker exists purely so the `inflight` map can store both flight
+/// kinds in the same `Vec<InflightLane<V>>` without a separate map.
+struct SyncMarker;
+
 /// One in-flight miss for a key. Lanes are matched by `TypeId<E>`; the
 /// `Arc<dyn Any + Send + Sync>` carries the typed `MissFlight<V, E>` for
 /// downcast on the follower side, and `cancel_fn` lets a future cancel-all
@@ -115,6 +184,15 @@ where
     E: Clone + Send + Sync + 'static,
 {
     if let Some(f) = (**a).downcast_ref::<MissFlight<V, E>>() {
+        f.cancel();
+    }
+}
+
+fn cancel_sync<V>(a: &Arc<dyn Any + Send + Sync>)
+where
+    V: Clone + Send + Sync + 'static,
+{
+    if let Some(f) = (**a).downcast_ref::<SyncMissFlight<V>>() {
         f.cancel();
     }
 }
@@ -144,6 +222,24 @@ where
         }
         Arc::clone(&self.flight)
             .downcast::<MissFlight<V, E>>()
+            .ok()
+    }
+
+    fn new_sync(flight: Arc<SyncMissFlight<V>>) -> Self {
+        Self {
+            type_id: TypeId::of::<SyncMarker>(),
+            flight: flight as Arc<dyn Any + Send + Sync>,
+            cancel_fn: cancel_sync::<V>,
+            _v: PhantomData,
+        }
+    }
+
+    fn downcast_sync(&self) -> Option<Arc<SyncMissFlight<V>>> {
+        if self.type_id != TypeId::of::<SyncMarker>() {
+            return None;
+        }
+        Arc::clone(&self.flight)
+            .downcast::<SyncMissFlight<V>>()
             .ok()
     }
 
@@ -687,6 +783,15 @@ where
     Leader { miss: Arc<MissFlight<V, E>> },
 }
 
+enum SyncMissStep<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    Hit(V),
+    Wait(Arc<SyncMissFlight<V>>),
+    Leader { miss: Arc<SyncMissFlight<V>> },
+}
+
 /// Identity-only lane removal. Compares Arc pointer addresses; ignores any
 /// fresh lane installed for the same key by an unrelated leader (cancelled
 /// then re-entered). If the per-key vec becomes empty the entry is dropped to
@@ -741,6 +846,43 @@ where
         }
         // Tolerate poisoning: the leader might already be unwinding from a
         // panic in `init`, and double-panicking from Drop aborts the process.
+        let mut st = match self.inner.shard_for(self.key).lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        remove_lane(&mut st, self.key, &self.flight_any);
+        drop(st);
+        self.flight.cancel();
+    }
+}
+
+/// RAII cleanup for the sync `get_or_insert_with` leader. Mirror of
+/// [`LeaderGuard`] but parameterised over the Condvar-backed
+/// [`SyncMissFlight`]; on cancel/panic it removes the lane and signals
+/// any sync followers to retry.
+struct SyncLeaderGuard<'a, K, V, P>
+where
+    K: Eq + Hash + 'static,
+    V: Clone + Send + Sync + 'static,
+    P: 'static,
+{
+    inner: &'a Inner<K, V, P>,
+    key: &'a K,
+    flight: Arc<SyncMissFlight<V>>,
+    flight_any: Arc<dyn Any + Send + Sync>,
+    armed: bool,
+}
+
+impl<K, V, P> Drop for SyncLeaderGuard<'_, K, V, P>
+where
+    K: Eq + Hash + 'static,
+    V: Clone + Send + Sync + 'static,
+    P: 'static,
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let mut st = match self.inner.shard_for(self.key).lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -1367,6 +1509,135 @@ where
                         self.fire_reclaim(rec);
                     }
                     return res;
+                }
+            }
+        }
+    }
+
+    /// Sync mirror of [`Self::miss_probe`]: returns a hit, a follower
+    /// flight to wait on, or installs a fresh sync-leader lane. Sync and
+    /// async flights coexist in the same `inflight` map under a sentinel
+    /// `TypeId`, so a sync caller never joins an async leader (and vice
+    /// versa) — both kinds run their own `init` if no compatible
+    /// follower is found, matching the typed-lanes semantics.
+    fn sync_miss_probe(&self, key: &K) -> SyncMissStep<V>
+    where
+        K: Eq + Hash + Clone,
+        V: Clone + Send + Sync + 'static,
+    {
+        let now = Instant::now();
+        let shard = self.shard_for(key);
+        let mut st = shard.lock().expect("cache mutex poisoned");
+
+        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
+            let expired = st
+                .slab
+                .get(id)
+                .is_some_and(|es| !entry_is_served(&es.entry, now));
+            if expired
+                && let Some((_, v, _)) = evict_slot(&mut st, &self.hasher, id)
+            {
+                drop(st);
+                self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
+                st = shard.lock().expect("cache mutex poisoned");
+            }
+        }
+
+        let now = Instant::now();
+        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
+            let still_served = st
+                .slab
+                .get(id)
+                .is_some_and(|es| entry_is_served(&es.entry, now));
+            if still_served {
+                let (value, generation, update) = {
+                    let State {
+                        slab, evict_list, ..
+                    } = &mut *st;
+                    evict_list.promote_to_mru(slab, id);
+                    let es = slab
+                        .get_mut(id)
+                        .expect("just confirmed Occupied above under our mutex");
+                    let value = es.entry.value.clone();
+                    let generation = es.generation;
+                    let update =
+                        update_read_deadline(key, &mut es.entry, &self.config.policy, now);
+                    (value, generation, update)
+                };
+                if let Some(dl) = update.new_deadline {
+                    expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
+                }
+                return SyncMissStep::Hit(value);
+            }
+        }
+
+        if let Some(lanes) = st.inflight.get(key)
+            && let Some(lane) = lanes.iter().find_map(InflightLane::downcast_sync)
+        {
+            return SyncMissStep::Wait(lane);
+        }
+
+        let miss = Arc::new(SyncMissFlight::<V>::new());
+        st.inflight
+            .entry(key.clone())
+            .or_default()
+            .push(InflightLane::new_sync(Arc::clone(&miss)));
+        SyncMissStep::Leader { miss }
+    }
+
+    /// Sync miss-coalescing entry point. The user closure runs **without**
+    /// the shard lock held, so the cache stays responsive on other keys
+    /// while the leader produces a value.
+    ///
+    /// `key` is taken by value to match the async [`Self::try_get_with`]
+    /// signature; internally it is borrowed everywhere except the owned
+    /// clone that goes into the `inflight` map and the slab.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn get_or_insert_with<F>(self: &Arc<Self>, key: K, init: F) -> V
+    where
+        K: Eq + Hash + Clone + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        F: FnOnce(&K) -> V,
+    {
+        let mut init = Some(init);
+        loop {
+            match self.sync_miss_probe(&key) {
+                SyncMissStep::Hit(v) => return v,
+                SyncMissStep::Wait(f) => {
+                    if let Some(v) = f.wait() {
+                        return v;
+                    }
+                    // Leader cancelled — its lane is gone; loop and either
+                    // observe a fresh value or take leadership ourselves.
+                }
+                SyncMissStep::Leader { miss } => {
+                    let init = init
+                        .take()
+                        .expect("init consumed: only the leader arm consumes it");
+                    let flight_any: Arc<dyn Any + Send + Sync> =
+                        Arc::clone(&miss) as Arc<dyn Any + Send + Sync>;
+                    let mut guard = SyncLeaderGuard {
+                        inner: self.as_ref(),
+                        key: &key,
+                        flight: miss,
+                        flight_any,
+                        armed: true,
+                    };
+                    let value = init(&key);
+                    let mut st = guard
+                        .inner
+                        .shard_for(&key)
+                        .lock()
+                        .expect("cache mutex poisoned");
+                    remove_lane(&mut st, &key, &guard.flight_any);
+                    let now = Instant::now();
+                    let reclaimed = self.finish_miss_ok(&mut st, &key, &value, now);
+                    guard.flight.publish(value.clone());
+                    guard.armed = false;
+                    drop(guard);
+                    drop(st);
+                    self.fire_reclaim(reclaimed);
+                    return value;
                 }
             }
         }
