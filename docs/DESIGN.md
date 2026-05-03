@@ -40,8 +40,9 @@ unifies those `TypeId` keys.
 
 ## Blocking `get_with`
 
-- `Cache::get_with_blocking` uses an internal park-the-thread driver (pollster-style) until the
-future completes so callers without an async runtime can still run the initializer on the
+- `Cache::get_with_blocking` uses **[pollster](https://github.com/zesterer/pollster)** **0.4.0**
+`block_on` (condvar-backed wait) **inlined** in the `blocking` module.
+Until the future completes, callers without an async runtime can still run the initializer on the
 current thread. `**get` / `insert` / `remove`** are synchronous only. That driver is not public API.
 - Do not use blocking `get_with_blocking` from async worker threads when the initializer may depend on
 that same runtime (deadlock risk). Prefer the async miss helpers there.

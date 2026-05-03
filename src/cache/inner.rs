@@ -1,9 +1,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::future::poll_fn;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
-use std::task::Poll;
 use std::time::Instant;
 
 use tokio::sync::watch;
@@ -44,6 +42,8 @@ pub(crate) struct MissFlight<V> {
 
 pub(crate) struct Inner<K: 'static, V: 'static> {
     pub(crate) config: CacheConfig<K, V>,
+    /// All `Ready` / `Miss` map state. **`std::sync::Mutex` only** — never `tokio::sync::Mutex`; the
+    /// lock is released before awaiting user `init` futures in [`Self::try_get_with`].
     pub(crate) state: Mutex<State<K, V>>,
 }
 
@@ -66,6 +66,7 @@ pub(crate) struct CacheEntry<V> {
 }
 
 pub(crate) enum MissStep<V> {
+    Hit(V),
     Wait(Arc<MissFlight<V>>),
     Retry,
     Leader { miss: Arc<MissFlight<V>> },
@@ -267,6 +268,55 @@ where
         pending
     }
 
+    /// Single critical section for one `try_get_with` iteration: served hit, in-flight miss wait, or
+    /// install miss leader. Avoids TOCTOU between separate `get_served` / miss checks / leader insert.
+    fn miss_probe(&self, key: &K) -> MissStep<V>
+    where
+        K: Eq + Hash + Clone + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        let now = Instant::now();
+        let mut st = self.state.lock().expect("cache mutex poisoned");
+
+        let expired = match st.entries.get(key) {
+            Some(MapSlot::Ready(e)) => !entry_is_served(e, now),
+            _ => false,
+        };
+        if expired && let Some(MapSlot::Ready(e)) = st.entries.remove(key) {
+            let w = self.ready_entry_weight(key, &e);
+            st.total_weight = st.total_weight.saturating_sub(w);
+            let v = e.value.clone();
+            drop(st);
+            self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
+            st = self.state.lock().expect("cache mutex poisoned");
+        }
+
+        let now = Instant::now();
+        if let Some(MapSlot::Ready(e)) = st.entries.get_mut(key)
+            && entry_is_served(e, now)
+        {
+            update_read_deadline(key, e, self.config.policy.as_ref(), now);
+            return MissStep::Hit(e.value.clone());
+        }
+
+        match st.entries.get(key) {
+            Some(MapSlot::Miss(f)) => MissStep::Wait(Arc::clone(f)),
+            Some(MapSlot::Ready(_)) => MissStep::Retry,
+            None => {
+                let (settle_tx, settle_rx) = watch::channel::<Option<FlightMsg<V>>>(None);
+                let miss = Arc::new(MissFlight {
+                    settle: settle_tx,
+                    _hold: settle_rx,
+                });
+                st.entries
+                    .insert(key.clone(), MapSlot::Miss(Arc::clone(&miss)));
+                MissStep::Leader {
+                    miss: Arc::clone(&miss),
+                }
+            }
+        }
+    }
+
     pub(crate) async fn try_get_with<F, Fut, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
@@ -276,59 +326,11 @@ where
         V: Clone + Send + Sync + 'static,
     {
         loop {
-            if let Some(v) = self.get_served(&key) {
-                return Ok(v);
-            }
-
-            if let Some(flight) = {
-                let st = self.state.lock().expect("cache mutex poisoned");
-                match st.entries.get(&key) {
-                    Some(MapSlot::Miss(f)) => Some(Arc::clone(f)),
-                    _ => None,
-                }
-            } {
-                return await_miss_settled(&flight).await;
-            }
-
-            let step = {
-                let mut st = self.state.lock().expect("cache mutex poisoned");
-                if let Some(MapSlot::Ready(e)) = st.entries.get(&key) {
-                    let now = Instant::now();
-                    if entry_is_served(e, now) {
-                        return Ok(e.value.clone());
-                    }
-                }
-                match st.entries.get(&key) {
-                    Some(MapSlot::Miss(f)) => MissStep::Wait(Arc::clone(f)),
-                    Some(MapSlot::Ready(_)) => MissStep::Retry,
-                    None => {
-                        let (settle_tx, settle_rx) = watch::channel::<Option<FlightMsg<V>>>(None);
-                        let miss = Arc::new(MissFlight {
-                            settle: settle_tx,
-                            _hold: settle_rx,
-                        });
-                        st.entries
-                            .insert(key.clone(), MapSlot::Miss(Arc::clone(&miss)));
-                        MissStep::Leader { miss }
-                    }
-                }
-            };
-
-            match step {
+            match self.miss_probe(&key) {
+                MissStep::Hit(v) => return Ok(v),
                 MissStep::Wait(f) => return await_miss_settled(&f).await,
                 MissStep::Retry => {}
                 MissStep::Leader { miss } => {
-                    let mut first_poll = true;
-                    poll_fn(|cx| {
-                        if first_poll {
-                            first_poll = false;
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        } else {
-                            Poll::Ready(())
-                        }
-                    })
-                    .await;
                     let fut = init();
                     let res = fut.await;
                     let mut st = self.state.lock().expect("cache mutex poisoned");

@@ -155,6 +155,18 @@ fn idle_timeout_caps_hooks() {
 }
 
 #[test]
+fn idle_timeout_weight_matches_inner_default_policy() {
+    let idle = std::time::Duration::from_secs(30);
+    let idle_pol = IdleTimeout::new(idle, DefaultPolicy);
+    let k = "k".to_string();
+    let v = "hello".to_string();
+    assert_eq!(
+        Policy::weight(&idle_pol, &k, &v),
+        Policy::weight(&DefaultPolicy, &k, &v)
+    );
+}
+
+#[test]
 fn policy_clone_does_not_change_policy_ref_semantics() {
     let cache = string_cache();
     let k = "k".to_string();

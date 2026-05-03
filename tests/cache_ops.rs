@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use clache::{
     Cache, CacheBuilder, DefaultPolicy, Executor, IdleTimeout, LifecycleListener, LifecycleReason,
-    RevalidateScheduled, TtlFromWrite, Weight,
+    Policy, RevalidateScheduled, TIME_UNBOUNDED, TtlFromWrite, Weight,
 };
 
 type K = String;
@@ -101,6 +101,20 @@ where
 {
     fn execute(&self, _fut: Fut) {
         self.executed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// For `#[tokio::test]` only: schedules work on the test's **current-thread** runtime via [`tokio::spawn`].
+/// Drive completion with awaits / [`tokio::task::yield_now`] so spawned tasks run on that scheduler.
+#[derive(Clone, Copy, Default)]
+struct TokioSpawnExecutor;
+
+impl<Fut> Executor<Fut> for TokioSpawnExecutor
+where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        tokio::spawn(fut);
     }
 }
 
@@ -221,50 +235,26 @@ mod miss {
             let barrier = Arc::new(tokio::sync::Barrier::new(3));
             let init_count = Arc::new(AtomicUsize::new(0));
 
-            let handles = [
-                {
-                    let c = Arc::clone(&cache);
-                    let k = k.clone();
-                    let b = Arc::clone(&barrier);
-                    let ic = Arc::clone(&init_count);
-                    tokio::spawn(async move {
-                        b.wait().await;
-                        c.try_get_with(k, || async move {
-                            ic.fetch_add(1, Ordering::SeqCst);
-                            Err::<String, ()>(())
-                        })
-                        .await
+            // The leader must hit an `.await` inside `init` so other tasks can run `miss_probe` and
+            // observe `MapSlot::Miss` before the leader finishes with `Err` and removes the slot.
+            // A purely synchronous `Err` future completes in one poll, so one task can run the whole
+            // flight before peers are scheduled (then each sees an empty map and becomes leader again).
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let c = Arc::clone(&cache);
+                let k = k.clone();
+                let b = Arc::clone(&barrier);
+                let ic = Arc::clone(&init_count);
+                handles.push(tokio::spawn(async move {
+                    b.wait().await;
+                    c.try_get_with(k, move || async move {
+                        ic.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Err::<String, ()>(())
                     })
-                },
-                {
-                    let c = Arc::clone(&cache);
-                    let k = k.clone();
-                    let b = Arc::clone(&barrier);
-                    let ic = Arc::clone(&init_count);
-                    tokio::spawn(async move {
-                        b.wait().await;
-                        c.try_get_with(k, || async move {
-                            ic.fetch_add(1, Ordering::SeqCst);
-                            Err::<String, ()>(())
-                        })
-                        .await
-                    })
-                },
-                {
-                    let c = Arc::clone(&cache);
-                    let k = k.clone();
-                    let b = Arc::clone(&barrier);
-                    let ic = Arc::clone(&init_count);
-                    tokio::spawn(async move {
-                        b.wait().await;
-                        c.try_get_with(k, || async move {
-                            ic.fetch_add(1, Ordering::SeqCst);
-                            Err::<String, ()>(())
-                        })
-                        .await
-                    })
-                },
-            ];
+                    .await
+                }));
+            }
 
             let mut results = Vec::new();
             for h in handles {
@@ -364,11 +354,26 @@ mod miss {
 }
 
 mod revalidate_tests {
-    //! Executor scheduling and `SkippedInFlight` behaviour. For end-to-end refresh (get reflects
-    //! new value after `RefreshWork` completes), drive a real executor in tests and assert `get` /
-    //! lifecycle as needed.
+    //! Executor scheduling and `SkippedInFlight` behaviour. `CountingExecutor` records schedules
+    //! without running work. For **`RefreshWork`** completing on the test runtime, use
+    //! `TokioSpawnExecutor` from a **`#[tokio::test]`** and `wait_get` until `get` matches.
 
     use super::*;
+
+    async fn wait_get(cache: &Cache<K, V>, key: &str, want: &str) {
+        let key = key.to_string();
+        let want = want.to_string();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cache.get(&key) == Some(want.clone()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timeout waiting for cache get after refresh");
+    }
 
     #[test]
     fn try_revalidate_first_call_submitted_and_executes() {
@@ -443,6 +448,32 @@ mod revalidate_tests {
         assert_eq!(s, RevalidateScheduled::SkippedInFlight);
         assert_eq!(ex.executed_count(), 1);
     }
+
+    #[tokio::test]
+    async fn try_revalidate_run_executor_updates_get_and_second_submit_not_skipped() {
+        with_timeout(Duration::from_secs(30), async {
+            let cache = test_cache();
+            cache.insert("rwk".into(), "old".into());
+            let ex = TokioSpawnExecutor;
+            assert_eq!(
+                cache.try_revalidate("rwk".into(), &ex, |_k| async move {
+                    Ok::<_, InitError>("mid".into())
+                }),
+                Ok(RevalidateScheduled::Submitted)
+            );
+            wait_get(&cache, "rwk", "mid").await;
+            assert_eq!(cache.get(&"rwk".into()), Some("mid".into()));
+            assert_eq!(
+                cache.try_revalidate("rwk".into(), &ex, |_k| async move {
+                    Ok::<_, InitError>("new".into())
+                }),
+                Ok(RevalidateScheduled::Submitted)
+            );
+            wait_get(&cache, "rwk", "new").await;
+            assert_eq!(cache.get(&"rwk".into()), Some("new".into()));
+        })
+        .await;
+    }
 }
 
 // Revalidate data plane: after `Submitted` and the executor runs `RefreshWork` to completion,
@@ -465,6 +496,20 @@ mod capacity {
              visible simultaneously once the core enforces the budget (eviction may be lazy on \
              insert—see DESIGN.md—relax only if the implementation deliberately defers eviction)"
         );
+    }
+
+    #[test]
+    fn max_weight_two_keeps_both_unit_weight_entries() {
+        let cache = Cache::<K, V>::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(2))
+                .policy(Arc::new(DefaultPolicy))
+                .build(),
+        );
+        assert_eq!(cache.insert("a".into(), "va".into()), None);
+        assert_eq!(cache.insert("b".into(), "vb".into()), None);
+        assert_eq!(cache.get(&"a".into()), Some("va".into()));
+        assert_eq!(cache.get(&"b".into()), Some("vb".into()));
     }
 }
 
@@ -634,6 +679,48 @@ mod concurrency {
         })
         .await;
     }
+
+    #[tokio::test]
+    async fn try_get_with_follower_awaits_miss_leader_without_second_initializer() {
+        with_timeout(Duration::from_secs(30), async {
+            let cache = Arc::new(test_cache());
+            let k = "miss_follow".to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let k1 = k.clone();
+            let c1 = Arc::clone(&cache);
+            let leader = tokio::spawn(async move {
+                c1.try_get_with(k1, || async move {
+                    rx.await.expect("release leader");
+                    Ok::<_, ()>("v".into())
+                })
+                .await
+            });
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_f = Arc::clone(&calls);
+            let c2 = Arc::clone(&cache);
+            let follower = tokio::spawn(async move {
+                c2.try_get_with(k, || async move {
+                    calls_f.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>("wrong".into())
+                })
+                .await
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(()).expect("unblock leader");
+            let (r1, r2) = tokio::join!(leader, follower);
+            assert_eq!(r1.expect("leader join"), Ok("v".into()));
+            assert_eq!(r2.expect("follower join"), Ok("v".into()));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "follower must await the in-flight miss, not run a second initializer"
+            );
+        })
+        .await;
+    }
 }
 
 mod lanes {
@@ -747,6 +834,53 @@ mod policy_time {
             assert_eq!(cache.get(&"k".into()), None);
         })
         .await;
+    }
+}
+
+mod mutation_guards {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LenWeightPolicy;
+
+    impl Policy<K, V> for LenWeightPolicy {
+        fn weight(&self, _k: &K, v: &V) -> Weight {
+            Weight::new(v.len() as u64)
+        }
+
+        fn expire_after_read(
+            &self,
+            _k: &K,
+            _v: &V,
+            _read_at: Instant,
+            _written_at: Instant,
+            _time_remaining: Duration,
+        ) -> Duration {
+            TIME_UNBOUNDED
+        }
+
+        fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
+            TIME_UNBOUNDED
+        }
+    }
+
+    #[test]
+    fn remove_restores_budget_for_len_weighted_values() {
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(10))
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        let ten = "x".repeat(10);
+        assert_eq!(cache.insert("a".into(), ten.clone()), None);
+        assert_eq!(cache.remove(&"a".into()), Some(ten));
+        assert_eq!(cache.insert("b".into(), "b".repeat(5)), None);
+        assert_eq!(cache.insert("c".into(), "c".repeat(5)), None);
+        assert!(cache.get(&"b".into()).is_some());
+        assert!(cache.get(&"c".into()).is_some());
     }
 }
 

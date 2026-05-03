@@ -5,8 +5,8 @@
 //!
 //! This crate is **`#![deny(unsafe_code)]`**. The in-memory [`Cache`](crate::Cache) implements
 //! synchronous `get` / `insert` / `remove`, async miss helpers, and executor-driven refresh;
-//! [`Cache::get_with_blocking`](crate::Cache::get_with_blocking) uses an internal park-based driver
-//! (not part of the public API).
+//! [`Cache::get_with_blocking`](crate::Cache::get_with_blocking) uses **[pollster](https://github.com/zesterer/pollster)**
+//! **0.4.0** logic inlined in [`blocking`](crate::blocking) (not part of the public API; see `third-party/pollster/`).
 //!
 //! ## Overview
 //!
