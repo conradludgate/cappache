@@ -12,10 +12,18 @@ use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
 use crate::policy::Policy;
 
+/// Settled state of a miss flight broadcast through [`MissFlight::settle`].
+///
+/// `Cancelled` is published by [`LeaderGuard::drop`] when the leader's
+/// `init` future was dropped or panicked before producing a value; followers
+/// translate it into a probe retry rather than reporting the leader's
+/// never-arrived result. Without this sentinel a stale `MapSlot::Miss` would
+/// outlive the leader and deadlock every subsequent caller for that key.
 #[derive(Clone)]
 pub(crate) enum FlightMsg<V> {
     Ok(V),
     Err(Arc<dyn Any + Send + Sync>),
+    Cancelled,
 }
 
 impl<V: Clone> FlightMsg<V> {
@@ -26,13 +34,18 @@ impl<V: Clone> FlightMsg<V> {
         }
     }
 
-    pub(crate) fn into_result<E: Clone + Send + Sync + 'static>(self) -> Result<V, E> {
+    /// Returns `None` when the leader was cancelled; the follower must retry
+    /// the probe loop and may itself be promoted to leader.
+    pub(crate) fn into_settled<E: Clone + Send + Sync + 'static>(
+        self,
+    ) -> Option<Result<V, E>> {
         match self {
-            FlightMsg::Ok(v) => Ok(v),
-            FlightMsg::Err(arc) => Err(Arc::downcast::<E>(arc)
+            FlightMsg::Ok(v) => Some(Ok(v)),
+            FlightMsg::Err(arc) => Some(Err(Arc::downcast::<E>(arc)
                 .expect("miss flight error type mismatch: E must match the stored miss error type")
                 .as_ref()
-                .clone()),
+                .clone())),
+            FlightMsg::Cancelled => None,
         }
     }
 }
@@ -374,7 +387,10 @@ pub(crate) enum MissStep<V> {
     Leader { miss: Arc<MissFlight<V>> },
 }
 
-async fn await_miss_settled<V, E>(flight: &MissFlight<V>) -> Result<V, E>
+/// Returns `None` when the leader was cancelled (sender published
+/// `FlightMsg::Cancelled` or was dropped without sending); callers are
+/// expected to re-enter the probe loop in that case.
+async fn await_miss_settled<V, E>(flight: &MissFlight<V>) -> Option<Result<V, E>>
 where
     V: Clone,
     E: Clone + Send + Sync + 'static,
@@ -384,12 +400,54 @@ where
         {
             let cur = rx.borrow();
             if let Some(m) = cur.as_ref() {
-                return m.clone().into_result::<E>();
+                return m.clone().into_settled::<E>();
             }
         }
-        rx.changed().await.expect(
-            "miss settle watch: sender dropped before flight completed; this is a bug in clache",
+        if rx.changed().await.is_err() {
+            // Sender dropped without sending — treat as cancellation.
+            return None;
+        }
+    }
+}
+
+/// RAII cleanup for the `try_get_with` leader. On drop (cancel or panic),
+/// removes the in-flight `MapSlot::Miss` slot iff it still points at the same
+/// flight and broadcasts `FlightMsg::Cancelled` so followers retry instead of
+/// blocking forever on a sender that will never publish.
+///
+/// `Arc::ptr_eq` is the safety hinge: if some other path already replaced the
+/// slot (e.g. a prior leader was cancelled and a new leader took over) the
+/// guard leaves the new slot alone.
+struct LeaderGuard<'a, K: Eq + Hash + 'static, V: 'static> {
+    inner: &'a Inner<K, V>,
+    key: &'a K,
+    flight: Arc<MissFlight<V>>,
+    armed: bool,
+}
+
+impl<K, V> Drop for LeaderGuard<'_, K, V>
+where
+    K: Eq + Hash,
+{
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Tolerate poisoning: the leader might already be unwinding from a
+        // panic in `init`, and double-panicking from Drop aborts the process.
+        let mut st = match self.inner.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let same = matches!(
+            st.entries.get(self.key),
+            Some(MapSlot::Miss(arc)) if Arc::ptr_eq(arc, &self.flight)
         );
+        if same {
+            st.entries.remove(self.key);
+        }
+        drop(st);
+        let _ = self.flight.settle.send(Some(FlightMsg::Cancelled));
     }
 }
 
@@ -791,17 +849,39 @@ where
         K: Eq + Hash + Clone + Send + Sync + 'static,
         V: Clone + Send + Sync + 'static,
     {
+        let mut init = Some(init);
         loop {
             match self.miss_probe(&key) {
                 MissStep::Hit(v) => return Ok(v),
-                MissStep::Wait(f) => return await_miss_settled(&f).await,
+                MissStep::Wait(f) => {
+                    if let Some(res) = await_miss_settled(&f).await {
+                        return res;
+                    }
+                    // Leader was cancelled; the cancelled slot has already
+                    // been cleared by `LeaderGuard::drop`, so the next probe
+                    // either hits a fresh value or installs us as leader.
+                }
                 MissStep::Retry => {}
                 MissStep::Leader { miss } => {
+                    let init = init
+                        .take()
+                        .expect("init consumed: only the leader arm consumes it");
+                    let mut guard = LeaderGuard {
+                        inner: self.as_ref(),
+                        key: &key,
+                        flight: miss,
+                        armed: true,
+                    };
                     let fut = init();
                     let res = fut.await;
-                    let mut st = self.state.lock().expect("cache mutex poisoned");
+                    let mut st = guard.inner.state.lock().expect("cache mutex poisoned");
                     st.entries.remove(&key);
-                    let _ = miss.settle.send(Some(FlightMsg::from_result(res.clone())));
+                    let _ = guard
+                        .flight
+                        .settle
+                        .send(Some(FlightMsg::from_result(res.clone())));
+                    guard.armed = false;
+                    drop(guard);
 
                     if let Ok(v) = &res {
                         let now = Instant::now();

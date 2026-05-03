@@ -723,6 +723,81 @@ mod concurrency {
     }
 }
 
+mod cancellation {
+    //! `try_get_with` must not deadlock subsequent callers when the leader's
+    //! init future is cancelled (caller dropped, e.g. via `tokio::select!`
+    //! / `timeout`) or panics partway through. The leader cleanup guard
+    //! removes the `MapSlot::Miss` slot and signals followers to retry.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_leader_lets_follower_progress() {
+        with_timeout(Duration::from_secs(30), async {
+            let cache = Arc::new(test_cache());
+            let key = "cancel".to_string();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let c1 = Arc::clone(&cache);
+            let k1 = key.clone();
+            let leader = tokio::spawn(async move {
+                c1.try_get_with(k1, move || async move {
+                    let _ = entered_tx.send(());
+                    std::future::pending::<()>().await;
+                    Ok::<_, ()>("never".to_string())
+                })
+                .await
+            });
+
+            entered_rx.await.expect("leader entered init");
+            leader.abort();
+            let _ = leader.await;
+
+            let res = cache
+                .try_get_with(key.clone(), || async move {
+                    Ok::<_, ()>("recovered".to_string())
+                })
+                .await;
+            assert_eq!(res, Ok("recovered".to_string()));
+            assert_eq!(cache.get(&key), Some("recovered".to_string()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn panicking_leader_lets_follower_progress() {
+        with_timeout(Duration::from_secs(30), async {
+            let cache = Arc::new(test_cache());
+            let key = "panic".to_string();
+
+            let c1 = Arc::clone(&cache);
+            let k1 = key.clone();
+            // tokio catches the panic and returns Err(JoinError); the leader
+            // future is dropped during unwind, firing LeaderGuard::drop.
+            let leader = tokio::spawn(async move {
+                c1.try_get_with(k1, || async {
+                    tokio::task::yield_now().await;
+                    panic!("leader init panic");
+                    #[allow(unreachable_code)]
+                    Ok::<_, ()>("unreachable".to_string())
+                })
+                .await
+            });
+            let join = leader.await;
+            assert!(join.is_err(), "leader task should have panicked");
+
+            let res = cache
+                .try_get_with(key.clone(), || async move {
+                    Ok::<_, ()>("recovered".to_string())
+                })
+                .await;
+            assert_eq!(res, Ok("recovered".to_string()));
+            assert_eq!(cache.get(&key), Some("recovered".to_string()));
+        })
+        .await;
+    }
+}
+
 mod lanes {
     //! Concurrent `try_get_with` miss and `try_revalidate` on the same key: miss initializer runs
     //! once; revalidate returns `Submitted` and the executor records one `execute`.
