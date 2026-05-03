@@ -21,7 +21,11 @@
 //! - Caller-driven background refresh: [`Cache::try_revalidate`], [`Cache::revalidate`] with an [`Executor`]
 //!   from the [`rt`] module.
 //! - Fallible miss path uses **`E: Clone`** on [`Cache::try_get_with`] / [`Cache::try_revalidate`] instead of `Arc<E>`;
-//!   [`Cache::get_with`] / [`Cache::revalidate`] use [`Infallible`](std::convert::Infallible) as the error type ([`OkIntoResult`] bridges `V` → `Result<V, Infallible>` for executor bounds on `revalidate`).
+//!   [`Cache::get_with`] / [`Cache::revalidate`] use [`Infallible`](std::convert::Infallible) as the error type.
+//! - [`Cache`] is `Clone`: cloning yields a handle that shares the underlying state
+//!   (cheap `Arc`-style increment), so spawning workers around the same cache is the
+//!   intended pattern. Drop a clone independently; the cache is dropped when the last
+//!   handle is dropped.
 //!
 //! ## Design notes
 //!
@@ -35,7 +39,7 @@ pub mod lifecycle;
 pub mod policy;
 pub mod rt;
 
-pub use cache::{Cache, OkIntoResult};
+pub use cache::Cache;
 pub use config::{CacheBuilder, CacheConfig};
 pub use lifecycle::{LifecycleListener, LifecycleReason};
 pub use policy::{DefaultPolicy, IdleTimeout, Policy, TIME_UNBOUNDED, TtlFromWrite, Weight};

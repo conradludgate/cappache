@@ -20,16 +20,17 @@ use crate::rt::{Executor, RevalidateScheduled};
 use crate::{Weight, blocking};
 
 pin_project! {
-    /// Wraps a fallible miss future as `Result<_, Infallible>` for [`Executor`] bounds on refresh.
-    pub struct OkIntoResult<Fut> {
+    /// Internal adapter wrapping a fallible miss future as `Result<_, Infallible>`
+    /// so [`Executor`] bounds on refresh can stay homogenous over `Result<V, E>`.
+    /// Crate-private: callers should not need to mention this type.
+    pub(crate) struct OkIntoResult<Fut> {
         #[pin]
         fut: Fut,
     }
 }
 
 impl<Fut> OkIntoResult<Fut> {
-    #[must_use]
-    pub fn new(fut: Fut) -> Self {
+    pub(crate) fn new(fut: Fut) -> Self {
         Self { fut }
     }
 }
@@ -75,11 +76,18 @@ where
 }
 
 /// Concurrent in-memory cache.
+///
+/// `Cache` is cheap to clone: each handle is an `Arc` to the same shared
+/// state, so call sites can hand out clones to spawned workers without
+/// rebuilding configuration. The underlying state lives until the last
+/// handle is dropped.
 pub struct Cache<K: 'static, V: 'static> {
     inner: Arc<inner::Inner<K, V>>,
 }
 
 impl<K: 'static, V: 'static> Clone for Cache<K, V> {
+    /// Cloning a `Cache` is `Arc`-cheap: both handles refer to the same
+    /// shared state. Mutations from one are visible from the other.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),

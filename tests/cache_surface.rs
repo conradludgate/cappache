@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use clache::{
-    Cache, CacheBuilder, DefaultPolicy, IdleTimeout, LifecycleListener, LifecycleReason,
-    OkIntoResult, Policy, TIME_UNBOUNDED, TtlFromWrite, Weight,
+    Cache, CacheBuilder, DefaultPolicy, IdleTimeout, LifecycleListener, LifecycleReason, Policy,
+    TIME_UNBOUNDED, TtlFromWrite, Weight,
 };
 
 struct SurfacePolicy;
@@ -253,10 +253,19 @@ fn cache_string_string_is_send_sync() {
     assert_send_sync::<Cache<String, String>>();
 }
 
-#[tokio::test]
-async fn ok_into_result_await_yields_ok() {
-    let out = OkIntoResult::new(async { 99_u32 }).await;
-    assert_eq!(out, Ok(99));
+#[test]
+fn cache_clone_shares_state() {
+    let cache = Cache::<String, String>::new(
+        CacheBuilder::new()
+            .max_weight(Weight::new(8))
+            .policy(Arc::new(DefaultPolicy))
+            .build(),
+    );
+    let handle = cache.clone();
+    cache.insert("k".into(), "v".into());
+    assert_eq!(handle.get("k"), Some("v".to_string()));
+    handle.insert("k".into(), "v2".into());
+    assert_eq!(cache.get("k"), Some("v2".to_string()));
 }
 
 #[test]
