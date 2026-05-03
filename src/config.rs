@@ -86,8 +86,21 @@ where
         self
     }
 
+    /// Finalises the builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Self::max_weight`] is left at the default `Weight::ZERO`.
+    /// A zero-weight cache cannot hold any entry (every insert would exceed
+    /// the budget and be evicted immediately), so this almost certainly
+    /// indicates a forgotten `.max_weight(...)` call. Surface it loudly at
+    /// build time rather than silently producing a useless cache.
     #[must_use]
     pub fn build(self) -> CacheConfig<K, V> {
+        assert!(
+            self.max_weight.get() > 0,
+            "CacheBuilder::build: max_weight must be > 0; call .max_weight(Weight::new(...)) before .build()"
+        );
         CacheConfig {
             max_weight: self.max_weight,
             policy: self.policy,

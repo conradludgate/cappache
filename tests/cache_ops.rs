@@ -456,6 +456,7 @@ mod revalidate_tests {
             let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
             let cache = Cache::new(
                 CacheBuilder::new()
+                    .max_weight(Weight::new(10))
                     .lifecycle_listener(listener)
                     .build(),
             );
@@ -558,7 +559,12 @@ mod lifecycle {
     fn remove_after_insert_records_removed_with_prior_value() {
         let (listener, log) = RecordingListener::new_pair();
         let listener: Arc<dyn LifecycleListener<String, String> + Send + Sync> = listener;
-        let cache = Cache::new(CacheBuilder::new().lifecycle_listener(listener).build());
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(10))
+                .lifecycle_listener(listener)
+                .build(),
+        );
         let k = "tracked".to_string();
         let _ = cache.insert(k.clone(), "v".into());
         let _ = cache.remove(&k);

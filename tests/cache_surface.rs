@@ -49,13 +49,16 @@ impl LifecycleListener<String, String> for CountListener {
 }
 
 fn string_cache() -> Cache<String, String> {
-    Cache::new(CacheBuilder::new().build())
+    Cache::new(CacheBuilder::new().max_weight(Weight::new(64)).build())
 }
 
 #[test]
-fn default_max_weight_is_zero() {
-    let cache = string_cache();
-    assert_eq!(cache.max_weight(), Weight::ZERO);
+#[should_panic(expected = "max_weight must be > 0")]
+fn build_panics_when_max_weight_is_zero() {
+    // Cache with capacity 0 is unusable: every insert exceeds the budget and
+    // is immediately reclaimed. CacheBuilder::build refuses to silently
+    // produce one so the misconfiguration surfaces before runtime.
+    let _ = CacheBuilder::<String, String>::new().build();
 }
 
 #[test]
@@ -95,6 +98,7 @@ fn policy_ref_matches_default_policy() {
 fn custom_policy_via_builder() {
     let cache = Cache::new(
         CacheBuilder::<String, String>::new()
+            .max_weight(Weight::new(64))
             .policy(Arc::new(SurfacePolicy))
             .build(),
     );
@@ -108,6 +112,7 @@ fn ttl_from_write_caps_write_expiry() {
     let ttl = std::time::Duration::from_secs(30);
     let cache = Cache::new(
         CacheBuilder::<String, String>::new()
+            .max_weight(Weight::new(64))
             .policy(Arc::new(TtlFromWrite::new(ttl, DefaultPolicy)))
             .build(),
     );
@@ -137,6 +142,7 @@ fn idle_timeout_caps_hooks() {
     let idle = std::time::Duration::from_secs(15);
     let cache = Cache::new(
         CacheBuilder::<String, String>::new()
+            .max_weight(Weight::new(64))
             .policy(Arc::new(IdleTimeout::new(idle, DefaultPolicy)))
             .build(),
     );
@@ -200,6 +206,7 @@ fn lifecycle_listener_some_matches_installed() {
     let ptr = Arc::as_ptr(&listener);
     let cache = Cache::new(
         CacheBuilder::<String, String>::new()
+            .max_weight(Weight::new(64))
             .lifecycle_listener(listener.clone())
             .build(),
     );
