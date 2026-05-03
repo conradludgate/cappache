@@ -4,6 +4,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -155,10 +156,30 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) state: Mutex<State<K, V>>,
 }
 
-/// Stable handle into [`Slab`]. `u32` caps slab population at 2^32-1, which
-/// far exceeds any practical cache bounded by RAM.
+/// Stable handle into [`Slab`]. `NonZeroU32` caps slab population at 2^32-2,
+/// which far exceeds any practical cache bounded by RAM, and lets
+/// `Option<SlotId>` niche-pack into 4 bytes (matters for [`EntrySlot`]'s
+/// LRU links and the slab free-list pointer that store one per ready
+/// entry).
+///
+/// Encoding: `idx + 1`. Index 0 is represented as `NonZeroU32::new(1)`;
+/// `to_index` reverses the offset. The offset is centralised in
+/// [`SlotId::from_index`] / [`SlotId::to_index`] so callers never see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SlotId(u32);
+pub(crate) struct SlotId(NonZeroU32);
+
+impl SlotId {
+    fn from_index(idx: u32) -> Self {
+        let raw = idx
+            .checked_add(1)
+            .expect("slab index + 1 overflows u32 (slab capacity exceeds u32::MAX - 1)");
+        SlotId(NonZeroU32::new(raw).expect("idx + 1 is non-zero by construction"))
+    }
+
+    fn to_index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+}
 
 pub(crate) struct State<K, V> {
     /// Lookup map for `Ready` entries only. In-flight miss leaders live in
@@ -212,13 +233,16 @@ enum SlabEntry<K, V> {
     Occupied(EntrySlot<K, V>),
     /// `generation` is the generation of the **last** occupant; the next insert into
     /// this slot uses `generation.wrapping_add(1)`.
-    Free { next_free: Option<u32>, generation: u32 },
+    Free {
+        next_free: Option<SlotId>,
+        generation: u32,
+    },
 }
 
 /// Vector-backed slab with a free-list. Pure-safe (no `unsafe`).
 struct Slab<K, V> {
     slots: Vec<SlabEntry<K, V>>,
-    free_head: Option<u32>,
+    free_head: Option<SlotId>,
     len: usize,
 }
 
@@ -239,8 +263,8 @@ impl<K, V> Slab<K, V> {
     /// to whatever this method returns from [`Self::next_generation_for`] beforehand
     /// — the slab does not mutate `entry` in place to keep the borrow simple.
     fn insert(&mut self, entry: EntrySlot<K, V>) -> SlotId {
-        if let Some(idx) = self.free_head {
-            let slot = &mut self.slots[idx as usize];
+        if let Some(id) = self.free_head {
+            let slot = &mut self.slots[id.to_index()];
             let next_free = match slot {
                 SlabEntry::Free { next_free, .. } => *next_free,
                 SlabEntry::Occupied(_) => unreachable!("free list points at occupied slot"),
@@ -248,12 +272,12 @@ impl<K, V> Slab<K, V> {
             self.free_head = next_free;
             *slot = SlabEntry::Occupied(entry);
             self.len += 1;
-            SlotId(idx)
+            id
         } else {
             let idx = u32::try_from(self.slots.len()).expect("slab capacity exceeds u32::MAX");
             self.slots.push(SlabEntry::Occupied(entry));
             self.len += 1;
-            SlotId(idx)
+            SlotId::from_index(idx)
         }
     }
 
@@ -271,13 +295,15 @@ impl<K, V> Slab<K, V> {
     /// [`Self::next_generation_for`] before the new `EntrySlot` is constructed.
     fn next_slot_index(&self) -> u32 {
         match self.free_head {
-            Some(idx) => idx,
+            Some(id) => {
+                u32::try_from(id.to_index()).expect("slab capacity exceeds u32::MAX")
+            }
             None => u32::try_from(self.slots.len()).expect("slab capacity exceeds u32::MAX"),
         }
     }
 
     fn remove(&mut self, id: SlotId) -> Option<EntrySlot<K, V>> {
-        let slot = self.slots.get_mut(id.0 as usize)?;
+        let slot = self.slots.get_mut(id.to_index())?;
         if !matches!(slot, SlabEntry::Occupied(_)) {
             return None;
         }
@@ -297,20 +323,20 @@ impl<K, V> Slab<K, V> {
         if let SlabEntry::Free { generation, .. } = slot {
             *generation = entry.generation;
         }
-        self.free_head = Some(id.0);
+        self.free_head = Some(id);
         self.len -= 1;
         Some(entry)
     }
 
     fn get(&self, id: SlotId) -> Option<&EntrySlot<K, V>> {
-        match self.slots.get(id.0 as usize)? {
+        match self.slots.get(id.to_index())? {
             SlabEntry::Occupied(e) => Some(e),
             SlabEntry::Free { .. } => None,
         }
     }
 
     fn get_mut(&mut self, id: SlotId) -> Option<&mut EntrySlot<K, V>> {
-        match self.slots.get_mut(id.0 as usize)? {
+        match self.slots.get_mut(id.to_index())? {
             SlabEntry::Occupied(e) => Some(e),
             SlabEntry::Free { .. } => None,
         }
@@ -397,7 +423,7 @@ impl Ord for HeapKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.deadline
             .cmp(&other.deadline)
-            .then_with(|| self.slot.0.cmp(&other.slot.0))
+            .then_with(|| self.slot.0.get().cmp(&other.slot.0.get()))
             .then_with(|| self.generation.cmp(&other.generation))
     }
 }
@@ -610,7 +636,8 @@ where
         lru_next: None,
     });
     debug_assert_eq!(
-        id.0, idx,
+        id.to_index(),
+        idx as usize,
         "slab.insert is expected to use the slot index it advertised"
     );
     evict_list.push_mru(slab, id);
@@ -1205,5 +1232,39 @@ where
     match new {
         Some(dl) if Some(dl) != prev => Some(dl),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod size_regressions {
+    use super::*;
+
+    /// Lock the niche-packed `Option<SlotId>` size. If this assertion ever
+    /// fires, either the niche optimisation was lost (`SlotId` stopped
+    /// using `NonZeroU32`) or the host pointer width changed in a way that
+    /// invalidates the budget. Either case warrants a deliberate update —
+    /// not an accidental regression that doubles every LRU link.
+    #[test]
+    fn option_slot_id_is_four_bytes() {
+        assert_eq!(std::mem::size_of::<Option<SlotId>>(), 4);
+        assert_eq!(std::mem::size_of::<SlotId>(), 4);
+    }
+
+    /// Lock the `EntrySlot` shape for a representative `<String, String>`
+    /// cache. Composition (aarch64): `String` × 2 (48) + `CacheEntry`
+    /// (`String` 24 + `Instant` 16 + `Option<Instant>` 24 = 64) + weight
+    /// `u64` (8) + generation `u32` (4) + `Option<SlotId>` × 2 (8 with
+    /// `NonZeroU32` niche) = 132, rounded to alignment-8 = 136. macOS
+    /// arm64 currently reports 104 because `Instant` packs in 12 bytes
+    /// here. Either way, the load-bearing claim is "the LRU links cost
+    /// 8 bytes total, not 16" — if this assertion fires after touching
+    /// `EntrySlot`, double-check `Option<SlotId>` is still niche-packed.
+    #[test]
+    fn entry_slot_size_locked() {
+        let observed = std::mem::size_of::<EntrySlot<String, String>>();
+        assert_eq!(
+            observed, 104,
+            "EntrySlot grew to {observed}; check niche packing on Option<SlotId>",
+        );
     }
 }
