@@ -8,7 +8,8 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hashbrown::HashMap;
+use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+use std::hash::BuildHasher;
 use tokio::sync::watch;
 
 use crate::config::CacheConfig;
@@ -195,12 +196,89 @@ impl SlotId {
     }
 }
 
+/// Hash a key using the table's `BuildHasher`. Centralising the hash
+/// derivation guarantees insert and lookup hash the same bytes the same
+/// way; otherwise a `Borrow`-related mismatch would silently produce
+/// missed lookups.
+fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
+    hasher.hash_one(key)
+}
+
+/// `entries` lookup that compares keys through the slab — the table only
+/// holds `SlotId` so equality lives on `EntrySlot::key`. Returns `None`
+/// when no slot matches; an unmatched probe walks at most one bucket
+/// chain on average.
+fn entries_find<K, V, Q>(
+    entries: &HashTable<SlotId>,
+    hasher: &DefaultHashBuilder,
+    slab: &Slab<K, V>,
+    key: &Q,
+) -> Option<SlotId>
+where
+    K: Hash + Eq + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    let h = hash_key(hasher, key);
+    entries
+        .find(h, |&id| {
+            slab.get(id).is_some_and(|es| es.key.borrow() == key)
+        })
+        .copied()
+}
+
+/// `entries` insert. Caller has already pushed `id` into the slab and is
+/// responsible for the resize closure rehashing existing entries against
+/// the same `slab`. The slot must be occupied at `id`.
+fn entries_insert<K, V>(
+    entries: &mut HashTable<SlotId>,
+    hasher: &DefaultHashBuilder,
+    slab: &Slab<K, V>,
+    id: SlotId,
+) where
+    K: Hash + Eq,
+{
+    let key_hash = hash_key(
+        hasher,
+        &slab
+            .get(id)
+            .expect("entries_insert: slot must be occupied")
+            .key,
+    );
+    entries.insert_unique(key_hash, id, |&other| {
+        hash_key(
+            hasher,
+            &slab
+                .get(other)
+                .expect("entries refer only to occupied slots")
+                .key,
+        )
+    });
+}
+
+
 pub(crate) struct State<K, V> {
-    /// Lookup map for `Ready` entries only. In-flight miss leaders live in
-    /// [`Self::inflight`] under their own `(K, TypeId<E>)` lane so a
-    /// `try_get_with::<…, E1>` call cannot deadlock waiting on a leader that
-    /// will publish an unrelated `E2` via type-erased downcast.
-    pub(crate) entries: HashMap<K, SlotId>,
+    /// Lookup table for `Ready` entries. Stores only `SlotId`; the key
+    /// itself lives once on the slab as `EntrySlot::key`. Migrating from
+    /// `HashMap<K, SlotId>` to `HashTable<SlotId>` removes one `K`
+    /// allocation per ready entry (notable for `String`-keyed caches) and
+    /// collapses the previous "find then remove" two-probe pattern into a
+    /// single probe via `find_entry`.
+    ///
+    /// Equality during probes goes through [`Slab::get`] so the table can
+    /// stay key-free; the `hasher` field below is the matching
+    /// `BuildHasher` used both at insert time and at probe time so the
+    /// stored hash matches what `find` recomputes.
+    ///
+    /// In-flight miss leaders live in [`Self::inflight`] under their own
+    /// `(K, TypeId<E>)` lane so a `try_get_with::<…, E1>` call cannot
+    /// deadlock waiting on a leader that will publish an unrelated `E2`.
+    pub(crate) entries: HashTable<SlotId>,
+    /// Single hasher used for every `entries` operation. Holding one per
+    /// state (rather than building a fresh one inside each helper) means
+    /// hashed bytes match between the install and lookup paths and avoids
+    /// re-deriving the seed on every call. `DefaultHashBuilder` is
+    /// `foldhash` in hashbrown 0.17.
+    pub(crate) hasher: DefaultHashBuilder,
     /// Per-key vector of in-flight miss lanes, deduped by the leader's `E`
     /// type. Single lane is the common case; multiple lanes appear only when
     /// concurrent `try_get_with` calls disagree on `E`.
@@ -609,15 +687,23 @@ where
 {
     let State {
         entries,
+        hasher,
         slab,
         evict_list,
         total_weight,
         ..
     } = st;
     evict_list.unlink(slab, id);
+    // Take the slot out first so the entries removal can compare against
+    // a slab that no longer holds `id` — `entries_remove`'s probe checks
+    // `slab.get(id)`, which now returns `None`, so we use the taken
+    // entry's key and an inline `find_entry` instead.
     let entry_slot = slab.remove(id)?;
     *total_weight = total_weight.saturating_sub(entry_slot.weight);
-    let _ = entries.remove(&entry_slot.key);
+    let h = hash_key(hasher, &entry_slot.key);
+    if let Ok(occ) = entries.find_entry(h, |&other| other == id) {
+        occ.remove();
+    }
     Some((entry_slot.key, entry_slot.entry.value, entry_slot.weight))
 }
 
@@ -632,10 +718,11 @@ fn install_ready<K, V>(
     weight: u64,
 ) -> SlotId
 where
-    K: Eq + Hash + Clone,
+    K: Eq + Hash,
 {
     let State {
         entries,
+        hasher,
         slab,
         evict_list,
         expiry,
@@ -646,7 +733,7 @@ where
     let generation = slab.next_generation_for(idx);
     let deadline = entry.deadline;
     let id = slab.insert(EntrySlot {
-        key: key.clone(),
+        key,
         entry,
         weight,
         generation,
@@ -660,7 +747,7 @@ where
         "slab.insert is expected to use the slot index it advertised"
     );
     evict_list.push_mru(slab, id);
-    entries.insert(key, id);
+    entries_insert(entries, hasher, slab, id);
     *total_weight = total_weight.saturating_add(weight);
     if let Some(dl) = deadline {
         expiry.push(dl, id, generation);
@@ -682,7 +769,8 @@ where
         Self {
             config,
             state: Mutex::new(State {
-                entries: HashMap::with_capacity(initial_capacity),
+                entries: HashTable::with_capacity(initial_capacity),
+                hasher: DefaultHashBuilder::default(),
                 inflight: HashMap::new(),
                 slab: Slab::with_capacity(initial_capacity),
                 evict_list: EvictList::default(),
@@ -701,7 +789,7 @@ where
         let now = Instant::now();
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
-        let &id = st.entries.get(key)?;
+        let id = entries_find(&st.entries, &st.hasher, &st.slab, key)?;
 
         // Fast-path read: borrow the slot to inspect the deadline; if expired,
         // drop the borrow and fall into the eviction path below.
@@ -744,7 +832,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let st = self.state.lock().expect("cache mutex poisoned");
-        let Some(&id) = st.entries.get(key) else {
+        let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) else {
             return false;
         };
         // Read-only check: do not evict expired entries here; let the next
@@ -826,17 +914,17 @@ where
         let key_for_updated = key.clone();
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
-        // Existing value (cloned for return + `Updated` lifecycle) before any
-        // structural change. `reclaim` skips `key`, so the existing slot is
-        // still present after reclaim returns.
-        let prev = match st.entries.get(&key) {
-            Some(&id) => st.slab.get(id).map(|es| es.entry.value.clone()),
-            None => None,
-        };
+        // Single lookup: cache the existing slot id, then derive both the
+        // returned `prev` value and the displaced-slot eviction from it.
+        // Avoids two passes through `entries.find` per insert.
+        let existing_id = entries_find(&st.entries, &st.hasher, &st.slab, &key);
+        let prev = existing_id.and_then(|id| st.slab.get(id).map(|es| es.entry.value.clone()));
 
         let reclaimed = self.reclaim(&mut st, new_w, &key, now);
 
-        if let Some(&id) = st.entries.get(&key) {
+        // `reclaim` never evicts `skip_key`, so `existing_id` is still valid
+        // here if it was valid before the call.
+        if let Some(id) = existing_id {
             let _ = evict_slot(&mut st, id);
         }
 
@@ -867,7 +955,7 @@ where
         V: 'static,
     {
         let mut st = self.state.lock().expect("cache mutex poisoned");
-        let &id = st.entries.get(key)?;
+        let id = entries_find(&st.entries, &st.hasher, &st.slab, key)?;
         let (k, v, _) = evict_slot(&mut st, id)?;
         drop(st);
         let v_for_listener = v.clone();
@@ -907,11 +995,9 @@ where
         // skip_key short-circuit means its slot is never reclaimed in this
         // pass, so its weight is invariant across iterations. Only
         // `state.total_weight` changes per iteration; the projection then
-        // becomes a couple of arithmetic ops instead of a HashMap probe.
-        let displaced_weight = st
-            .entries
-            .get(skip_key)
-            .and_then(|&id| st.slab.get(id))
+        // becomes a couple of arithmetic ops instead of a HashTable probe.
+        let displaced_weight = entries_find(&st.entries, &st.hasher, &st.slab, skip_key)
+            .and_then(|id| st.slab.get(id))
             .map_or(0, |es| es.weight);
 
         let max = self.config.max_weight.get();
@@ -1018,7 +1104,7 @@ where
         let now = Instant::now();
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
-        if let Some(&id) = st.entries.get(key) {
+        if let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) {
             let expired = st
                 .slab
                 .get(id)
@@ -1033,7 +1119,7 @@ where
         }
 
         let now = Instant::now();
-        if let Some(&id) = st.entries.get(key) {
+        if let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) {
             let still_served = st
                 .slab
                 .get(id)
@@ -1148,7 +1234,7 @@ where
         K: Eq + Hash,
     {
         let mut st = self.state.lock().expect("cache mutex poisoned");
-        let Some(&id) = st.entries.get(key) else {
+        let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key) else {
             return RefreshGate::AbsentKey;
         };
         let Some(es) = st.slab.get_mut(id) else {
@@ -1172,7 +1258,7 @@ where
         K: Eq + Hash,
     {
         let mut st = self.state.lock().expect("cache mutex poisoned");
-        if let Some(&id) = st.entries.get(key)
+        if let Some(id) = entries_find(&st.entries, &st.hasher, &st.slab, key)
             && let Some(es) = st.slab.get_mut(id)
         {
             es.refresh_inflight = false;
@@ -1188,8 +1274,8 @@ where
         let now = Instant::now();
         let nw = self.config.policy.weight(key, &v).get();
         let reclaimed = self.reclaim(&mut st, nw, key, now);
-        let displaced = match st.entries.get(key) {
-            Some(&id) => evict_slot(&mut st, id).map(|(_, v, _)| v),
+        let displaced = match entries_find(&st.entries, &st.hasher, &st.slab, key) {
+            Some(id) => evict_slot(&mut st, id).map(|(_, v, _)| v),
             None => None,
         };
         let deadline = deadline_after_write(&self.config.policy, key, &v, now);
