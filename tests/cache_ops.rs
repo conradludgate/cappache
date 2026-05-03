@@ -803,6 +803,65 @@ mod cancellation {
     }
 
     #[tokio::test]
+    async fn distinct_error_types_run_independently_on_same_key() {
+        // Each `try_get_with::<_, E>` keys its lane on `(K, TypeId<E>)`, so a
+        // leader publishing `Result<V, E1>` cannot satisfy a concurrent
+        // follower expecting `Result<V, E2>`. Both initializers must run
+        // exactly once and produce their own typed result.
+        with_timeout(Duration::from_secs(30), async {
+            let cache = Arc::new(test_cache());
+            let key = "typed".to_string();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let init_calls = Arc::new(AtomicUsize::new(0));
+
+            let c_unit = Arc::clone(&cache);
+            let k_unit = key.clone();
+            let b_unit = Arc::clone(&barrier);
+            let n_unit = Arc::clone(&init_calls);
+            let task_unit = tokio::spawn(async move {
+                b_unit.wait().await;
+                c_unit
+                    .try_get_with(k_unit, move || async move {
+                        n_unit.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok::<_, ()>("unit-ok".to_string())
+                    })
+                    .await
+            });
+
+            #[derive(Clone, Debug, PartialEq, Eq)]
+            struct OtherErr;
+
+            let c_other = Arc::clone(&cache);
+            let k_other = key.clone();
+            let b_other = Arc::clone(&barrier);
+            let n_other = Arc::clone(&init_calls);
+            let task_other = tokio::spawn(async move {
+                b_other.wait().await;
+                c_other
+                    .try_get_with(k_other, move || async move {
+                        n_other.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok::<_, OtherErr>("other-ok".to_string())
+                    })
+                    .await
+            });
+
+            let r_unit = task_unit.await.expect("unit task join");
+            let r_other = task_other.await.expect("other task join");
+
+            // Each lane ran its own initializer; lanes did not coalesce.
+            assert_eq!(init_calls.load(Ordering::SeqCst), 2);
+            // Both must succeed; the second leader replaces the first's
+            // installed value (last-write-wins under our install ordering).
+            assert!(matches!(&r_unit, Ok(v) if v == "unit-ok" || v == "other-ok"));
+            assert!(matches!(&r_other, Ok(v) if v == "unit-ok" || v == "other-ok"));
+            assert!(cache.get(&key).is_some(), "some value must remain");
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn panicking_leader_lets_follower_progress() {
         with_timeout(Duration::from_secs(30), async {
             let cache = Arc::new(test_cache());

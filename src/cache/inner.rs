@@ -1,7 +1,8 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -12,47 +13,138 @@ use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
 use crate::policy::Policy;
 
-/// Settled state of a miss flight broadcast through [`MissFlight::settle`].
-///
-/// `Cancelled` is published by [`LeaderGuard::drop`] when the leader's
-/// `init` future was dropped or panicked before producing a value; followers
-/// translate it into a probe retry rather than reporting the leader's
-/// never-arrived result. Without this sentinel a stale `MapSlot::Miss` would
-/// outlive the leader and deadlock every subsequent caller for that key.
+/// Outcome published on a miss flight's settle channel. `Cancelled` is sent by
+/// [`LeaderGuard::drop`] when the leader's `init` future was dropped or
+/// panicked before producing a value; followers translate it into a probe
+/// retry. Each lane is monomorphic on `(V, E)` so no `Any` downcast is needed
+/// to read the result.
 #[derive(Clone)]
-pub(crate) enum FlightMsg<V> {
-    Ok(V),
-    Err(Arc<dyn Any + Send + Sync>),
+pub(crate) enum LaneOutcome<V, E> {
+    Settled(Result<V, E>),
     Cancelled,
 }
 
-impl<V: Clone> FlightMsg<V> {
-    pub(crate) fn from_result<E: Send + Sync + 'static>(r: Result<V, E>) -> Self {
-        match r {
-            Ok(v) => FlightMsg::Ok(v),
-            Err(e) => FlightMsg::Err(Arc::new(e)),
-        }
+/// Per-(key, error type) coalescing point for `try_get_with`. Followers with
+/// the same `E` subscribe to the same flight; followers with a different `E`
+/// install their own lane and run their own `init`. Mirrors moka's typed miss
+/// lanes — see `State::inflight`.
+pub(crate) struct MissFlight<V, E>
+where
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
+    settle: watch::Sender<Option<LaneOutcome<V, E>>>,
+}
+
+impl<V, E> MissFlight<V, E>
+where
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
+    fn new() -> Self {
+        let (tx, _) = watch::channel(None);
+        Self { settle: tx }
     }
 
-    /// Returns `None` when the leader was cancelled; the follower must retry
-    /// the probe loop and may itself be promoted to leader.
-    pub(crate) fn into_settled<E: Clone + Send + Sync + 'static>(
-        self,
-    ) -> Option<Result<V, E>> {
-        match self {
-            FlightMsg::Ok(v) => Some(Ok(v)),
-            FlightMsg::Err(arc) => Some(Err(Arc::downcast::<E>(arc)
-                .expect("miss flight error type mismatch: E must match the stored miss error type")
-                .as_ref()
-                .clone())),
-            FlightMsg::Cancelled => None,
+    fn publish(&self, r: Result<V, E>) {
+        let _ = self.settle.send(Some(LaneOutcome::Settled(r)));
+    }
+
+    fn cancel(&self) {
+        let _ = self.settle.send(Some(LaneOutcome::Cancelled));
+    }
+
+    /// `None` when the leader cancelled (sender published `Cancelled`, or
+    /// dropped before publishing); callers re-enter the probe loop.
+    async fn await_settled(&self) -> Option<Result<V, E>> {
+        let mut rx = self.settle.subscribe();
+        loop {
+            {
+                let cur = rx.borrow();
+                if let Some(o) = cur.as_ref() {
+                    return match o.clone() {
+                        LaneOutcome::Settled(r) => Some(r),
+                        LaneOutcome::Cancelled => None,
+                    };
+                }
+            }
+            if rx.changed().await.is_err() {
+                return None;
+            }
         }
     }
 }
 
-pub(crate) struct MissFlight<V> {
-    pub(crate) settle: watch::Sender<Option<FlightMsg<V>>>,
-    pub(crate) _hold: watch::Receiver<Option<FlightMsg<V>>>,
+/// One in-flight miss for a key. Lanes are matched by `TypeId<E>`; the
+/// `Arc<dyn Any + Send + Sync>` carries the typed `MissFlight<V, E>` for
+/// downcast on the follower side, and `cancel_fn` lets a future cancel-all
+/// path (e.g. `clear()`) cancel a flight without knowing `E` statically.
+///
+/// `_v` keeps the `V` parameter at the type level (needed by `downcast::<E>`
+/// to reconstruct the typed `MissFlight<V, E>`) without restricting `State`'s
+/// auto traits — `fn() -> V` is unconditionally `Send + Sync`.
+struct InflightLane<V> {
+    type_id: TypeId,
+    flight: Arc<dyn Any + Send + Sync>,
+    // Wired by `cancel()` once a non-leader cancellation path lands.
+    #[allow(dead_code)]
+    cancel_fn: fn(&Arc<dyn Any + Send + Sync>),
+    _v: PhantomData<fn() -> V>,
+}
+
+fn cancel_typed<V, E>(a: &Arc<dyn Any + Send + Sync>)
+where
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
+    if let Some(f) = (**a).downcast_ref::<MissFlight<V, E>>() {
+        f.cancel();
+    }
+}
+
+impl<V> InflightLane<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    fn new<E>(flight: Arc<MissFlight<V, E>>) -> Self
+    where
+        E: Clone + Send + Sync + 'static,
+    {
+        Self {
+            type_id: TypeId::of::<E>(),
+            flight: flight as Arc<dyn Any + Send + Sync>,
+            cancel_fn: cancel_typed::<V, E>,
+            _v: PhantomData,
+        }
+    }
+
+    fn downcast<E>(&self) -> Option<Arc<MissFlight<V, E>>>
+    where
+        E: Clone + Send + Sync + 'static,
+    {
+        if self.type_id != TypeId::of::<E>() {
+            return None;
+        }
+        Arc::clone(&self.flight)
+            .downcast::<MissFlight<V, E>>()
+            .ok()
+    }
+
+    /// Identity-only comparison: two lanes match if they wrap the same
+    /// `Arc<MissFlight<_, _>>` allocation. Used by `LeaderGuard` and the
+    /// leader's manual cleanup to avoid removing a fresh lane that replaced
+    /// the original.
+    fn ptr_eq_any(&self, other: &Arc<dyn Any + Send + Sync>) -> bool {
+        Arc::as_ptr(&self.flight).cast::<()>() == Arc::as_ptr(other).cast::<()>()
+    }
+
+    /// Will be wired by `Cache::clear` (and any other cancel-all paths) once
+    /// they land; kept now so downcast and identity comparison live on one
+    /// type.
+    #[allow(dead_code)]
+    fn cancel(&self) {
+        (self.cancel_fn)(&self.flight);
+    }
 }
 
 pub(crate) struct Inner<K: 'static, V: 'static> {
@@ -68,8 +160,15 @@ pub(crate) struct Inner<K: 'static, V: 'static> {
 pub(crate) struct SlotId(u32);
 
 pub(crate) struct State<K, V> {
-    /// Lookup map: key → `Ready` slab id or `Miss` flight handle.
-    pub(crate) entries: HashMap<K, MapSlot<V>>,
+    /// Lookup map for `Ready` entries only. In-flight miss leaders live in
+    /// [`Self::inflight`] under their own `(K, TypeId<E>)` lane so a
+    /// `try_get_with::<…, E1>` call cannot deadlock waiting on a leader that
+    /// will publish an unrelated `E2` via type-erased downcast.
+    pub(crate) entries: HashMap<K, SlotId>,
+    /// Per-key vector of in-flight miss lanes, deduped by the leader's `E`
+    /// type. Single lane is the common case; multiple lanes appear only when
+    /// concurrent `try_get_with` calls disagree on `E`.
+    inflight: HashMap<K, Vec<InflightLane<V>>>,
     /// Backing storage for `Ready` entries. The slab owns `CacheEntry`,
     /// the back-reference key, the cached weight, and the intrusive LRU links.
     slab: Slab<K, V>,
@@ -86,11 +185,6 @@ pub(crate) struct State<K, V> {
     pub(crate) refresh_inflight: HashSet<K>,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
-}
-
-pub(crate) enum MapSlot<V> {
-    Ready(SlotId),
-    Miss(Arc<MissFlight<V>>),
 }
 
 pub(crate) struct CacheEntry<V> {
@@ -380,54 +474,61 @@ struct Reclaimed<K, V> {
     evicted: Vec<(K, V)>,
 }
 
-pub(crate) enum MissStep<V> {
-    Hit(V),
-    Wait(Arc<MissFlight<V>>),
-    Retry,
-    Leader { miss: Arc<MissFlight<V>> },
-}
-
-/// Returns `None` when the leader was cancelled (sender published
-/// `FlightMsg::Cancelled` or was dropped without sending); callers are
-/// expected to re-enter the probe loop in that case.
-async fn await_miss_settled<V, E>(flight: &MissFlight<V>) -> Option<Result<V, E>>
+pub(crate) enum MissStep<V, E>
 where
-    V: Clone,
+    V: Clone + Send + Sync + 'static,
     E: Clone + Send + Sync + 'static,
 {
-    let mut rx = flight.settle.subscribe();
-    loop {
-        {
-            let cur = rx.borrow();
-            if let Some(m) = cur.as_ref() {
-                return m.clone().into_settled::<E>();
-            }
-        }
-        if rx.changed().await.is_err() {
-            // Sender dropped without sending — treat as cancellation.
-            return None;
+    Hit(V),
+    Wait(Arc<MissFlight<V, E>>),
+    Leader { miss: Arc<MissFlight<V, E>> },
+}
+
+/// Identity-only lane removal. Compares Arc pointer addresses; ignores any
+/// fresh lane installed for the same key by an unrelated leader (cancelled
+/// then re-entered). If the per-key vec becomes empty the entry is dropped to
+/// keep `inflight` from accumulating dead keys.
+fn remove_lane<K, V>(
+    st: &mut State<K, V>,
+    key: &K,
+    flight: &Arc<dyn Any + Send + Sync>,
+) where
+    K: Eq + Hash,
+    V: Clone + Send + Sync + 'static,
+{
+    if let Some(lanes) = st.inflight.get_mut(key) {
+        lanes.retain(|lane| !lane.ptr_eq_any(flight));
+        if lanes.is_empty() {
+            st.inflight.remove(key);
         }
     }
 }
 
 /// RAII cleanup for the `try_get_with` leader. On drop (cancel or panic),
-/// removes the in-flight `MapSlot::Miss` slot iff it still points at the same
-/// flight and broadcasts `FlightMsg::Cancelled` so followers retry instead of
-/// blocking forever on a sender that will never publish.
-///
-/// `Arc::ptr_eq` is the safety hinge: if some other path already replaced the
-/// slot (e.g. a prior leader was cancelled and a new leader took over) the
-/// guard leaves the new slot alone.
-struct LeaderGuard<'a, K: Eq + Hash + 'static, V: 'static> {
+/// removes the lane (identified by Arc identity, so we won't disturb a
+/// follower-installed replacement) and broadcasts `LaneOutcome::Cancelled` so
+/// any follower waiting on this exact flight retries instead of blocking
+/// forever on a sender that will never publish.
+struct LeaderGuard<'a, K, V, E>
+where
+    K: Eq + Hash + 'static,
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
     inner: &'a Inner<K, V>,
     key: &'a K,
-    flight: Arc<MissFlight<V>>,
+    flight: Arc<MissFlight<V, E>>,
+    /// Type-erased view of `flight`, kept alongside so identity comparison
+    /// against stored lanes does not need to know `E` at the call site.
+    flight_any: Arc<dyn Any + Send + Sync>,
     armed: bool,
 }
 
-impl<K, V> Drop for LeaderGuard<'_, K, V>
+impl<K, V, E> Drop for LeaderGuard<'_, K, V, E>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + 'static,
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         if !self.armed {
@@ -439,15 +540,9 @@ where
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let same = matches!(
-            st.entries.get(self.key),
-            Some(MapSlot::Miss(arc)) if Arc::ptr_eq(arc, &self.flight)
-        );
-        if same {
-            st.entries.remove(self.key);
-        }
+        remove_lane(&mut st, self.key, &self.flight_any);
         drop(st);
-        let _ = self.flight.settle.send(Some(FlightMsg::Cancelled));
+        self.flight.cancel();
     }
 }
 
@@ -512,7 +607,7 @@ where
         "slab.insert is expected to use the slot index it advertised"
     );
     evict_list.push_mru(slab, id);
-    entries.insert(key, MapSlot::Ready(id));
+    entries.insert(key, id);
     *total_weight = total_weight.saturating_add(weight);
     if let Some(dl) = deadline {
         expiry.push(dl, id, generation);
@@ -534,6 +629,7 @@ where
             config,
             state: Mutex::new(State {
                 entries: HashMap::with_capacity(initial_capacity),
+                inflight: HashMap::new(),
                 slab: Slab::with_capacity(initial_capacity),
                 evict_list: EvictList::default(),
                 expiry: ExpiryHeap::default(),
@@ -551,9 +647,7 @@ where
         let now = Instant::now();
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
-        let Some(&MapSlot::Ready(id)) = st.entries.get(key) else {
-            return None;
-        };
+        let &id = st.entries.get(key)?;
 
         // Fast-path read: borrow the slot to inspect the deadline; if expired,
         // drop the borrow and fall into the eviction path below.
@@ -599,13 +693,13 @@ where
         // structural change. `reclaim` skips `key`, so the existing slot is
         // still present after reclaim returns.
         let prev = match st.entries.get(&key) {
-            Some(&MapSlot::Ready(id)) => st.slab.get(id).map(|es| es.entry.value.clone()),
-            _ => None,
+            Some(&id) => st.slab.get(id).map(|es| es.entry.value.clone()),
+            None => None,
         };
 
         let reclaimed = self.reclaim(&mut st, new_w, &key, now);
 
-        if let Some(&MapSlot::Ready(id)) = st.entries.get(&key) {
+        if let Some(&id) = st.entries.get(&key) {
             let _ = evict_slot(&mut st, id);
         }
 
@@ -635,9 +729,7 @@ where
         V: 'static,
     {
         let mut st = self.state.lock().expect("cache mutex poisoned");
-        let Some(&MapSlot::Ready(id)) = st.entries.get(key) else {
-            return None;
-        };
+        let &id = st.entries.get(key)?;
         let (_, v, _) = evict_slot(&mut st, id)?;
         drop(st);
         let v_for_listener = v.clone();
@@ -723,13 +815,13 @@ where
         max: u64,
     ) -> bool {
         let projected = match st.entries.get(insert_key) {
-            Some(&MapSlot::Ready(id)) => {
+            Some(&id) => {
                 let ow = st.slab.get(id).map_or(0, |es| es.weight);
                 st.total_weight
                     .saturating_sub(ow)
                     .saturating_add(new_entry_weight)
             }
-            Some(MapSlot::Miss(_)) | None => st.total_weight.saturating_add(new_entry_weight),
+            None => st.total_weight.saturating_add(new_entry_weight),
         };
         projected > max
     }
@@ -773,15 +865,16 @@ where
 
     /// Single critical section for one `try_get_with` iteration: served hit, in-flight miss wait, or
     /// install miss leader. Avoids TOCTOU between separate `get_served` / miss checks / leader insert.
-    fn miss_probe(&self, key: &K) -> MissStep<V>
+    fn miss_probe<E>(&self, key: &K) -> MissStep<V, E>
     where
         K: 'static,
         V: 'static,
+        E: Clone + Send + Sync + 'static,
     {
         let now = Instant::now();
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
-        if let Some(&MapSlot::Ready(id)) = st.entries.get(key) {
+        if let Some(&id) = st.entries.get(key) {
             let expired = st
                 .slab
                 .get(id)
@@ -796,7 +889,7 @@ where
         }
 
         let now = Instant::now();
-        if let Some(&MapSlot::Ready(id)) = st.entries.get(key) {
+        if let Some(&id) = st.entries.get(key) {
             let still_served = st
                 .slab
                 .get(id)
@@ -823,22 +916,20 @@ where
             }
         }
 
-        match st.entries.get(key) {
-            Some(MapSlot::Miss(f)) => MissStep::Wait(Arc::clone(f)),
-            Some(MapSlot::Ready(_)) => MissStep::Retry,
-            None => {
-                let (settle_tx, settle_rx) = watch::channel::<Option<FlightMsg<V>>>(None);
-                let miss = Arc::new(MissFlight {
-                    settle: settle_tx,
-                    _hold: settle_rx,
-                });
-                st.entries
-                    .insert(key.clone(), MapSlot::Miss(Arc::clone(&miss)));
-                MissStep::Leader {
-                    miss: Arc::clone(&miss),
-                }
-            }
+        // No live Ready. Look for an in-flight lane with the same E and join
+        // it as a follower; otherwise install a fresh lane and become leader.
+        if let Some(lanes) = st.inflight.get(key)
+            && let Some(lane) = lanes.iter().find_map(InflightLane::downcast::<E>)
+        {
+            return MissStep::Wait(lane);
         }
+
+        let miss = Arc::new(MissFlight::<V, E>::new());
+        st.inflight
+            .entry(key.clone())
+            .or_default()
+            .push(InflightLane::new(Arc::clone(&miss)));
+        MissStep::Leader { miss }
     }
 
     pub(crate) async fn try_get_with<F, Fut, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
@@ -851,46 +942,52 @@ where
     {
         let mut init = Some(init);
         loop {
-            match self.miss_probe(&key) {
+            match self.miss_probe::<E>(&key) {
                 MissStep::Hit(v) => return Ok(v),
                 MissStep::Wait(f) => {
-                    if let Some(res) = await_miss_settled(&f).await {
+                    if let Some(res) = f.await_settled().await {
                         return res;
                     }
-                    // Leader was cancelled; the cancelled slot has already
-                    // been cleared by `LeaderGuard::drop`, so the next probe
-                    // either hits a fresh value or installs us as leader.
+                    // Leader cancelled — its lane has been cleared. Loop and
+                    // either hit a fresh value or take leadership ourselves.
                 }
-                MissStep::Retry => {}
                 MissStep::Leader { miss } => {
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
+                    let flight_any: Arc<dyn Any + Send + Sync> =
+                        Arc::clone(&miss) as Arc<dyn Any + Send + Sync>;
                     let mut guard = LeaderGuard {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
+                        flight_any,
                         armed: true,
                     };
                     let fut = init();
                     let res = fut.await;
                     let mut st = guard.inner.state.lock().expect("cache mutex poisoned");
-                    st.entries.remove(&key);
-                    let _ = guard
-                        .flight
-                        .settle
-                        .send(Some(FlightMsg::from_result(res.clone())));
+                    remove_lane(&mut st, &key, &guard.flight_any);
+
+                    let reclaimed = if let Ok(v) = &res {
+                        let now = Instant::now();
+                        Some(self.finish_miss_ok(&mut st, &key, v, now))
+                    } else {
+                        None
+                    };
+
+                    // Publish under the lock so a follower that wakes and
+                    // immediately calls `get(key)` cannot observe a state
+                    // where the value was reported settled but is not yet
+                    // installed in `entries`.
+                    guard.flight.publish(res.clone());
                     guard.armed = false;
                     drop(guard);
-
-                    if let Ok(v) = &res {
-                        let now = Instant::now();
-                        let reclaimed = self.finish_miss_ok(&mut st, &key, v, now);
-                        drop(st);
-                        self.fire_reclaim(reclaimed);
-                        return res;
-                    }
                     drop(st);
+
+                    if let Some(rec) = reclaimed {
+                        self.fire_reclaim(rec);
+                    }
                     return res;
                 }
             }
@@ -918,8 +1015,8 @@ where
         let nw = self.config.policy.weight(key, &v).get();
         let reclaimed = self.reclaim(&mut st, nw, key, now);
         let displaced = match st.entries.get(key) {
-            Some(&MapSlot::Ready(id)) => evict_slot(&mut st, id).map(|(_, v, _)| v),
-            _ => None,
+            Some(&id) => evict_slot(&mut st, id).map(|(_, v, _)| v),
+            None => None,
         };
         let deadline = deadline_after_write(self.config.policy.as_ref(), key, &v, now);
         install_ready(
