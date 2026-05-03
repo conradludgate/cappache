@@ -119,8 +119,8 @@ fn ttl_from_write_caps_write_expiry() {
     let read_cap =
         cache
             .policy_ref()
-            .expire_after_read(&k, &v, now, now, std::time::Duration::from_secs(60));
-    assert_eq!(read_cap, std::time::Duration::from_secs(60));
+            .expire_after_read(&k, &v, now, now, std::time::Duration::from_mins(1));
+    assert_eq!(read_cap, std::time::Duration::from_mins(1));
 }
 
 #[test]

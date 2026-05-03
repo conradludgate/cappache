@@ -51,16 +51,16 @@ fn test_cache_max_weight_one() -> Cache<K, V> {
     )
 }
 
+type ListenerEvent = (LifecycleReason, String, Option<String>);
+type ListenerEvents = Arc<Mutex<Vec<ListenerEvent>>>;
+
 struct RecordingListener {
-    events: Arc<Mutex<Vec<(LifecycleReason, String, Option<String>)>>>,
+    events: ListenerEvents,
 }
 
 impl RecordingListener {
-    fn new_pair() -> (
-        Arc<Self>,
-        Arc<Mutex<Vec<(LifecycleReason, String, Option<String>)>>>,
-    ) {
-        let events = Arc::new(Mutex::new(Vec::new()));
+    fn new_pair() -> (Arc<Self>, ListenerEvents) {
+        let events: ListenerEvents = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
                 events: events.clone(),
@@ -79,7 +79,7 @@ impl LifecycleListener<String, String> for RecordingListener {
 async fn with_timeout<F: Future>(limit: Duration, fut: F) -> F::Output {
     tokio::time::timeout(limit, fut)
         .await
-        .unwrap_or_else(|_| panic!("test exceeded {limit:?}"))
+        .expect("test exceeded timeout; raise limit in with_timeout(...) caller")
 }
 
 /// Counts `execute` calls; accepts any `Fut: Future + Send + 'static` with `Send` output (Tokio-style).

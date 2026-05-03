@@ -1,4 +1,5 @@
 #![deny(unsafe_code)]
+#![warn(clippy::pedantic)]
 
 //! Clache (Conrad Ludgate cache): a safe Rust concurrent cache API.
 //!
@@ -89,11 +90,11 @@ mod compile_tests {
     #[test]
     fn ttl_and_idle_wrap_inner_policy() {
         let _ttl: TtlFromWrite<DefaultPolicy> =
-            TtlFromWrite::new(std::time::Duration::from_secs(60), DefaultPolicy);
+            TtlFromWrite::new(std::time::Duration::from_mins(1), DefaultPolicy);
         let _idle: IdleTimeout<DefaultPolicy> =
             IdleTimeout::new(std::time::Duration::from_secs(30), DefaultPolicy);
         let _: Arc<dyn Policy<String, String> + Send + Sync> = Arc::new(TtlFromWrite::new(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_mins(2),
             DefaultPolicy,
         ));
     }

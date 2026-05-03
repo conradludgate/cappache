@@ -30,7 +30,7 @@ impl<V: Clone> FlightMsg<V> {
         match self {
             FlightMsg::Ok(v) => Ok(v),
             FlightMsg::Err(arc) => Err(Arc::downcast::<E>(arc)
-                .expect("miss flight error type mismatch")
+                .expect("miss flight error type mismatch: E must match the stored miss error type")
                 .as_ref()
                 .clone()),
         }
@@ -65,6 +65,31 @@ pub(crate) struct CacheEntry<V> {
     pub(crate) deadline: Option<Instant>,
 }
 
+pub(crate) enum MissStep<V> {
+    Wait(Arc<MissFlight<V>>),
+    Retry,
+    Leader { miss: Arc<MissFlight<V>> },
+}
+
+async fn await_miss_settled<V, E>(flight: &MissFlight<V>) -> Result<V, E>
+where
+    V: Clone,
+    E: Clone + Send + Sync + 'static,
+{
+    let mut rx = flight.settle.subscribe();
+    loop {
+        {
+            let cur = rx.borrow();
+            if let Some(m) = cur.as_ref() {
+                return m.clone().into_result::<E>();
+            }
+        }
+        rx.changed().await.expect(
+            "miss settle watch: sender dropped before flight completed; this is a bug in clache",
+        );
+    }
+}
+
 impl<K, V> Inner<K, V>
 where
     K: Eq + Hash + Clone + Send + Sync,
@@ -95,7 +120,7 @@ where
         V: 'static,
     {
         let now = Instant::now();
-        let mut st = self.state.lock().expect("cache lock");
+        let mut st = self.state.lock().expect("cache mutex poisoned");
         let expired = match st.entries.get(key) {
             Some(MapSlot::Ready(e)) => !entry_is_served(e, now),
             _ => false,
@@ -126,7 +151,7 @@ where
         let now = Instant::now();
         let new_w = self.config.policy.weight(&key, &value).get();
         let key_for_updated = key.clone();
-        let mut st = self.state.lock().expect("cache lock");
+        let mut st = self.state.lock().expect("cache mutex poisoned");
 
         let prev = match st.entries.remove(&key) {
             Some(MapSlot::Ready(old)) => {
@@ -165,7 +190,7 @@ where
         K: 'static,
         V: 'static,
     {
-        let mut st = self.state.lock().expect("cache lock");
+        let mut st = self.state.lock().expect("cache mutex poisoned");
         match st.entries.remove(key)? {
             MapSlot::Ready(e) => {
                 st.total_weight = st
@@ -222,6 +247,26 @@ where
         }
     }
 
+    fn finish_miss_ok(&self, st: &mut State<K, V>, key: &K, v: &V, now: Instant) -> Vec<(K, V)>
+    where
+        K: Clone + Eq + Hash + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        let deadline = deadline_after_write(self.config.policy.as_ref(), key, v, now);
+        let nw = self.config.policy.weight(key, v).get();
+        let pending = self.evict_until_fit(st, Weight::new(nw), key);
+        st.total_weight = st.total_weight.saturating_add(nw);
+        st.entries.insert(
+            key.clone(),
+            MapSlot::Ready(CacheEntry {
+                value: v.clone(),
+                written_at: now,
+                deadline,
+            }),
+        );
+        pending
+    }
+
     pub(crate) async fn try_get_with<F, Fut, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
@@ -236,32 +281,17 @@ where
             }
 
             if let Some(flight) = {
-                let st = self.state.lock().expect("cache lock");
+                let st = self.state.lock().expect("cache mutex poisoned");
                 match st.entries.get(&key) {
                     Some(MapSlot::Miss(f)) => Some(Arc::clone(f)),
                     _ => None,
                 }
             } {
-                let mut rx = flight.settle.subscribe();
-                loop {
-                    {
-                        let cur = rx.borrow();
-                        if let Some(m) = cur.as_ref() {
-                            return m.clone().into_result::<E>();
-                        }
-                    }
-                    rx.changed().await.expect("miss settle watch");
-                }
-            }
-
-            enum MissStep<V> {
-                Wait(Arc<MissFlight<V>>),
-                Retry,
-                Leader { miss: Arc<MissFlight<V>> },
+                return await_miss_settled(&flight).await;
             }
 
             let step = {
-                let mut st = self.state.lock().expect("cache lock");
+                let mut st = self.state.lock().expect("cache mutex poisoned");
                 if let Some(MapSlot::Ready(e)) = st.entries.get(&key) {
                     let now = Instant::now();
                     if entry_is_served(e, now) {
@@ -285,19 +315,8 @@ where
             };
 
             match step {
-                MissStep::Wait(f) => {
-                    let mut rx = f.settle.subscribe();
-                    loop {
-                        {
-                            let cur = rx.borrow();
-                            if let Some(m) = cur.as_ref() {
-                                return m.clone().into_result::<E>();
-                            }
-                        }
-                        rx.changed().await.expect("miss settle watch");
-                    }
-                }
-                MissStep::Retry => continue,
+                MissStep::Wait(f) => return await_miss_settled(&f).await,
+                MissStep::Retry => {}
                 MissStep::Leader { miss } => {
                     let mut first_poll = true;
                     poll_fn(|cx| {
@@ -312,25 +331,13 @@ where
                     .await;
                     let fut = init();
                     let res = fut.await;
-                    let mut st = self.state.lock().expect("cache lock");
+                    let mut st = self.state.lock().expect("cache mutex poisoned");
                     st.entries.remove(&key);
                     let _ = miss.settle.send(Some(FlightMsg::from_result(res.clone())));
 
                     if let Ok(v) = &res {
                         let now = Instant::now();
-                        let deadline =
-                            deadline_after_write(self.config.policy.as_ref(), &key, v, now);
-                        let nw = self.config.policy.weight(&key, v).get();
-                        let pending = self.evict_until_fit(&mut st, Weight::new(nw), &key);
-                        st.total_weight = st.total_weight.saturating_add(nw);
-                        st.entries.insert(
-                            key.clone(),
-                            MapSlot::Ready(CacheEntry {
-                                value: v.clone(),
-                                written_at: now,
-                                deadline,
-                            }),
-                        );
+                        let pending = self.finish_miss_ok(&mut st, &key, v, now);
                         drop(st);
                         for (ek, ev) in pending {
                             self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
@@ -350,7 +357,7 @@ where
     {
         self.state
             .lock()
-            .expect("cache lock")
+            .expect("cache mutex poisoned")
             .refresh_inflight
             .remove(key);
     }
@@ -360,7 +367,7 @@ where
         K: Eq + Hash + Clone + Send + Sync + 'static,
         V: Clone + Send + Sync + 'static,
     {
-        let mut st = self.state.lock().expect("cache lock");
+        let mut st = self.state.lock().expect("cache mutex poisoned");
         let displaced = match st.entries.remove(key) {
             Some(MapSlot::Ready(e)) => {
                 st.total_weight = st
@@ -427,10 +434,9 @@ fn update_read_deadline<K, V>(
     K: 'static,
     V: 'static,
 {
-    let time_remaining = e
-        .deadline
-        .map(|dl| dl.saturating_duration_since(now))
-        .unwrap_or(crate::policy::TIME_UNBOUNDED);
+    let time_remaining = e.deadline.map_or(crate::policy::TIME_UNBOUNDED, |dl| {
+        dl.saturating_duration_since(now)
+    });
     let d = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
     if d >= crate::policy::TIME_UNBOUNDED / 2 {
         e.deadline = None;

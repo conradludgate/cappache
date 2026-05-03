@@ -34,8 +34,8 @@ impl Weight {
 }
 
 /// Duration large enough to mean “no practical time eviction” from this hook, but small enough to
-/// add to typical [`Instant`] values without overflow.
-pub const TIME_UNBOUNDED: Duration = Duration::from_secs(365 * 24 * 3600 * 100);
+/// add to typical [`Instant`] values without overflow. Equivalent to **100 × 365 × 24 h** (`876_000` hours).
+pub const TIME_UNBOUNDED: Duration = Duration::from_hours(876_000);
 
 /// Per-entry weighting and time limits after read and write events.
 pub trait Policy<K, V>: Send + Sync {

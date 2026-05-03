@@ -132,6 +132,17 @@ where
         self.inner.remove(key)
     }
 
+    /// Runs the miss initializer for `key` when absent or not yet served, coalescing concurrent waiters.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the initializer future resolves to `Err`; no value is installed for `key`.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on internal bugs: if the miss single-flight `watch` sender is dropped before
+    /// waiters are notified, if a stored miss error does not match the requested `E` when
+    /// unwrapping waiters, or if the cache mutex is poisoned.
     pub async fn try_get_with<F, Fut, E>(&self, key: K, init: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
@@ -141,6 +152,12 @@ where
         inner::Inner::try_get_with(&self.inner, key, init).await
     }
 
+    /// Miss path that returns `V` by using [`Infallible`] errors internally; see [`Self::try_get_with`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::try_get_with`], and if an [`Infallible`] `Err`
+    /// is ever produced (unreachable for this API).
     pub async fn get_with<F, Fut>(&self, key: K, init: F) -> V
     where
         F: FnOnce() -> Fut,
@@ -151,9 +168,14 @@ where
             async move { Ok::<_, Infallible>(f.await) }
         })
         .await
-        .unwrap_or_else(|e| match e {})
+        .expect("infallible: get_with uses OkIntoResult")
     }
 
+    /// Like [`Self::get_with`], blocking the current thread until completion.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`Self::get_with`].
     pub fn get_with_blocking<F, Fut>(&self, key: K, init: F) -> V
     where
         F: FnOnce() -> Fut,
@@ -166,10 +188,21 @@ where
                 async move { Ok::<_, Infallible>(f.await) }
             })
             .await
-            .unwrap_or_else(|e| match e {})
+            .expect("infallible: get_with_blocking uses OkIntoResult")
         })
     }
 
+    /// Schedules a refresh job on `executor` for `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the initializer resolves to `Err` on its first poll before the job is
+    /// handed to [`Executor::execute`]. Errors that appear only after the job is scheduled are not
+    /// returned here (the refresh future completes without updating the map).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache mutex is poisoned.
     pub fn try_revalidate<E, Ex, F, Fut>(
         &self,
         key: K,
@@ -184,7 +217,7 @@ where
         K: Unpin,
     {
         {
-            let mut st = self.inner.state.lock().expect("cache lock");
+            let mut st = self.inner.state.lock().expect("cache mutex poisoned");
             if st.refresh_inflight.contains(&key) {
                 return Ok(RevalidateScheduled::SkippedInFlight);
             }
@@ -214,6 +247,12 @@ where
         Ok(RevalidateScheduled::Submitted)
     }
 
+    /// Infallible wrapper around [`Self::try_revalidate`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::try_revalidate`], and if an [`Infallible`] `Err`
+    /// is ever produced (unreachable for this API).
     pub fn revalidate<Ex, F, Fut>(&self, key: K, executor: &Ex, init: F) -> RevalidateScheduled
     where
         Ex: Executor<RefreshWork<K, V, Infallible>> + ?Sized,
@@ -221,9 +260,7 @@ where
         Fut: Future<Output = V> + Send + 'static,
         K: Unpin,
     {
-        match self.try_revalidate(key, executor, |k| OkIntoResult::new(init(k))) {
-            Ok(s) => s,
-            Err(e) => match e {},
-        }
+        self.try_revalidate(key, executor, |k| OkIntoResult::new(init(k)))
+            .expect("infallible: revalidate uses OkIntoResult")
     }
 }
