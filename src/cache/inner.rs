@@ -8,12 +8,26 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use tokio::sync::watch;
 
 use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
 use crate::policy::Policy;
+
+/// Decision returned by [`Inner::try_mark_refresh_inflight`]. Mirrors the
+/// public [`crate::rt::RevalidateScheduled`] variants so the call site only
+/// has to translate, not branch on slot state directly.
+pub(crate) enum RefreshGate {
+    /// Caller should poll `init` and submit to the executor.
+    Submit,
+    /// A refresh for this key is already in flight; caller returns
+    /// `RevalidateScheduled::SkippedInFlight`.
+    SkipInFlight,
+    /// No `Ready` slot exists for this key; caller returns
+    /// `RevalidateScheduled::AbsentKey`.
+    AbsentKey,
+}
 
 /// Outcome published on a miss flight's settle channel. `Cancelled` is sent by
 /// [`LeaderGuard::drop`] when the leader's `init` future was dropped or
@@ -204,7 +218,6 @@ pub(crate) struct State<K, V> {
     /// dropped on pop. Read-deadline updates push a new tuple instead of
     /// removing the old one.
     expiry: ExpiryHeap,
-    pub(crate) refresh_inflight: HashSet<K>,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
 }
@@ -227,6 +240,11 @@ struct EntrySlot<K, V> {
     generation: u32,
     lru_prev: Option<SlotId>,
     lru_next: Option<SlotId>,
+    /// `true` while a `try_revalidate` job for this key is in flight.
+    /// Held on the slot rather than a side `HashSet<K>` to skip the
+    /// per-revalidate `K::clone()` + hash + insert; cleared by
+    /// `refresh_inflight_remove` (or dropped with the slot on eviction).
+    refresh_inflight: bool,
 }
 
 enum SlabEntry<K, V> {
@@ -634,6 +652,7 @@ where
         generation,
         lru_prev: None,
         lru_next: None,
+        refresh_inflight: false,
     });
     debug_assert_eq!(
         id.to_index(),
@@ -668,7 +687,6 @@ where
                 slab: Slab::with_capacity(initial_capacity),
                 evict_list: EvictList::default(),
                 expiry: ExpiryHeap::default(),
-                refresh_inflight: HashSet::new(),
                 total_weight: 0,
             }),
         }
@@ -1120,15 +1138,45 @@ where
         }
     }
 
+    /// Atomically inspects the slot for `key` and decides whether
+    /// `try_revalidate` should submit, skip (already inflight), or refuse
+    /// (no `Ready` slot). On `Submit`, sets the slot's
+    /// `refresh_inflight = true` so the next call returns `SkipInFlight`
+    /// until the matching `refresh_inflight_remove`.
+    pub(crate) fn try_mark_refresh_inflight(&self, key: &K) -> RefreshGate
+    where
+        K: Eq + Hash,
+    {
+        let mut st = self.state.lock().expect("cache mutex poisoned");
+        let Some(&id) = st.entries.get(key) else {
+            return RefreshGate::AbsentKey;
+        };
+        let Some(es) = st.slab.get_mut(id) else {
+            return RefreshGate::AbsentKey;
+        };
+        if es.refresh_inflight {
+            RefreshGate::SkipInFlight
+        } else {
+            es.refresh_inflight = true;
+            RefreshGate::Submit
+        }
+    }
+
+    /// Clears the per-slot `refresh_inflight` flag once a refresh job
+    /// finishes (success, error, or future drop). Best-effort: if the slot
+    /// was evicted while the refresh was in flight there is nothing to
+    /// clear, which is fine — the next `try_revalidate` would land on a
+    /// different slot anyway.
     pub(crate) fn refresh_inflight_remove(&self, key: &K)
     where
         K: Eq + Hash,
     {
-        self.state
-            .lock()
-            .expect("cache mutex poisoned")
-            .refresh_inflight
-            .remove(key);
+        let mut st = self.state.lock().expect("cache mutex poisoned");
+        if let Some(&id) = st.entries.get(key)
+            && let Some(es) = st.slab.get_mut(id)
+        {
+            es.refresh_inflight = false;
+        }
     }
 
     pub(crate) fn apply_refresh_ok(&self, key: &K, v: V)

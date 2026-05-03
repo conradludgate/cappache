@@ -383,6 +383,7 @@ mod revalidate_tests {
         let cache = test_cache();
         let ex = CountingExecutor::default();
         let k = "rev1".to_string();
+        cache.insert(k.clone(), "old".into());
         let res = cache.try_revalidate(k.clone(), &ex, |_key| async move {
             Ok::<_, InitError>("nv".to_string())
         });
@@ -396,6 +397,7 @@ mod revalidate_tests {
         let cache = test_cache();
         let ex = CountingExecutor::default();
         let k = "rev2".to_string();
+        cache.insert(k.clone(), "old".into());
         let _ = cache
             .try_revalidate(k.clone(), &ex, |_key| async move {
                 Ok::<_, InitError>("a".to_string())
@@ -417,6 +419,7 @@ mod revalidate_tests {
         let cache = test_cache();
         let ex = CountingExecutor::default();
         let k = "init_err".to_string();
+        cache.insert(k.clone(), "old".into());
         let res = cache.try_revalidate(k, &ex, |_key| async move {
             Err::<String, InitError>(InitError(42))
         });
@@ -424,10 +427,39 @@ mod revalidate_tests {
     }
 
     #[test]
+    fn try_revalidate_absent_key_returns_absent_and_does_not_schedule() {
+        let cache = test_cache();
+        let ex = CountingExecutor::default();
+        let res = cache.try_revalidate("missing".to_string(), &ex, |_key| async move {
+            Ok::<_, InitError>("never_run".to_string())
+        });
+        assert_eq!(res, Ok(RevalidateScheduled::AbsentKey));
+        assert_eq!(
+            ex.executed_count(),
+            0,
+            "AbsentKey must not hand a job to the executor"
+        );
+    }
+
+    #[test]
+    fn revalidate_absent_key_returns_absent_and_does_not_schedule() {
+        let cache = test_cache();
+        let ex = CountingExecutor::default();
+        let s = cache.revalidate(
+            "missing_inf".to_string(),
+            &ex,
+            |_key| async move { "never_run".to_string() },
+        );
+        assert_eq!(s, RevalidateScheduled::AbsentKey);
+        assert_eq!(ex.executed_count(), 0);
+    }
+
+    #[test]
     fn revalidate_submitted_when_idle() {
         let cache = test_cache();
         let ex = CountingExecutor::default();
         let k = "rev_inf".to_string();
+        cache.insert(k.clone(), "old".into());
         let s = cache.revalidate(
             k.clone(),
             &ex,
@@ -442,6 +474,7 @@ mod revalidate_tests {
         let cache = test_cache();
         let ex = CountingExecutor::default();
         let k = "rev_inf2".to_string();
+        cache.insert(k.clone(), "old".into());
         let _ = cache
             .try_revalidate(k.clone(), &ex, |_key| async move {
                 Ok::<_, InitError>("x".to_string())
@@ -955,23 +988,21 @@ mod lanes {
     use super::*;
 
     #[tokio::test]
-    async fn try_get_with_miss_once_and_revalidate_submits_under_concurrency() {
+    async fn concurrent_get_and_revalidate_on_present_key_both_progress() {
         with_timeout(Duration::from_secs(30), async {
             let cache = Arc::new(test_cache());
             let k = "lane1".to_string();
+            cache.insert(k.clone(), "warm".into());
             let ex = CountingExecutor::default();
 
-            let miss_calls = Arc::new(AtomicUsize::new(0));
-            let mc = Arc::clone(&miss_calls);
-            let c_miss = Arc::clone(&cache);
-            let k_miss = k.clone();
-            let miss = tokio::spawn(async move {
-                c_miss
-                    .try_get_with(k_miss, || async move {
-                        mc.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, ()>("mv".to_string())
-                    })
-                    .await
+            let read_calls = Arc::new(AtomicUsize::new(0));
+            let rc = Arc::clone(&read_calls);
+            let c_get = Arc::clone(&cache);
+            let k_get = k.clone();
+            let getter = tokio::spawn(async move {
+                let v = c_get.get(&k_get);
+                rc.fetch_add(1, Ordering::SeqCst);
+                v
             });
 
             let c_rev = Arc::clone(&cache);
@@ -984,13 +1015,13 @@ mod lanes {
                 })
             });
 
-            let (m, r) = tokio::join!(miss, rev);
-            let miss_res = m.expect("miss join").expect("try_get_with");
+            let (g, r) = tokio::join!(getter, rev);
+            let get_res = g.expect("get join");
             let rev_res = r.expect("rev join").expect("try_revalidate");
-            assert_eq!(miss_res, "mv");
+            assert_eq!(get_res.as_deref(), Some("warm"));
             assert_eq!(rev_res, RevalidateScheduled::Submitted);
             assert_eq!(ex.executed_count(), 1);
-            assert_eq!(miss_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(read_calls.load(Ordering::SeqCst), 1);
         })
         .await;
     }

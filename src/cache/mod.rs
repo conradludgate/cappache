@@ -287,12 +287,14 @@ where
         Fut: Future<Output = Result<V, E>> + Send + 'static,
         K: Unpin,
     {
-        {
-            let mut st = self.inner.state.lock().expect("cache mutex poisoned");
-            if st.refresh_inflight.contains(&key) {
+        match self.inner.try_mark_refresh_inflight(&key) {
+            inner::RefreshGate::Submit => {}
+            inner::RefreshGate::SkipInFlight => {
                 return Ok(RevalidateScheduled::SkippedInFlight);
             }
-            st.refresh_inflight.insert(key.clone());
+            inner::RefreshGate::AbsentKey => {
+                return Ok(RevalidateScheduled::AbsentKey);
+            }
         }
 
         let mut fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>> = Box::pin(init(&key));

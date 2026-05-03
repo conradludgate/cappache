@@ -33,9 +33,16 @@ pub trait Executor<Fut> {
 /// Whether [`Cache::revalidate`](crate::Cache::revalidate) or [`Cache::try_revalidate`](crate::Cache::try_revalidate)
 /// submitted work to the [`Executor`].
 ///
-/// **`SkippedInFlight`** means a refresh was already in flight for that key (per
-/// [`Cache::try_revalidate`](crate::Cache::try_revalidate)’s `refresh_inflight` tracking) and a second
-/// backend call was not started.
+/// **`SkippedInFlight`** means a refresh was already in flight for that key
+/// (the prior refresh's `EntrySlot::refresh_inflight` flag is still set) and
+/// a second backend call was not started.
+///
+/// **`AbsentKey`** means the cache currently holds no `Ready` entry for that
+/// key, so there is nothing to refresh in place. Refresh deliberately does
+/// not install fresh entries — that is the miss path
+/// ([`Cache::try_get_with`](crate::Cache::try_get_with) /
+/// [`Cache::get_with`](crate::Cache::get_with)) — so the call is a no-op
+/// and the caller can decide whether to fall back to a miss.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RevalidateScheduled {
@@ -43,4 +50,7 @@ pub enum RevalidateScheduled {
     Submitted,
     /// A refresh was already in flight for this key.
     SkippedInFlight,
+    /// No `Ready` entry exists for this key; the cache deliberately does
+    /// not promote refresh into an install.
+    AbsentKey,
 }
