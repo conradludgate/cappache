@@ -97,10 +97,15 @@ where
     V: Clone + Send + Sync,
 {
     pub(crate) fn new(config: CacheConfig<K, V>) -> Self {
+        // Pre-size `entries` to the cache's weight budget so steady-state inserts
+        // never trigger a one-shot O(n) rehash. `weight ≥ 1` is the working
+        // assumption for entry count ≤ max_weight; if a future `Policy` returns
+        // `Weight::ZERO` we still have an upper-bounded allocation here.
+        let initial_capacity = capacity_hint_from_max_weight(config.max_weight.get());
         Self {
             config,
             state: Mutex::new(State {
-                entries: HashMap::new(),
+                entries: HashMap::with_capacity(initial_capacity),
                 refresh_inflight: HashSet::new(),
                 total_weight: 0,
             }),
@@ -454,6 +459,18 @@ where
 /// in [`update_read_deadline`] to compute the next deadline.
 fn entry_is_served<V>(e: &CacheEntry<V>, now: Instant) -> bool {
     !matches!(e.deadline, Some(dl) if now >= dl)
+}
+
+/// Pre-sizing hint for `State::entries`. Bounds the rare-resize tail without
+/// allocating absurdly large tables for callers who set huge weight budgets:
+/// once the per-entry `Policy::weight` is `≥ 1`, total entry count is bounded
+/// by `max_weight`, but we still cap the *allocation* here because the
+/// configured budget is a weight unit, not necessarily an entry count.
+const CAPACITY_HINT_CAP: u64 = 1 << 20;
+
+fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
+    let bounded = max_weight.min(CAPACITY_HINT_CAP);
+    usize::try_from(bounded).unwrap_or(usize::MAX)
 }
 
 fn update_read_deadline<K, V>(

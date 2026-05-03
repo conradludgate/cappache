@@ -12,12 +12,14 @@ collect must go.
 
 | Piece                                       | Cost                                                        |
 | ------------------------------------------- | ----------------------------------------------------------- |
-| `get_served` / `insert` / `remove` map ops  | **O(1)** average, **bounded** worst case (incremental resize) |
+| `get_served` / `insert` / `remove` map ops  | **O(1)** average, no rehash spikes inside the weight budget |
 | Heap deadline maintenance (push / pop)      | **O(log n)**                                                |
 | Drain `d` already-expired entries           | **O(d log n)**                                              |
 | Slab eviction step (per live victim)        | **O(1)**                                                    |
 | Read-deadline update (heap re-push, lazy)   | **O(log n)** amortised; stale entries discarded on peek     |
 | Capacity check                              | **O(1)** (running `total_weight` of `Ready` slots)          |
+
+Map sizing: `State.entries` is constructed with `HashMap::with_capacity(min(max_weight, 1 << 20))` so a cache that stays inside its weight budget never sees a rehash. Past that cap (or with `Weight::ZERO` policies) the standard amortised-doubling growth applies. A `papaya::HashMap` with `ResizeMode::Incremental` was considered for hard worst-case bounds; under the current `Mutex<State>` it would force a clone on every `update_read_deadline` for no reader-concurrency benefit, so it is deferred until Phase 3 lifts the outer mutex.
 
 **Capacity flow on writes:** drain entries already past their materialised
 deadline first (via the expiry index), then evict live entries via the slab
