@@ -305,6 +305,13 @@ pub(crate) struct State<K, V> {
     /// dropped on pop. Read-deadline updates push a new tuple instead of
     /// removing the old one.
     expiry: ExpiryHeap,
+    /// Number of heap pushes that superseded a still-finite prior deadline
+    /// for the same slot (i.e. left a stale tuple behind). Read-extending
+    /// policies — `IdleTimeout`, custom `expire_after_read` hooks — can
+    /// pile these up arbitrarily under read-heavy workloads. When the
+    /// stale count exceeds the live slab size we rebuild the heap from
+    /// scratch so memory stays bounded by `slab.len()`.
+    stale_pushes: u64,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
 }
@@ -362,6 +369,24 @@ impl<K, V> Slab<K, V> {
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Iterate `(SlotId, &EntrySlot)` over occupied slots only. Used by
+    /// the expiry-heap rebuild path; ordering matches insertion index but
+    /// callers don't depend on it.
+    fn iter_occupied(&self) -> impl Iterator<Item = (SlotId, &EntrySlot<K, V>)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| match slot {
+                SlabEntry::Occupied(es) => {
+                    let id = SlotId::from_index(
+                        u32::try_from(idx).expect("slab capacity exceeds u32::MAX"),
+                    );
+                    Some((id, es))
+                }
+                SlabEntry::Free { .. } => None,
+            })
     }
 
     /// Install `entry` and return its slot id. Callers must set `entry.generation`
@@ -562,6 +587,43 @@ impl ExpiryHeap {
     fn clear(&mut self) {
         self.0.clear();
     }
+}
+
+/// Push a deadline tuple into the expiry heap and bump `stale_pushes`
+/// when the push leaves a previous (still-finite) tuple for the same slot
+/// behind. When stale tuples outnumber live entries the heap is rebuilt
+/// from the slab so memory stays bounded by `slab.len()`. Pure-`State`
+/// helper so it's reachable from both the read and miss-probe paths.
+fn expiry_push_extend<K, V>(
+    st: &mut State<K, V>,
+    deadline: Instant,
+    slot: SlotId,
+    generation: u32,
+    superseded_finite: bool,
+) {
+    st.expiry.push(deadline, slot, generation);
+    if superseded_finite {
+        st.stale_pushes = st.stale_pushes.saturating_add(1);
+        // Rebuilding under the same lock keeps the invariant simple
+        // (no stale tuple ever escapes a probe) and is amortised: the
+        // trigger only fires once per `slab.len()` superseded pushes.
+        if st.stale_pushes > st.slab.len() as u64 {
+            rebuild_expiry(st);
+        }
+    }
+}
+
+/// Walk the slab and rebuild the expiry heap from the live deadline of
+/// each occupied slot. `stale_pushes` resets to 0; the new heap holds at
+/// most one tuple per live entry.
+fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
+    st.expiry.clear();
+    for (id, es) in st.slab.iter_occupied() {
+        if let Some(dl) = es.entry.deadline {
+            st.expiry.push(dl, id, es.generation);
+        }
+    }
+    st.stale_pushes = 0;
 }
 
 /// Drain entries whose materialised deadline is at or before `now`. Each
@@ -822,6 +884,7 @@ where
                     slab: Slab::with_capacity(initial_capacity),
                     evict_list: EvictList::default(),
                     expiry: ExpiryHeap::default(),
+                    stale_pushes: 0,
                     total_weight: 0,
                 })
             })
@@ -863,22 +926,22 @@ where
             return None;
         }
 
-        let State {
-            slab,
-            evict_list,
-            expiry,
-            ..
-        } = &mut *st;
-        evict_list.promote_to_mru(slab, id);
-        let es = slab.get_mut(id)?;
-        let value = es.entry.value.clone();
-        let generation = es.generation;
-        // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
-        // (mutable) don't overlap, so the borrow checker accepts both.
-        let new_dl =
-            update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
-        if let Some(dl) = new_dl {
-            expiry.push(dl, id, generation);
+        let (value, generation, update) = {
+            let State {
+                slab, evict_list, ..
+            } = &mut *st;
+            evict_list.promote_to_mru(slab, id);
+            let es = slab.get_mut(id)?;
+            let value = es.entry.value.clone();
+            let generation = es.generation;
+            // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
+            // (mutable) don't overlap, so the borrow checker accepts both.
+            let update =
+                update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
+            (value, generation, update)
+        };
+        if let Some(dl) = update.new_deadline {
+            expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
         }
         Some(value)
     }
@@ -947,6 +1010,7 @@ where
                 slab,
                 evict_list,
                 expiry,
+                stale_pushes,
                 total_weight,
                 ..
             } = &mut *st;
@@ -959,6 +1023,7 @@ where
             }
             entries.clear();
             expiry.clear();
+            *stale_pushes = 0;
             *total_weight = 0;
 
             // Cancel pending miss lanes before releasing the lock so
@@ -1204,22 +1269,22 @@ where
                 .get(id)
                 .is_some_and(|es| entry_is_served(&es.entry, now));
             if still_served {
-                let State {
-                    slab,
-                    evict_list,
-                    expiry,
-                    ..
-                } = &mut *st;
-                evict_list.promote_to_mru(slab, id);
-                let es = slab
-                    .get_mut(id)
-                    .expect("just confirmed Occupied above under our mutex");
-                let value = es.entry.value.clone();
-                let generation = es.generation;
-                let new_dl =
-                    update_read_deadline(key, &mut es.entry, &self.config.policy, now);
-                if let Some(dl) = new_dl {
-                    expiry.push(dl, id, generation);
+                let (value, generation, update) = {
+                    let State {
+                        slab, evict_list, ..
+                    } = &mut *st;
+                    evict_list.promote_to_mru(slab, id);
+                    let es = slab
+                        .get_mut(id)
+                        .expect("just confirmed Occupied above under our mutex");
+                    let value = es.entry.value.clone();
+                    let generation = es.generation;
+                    let update =
+                        update_read_deadline(key, &mut es.entry, &self.config.policy, now);
+                    (value, generation, update)
+                };
+                if let Some(dl) = update.new_deadline {
+                    expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
                 }
                 return MissStep::Hit(value);
             }
@@ -1420,17 +1485,26 @@ fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
     usize::try_from(bounded).unwrap_or(usize::MAX)
 }
 
-/// Apply the read hook to `e.deadline` in place. Returns `Some(new_deadline)`
-/// only when the deadline transitions to a new finite value (different from
-/// the old one); the caller is then responsible for pushing it into the
-/// expiry heap. Returns `None` when the deadline either stayed the same or
-/// became `None`, both of which leave the heap untouched.
+/// Outcome of [`update_read_deadline`]. `new_deadline` is `Some` only when
+/// the deadline transitioned to a fresh finite value the caller still has
+/// to push into the expiry heap. `superseded_finite` is `true` when the
+/// previous deadline was finite (so any tuple already in the heap for
+/// this slot is now stale) — read-extending policies pile these up over
+/// time and are what trigger the periodic rebuild.
+struct ReadDeadlineUpdate {
+    new_deadline: Option<Instant>,
+    superseded_finite: bool,
+}
+
+/// Apply the read hook to `e.deadline` in place. The returned
+/// [`ReadDeadlineUpdate`] tells the caller whether to push a fresh tuple
+/// and whether that push leaves a stale tuple behind.
 fn update_read_deadline<K, V, P>(
     key: &K,
     e: &mut CacheEntry<V>,
     policy: &P,
     now: Instant,
-) -> Option<Instant>
+) -> ReadDeadlineUpdate
 where
     K: 'static,
     V: 'static,
@@ -1447,9 +1521,13 @@ where
         now.checked_add(d)
     };
     e.deadline = new;
-    match new {
+    let new_deadline = match new {
         Some(dl) if Some(dl) != prev => Some(dl),
         _ => None,
+    };
+    ReadDeadlineUpdate {
+        new_deadline,
+        superseded_finite: new_deadline.is_some() && prev.is_some(),
     }
 }
 
@@ -1562,6 +1640,51 @@ mod shard_tests {
                 "weight {w} exceeded documented upper bound {upper} after k{i}",
             );
         }
+    }
+
+    /// Read-extending policies (e.g. `IdleTimeout`) push a fresh
+    /// deadline tuple per read but cannot remove the old one cheaply, so
+    /// without a rebuild trigger the heap grows without bound under
+    /// repeated reads. The trigger fires once stale tuples exceed live
+    /// slab size, capping the heap at one tuple per live entry plus the
+    /// transient batch since the last rebuild.
+    #[test]
+    fn heap_stays_bounded_under_read_extending_policy() {
+        use crate::policy::{IdleTimeout, Weight};
+        use std::time::Duration;
+
+        let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(
+            Duration::from_mins(1),
+            crate::policy::DefaultPolicy,
+        ));
+        let cfg = CacheBuilder::<K, V>::new()
+            .max_weight(Weight::new(8))
+            .shards(1)
+            .policy(policy)
+            .build();
+        let inner = Arc::new(Inner::new(cfg));
+
+        for i in 0..8 {
+            inner.insert(format!("k{i}"), "v".to_string());
+        }
+
+        // Without the rebuild trigger, each read pushes a fresh heap
+        // tuple and leaves the previous one stale; we'd see the heap
+        // grow without bound. With the trigger, the heap stays at most
+        // a constant multiple of the live slab size.
+        for _ in 0..1024 {
+            for i in 0..8 {
+                let _ = inner.get_served(&format!("k{i}"));
+            }
+        }
+
+        let st = inner.shards[0].lock().expect("cache mutex poisoned");
+        let live = st.slab.len();
+        let heap_len = st.expiry.0.len();
+        assert!(
+            heap_len <= 2 * live + 1,
+            "expiry heap grew to {heap_len} for {live} live entries; rebuild trigger broken",
+        );
     }
 
     /// Per-shard eviction must not leak across shards: filling one shard
