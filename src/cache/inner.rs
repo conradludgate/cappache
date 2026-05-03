@@ -934,7 +934,12 @@ where
         );
 
         drop(st);
-        drop(displaced);
+        // Mirror `Inner::insert`: when an existing Ready value is replaced,
+        // emit Updated outside the lock so listeners see the same lifecycle
+        // for refresh-driven and caller-driven replacements.
+        if let Some(prev) = displaced {
+            self.notify_lifecycle(LifecycleReason::Updated, key.clone(), Some(prev));
+        }
         self.fire_reclaim(reclaimed);
     }
 }

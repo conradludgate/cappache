@@ -450,6 +450,44 @@ mod revalidate_tests {
     }
 
     #[tokio::test]
+    async fn refresh_replacing_existing_value_emits_updated_with_prior() {
+        with_timeout(Duration::from_secs(30), async {
+            let (listener, log) = RecordingListener::new_pair();
+            let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+            let cache = Cache::new(
+                CacheBuilder::new()
+                    .lifecycle_listener(listener)
+                    .build(),
+            );
+            cache.insert("k".into(), "old".into());
+
+            let ex = TokioSpawnExecutor;
+            assert_eq!(
+                cache.try_revalidate("k".into(), &ex, |_k| async move {
+                    Ok::<_, InitError>("new".into())
+                }),
+                Ok(RevalidateScheduled::Submitted)
+            );
+            wait_get(&cache, "k", "new").await;
+
+            // Mirror the lifecycle emitted by `Cache::insert` when it
+            // replaces an existing key, so callers can audit refresh-driven
+            // replacements via the same Updated path.
+            let saw_updated = log.lock().unwrap().iter().any(|(reason, key, val)| {
+                *reason == LifecycleReason::Updated
+                    && key == "k"
+                    && val.as_ref() == Some(&"old".to_string())
+            });
+            assert!(
+                saw_updated,
+                "expected Updated(k, Some(old)); got {:?}",
+                log.lock().unwrap()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn try_revalidate_run_executor_updates_get_and_second_submit_not_skipped() {
         with_timeout(Duration::from_secs(30), async {
             let cache = test_cache();
