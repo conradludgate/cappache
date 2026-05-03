@@ -5,11 +5,28 @@ public Rust API and doc comments on types and methods.
 
 ## Performance targets
 
-- **O(1) worst case** for `**get` / `insert` / `remove`** (including structural work those operations
-trigger) is a **target** for the current implementation and later refinements.
-- **Weight budget:** the cache keeps a running **total weight** of `**Ready**` entries so over-capacity checks avoid a full map scan each time. **Victim selection** for eviction may still scan keys (or use a richer structure later), so worst-case eviction work is not yet the full O(1) story.
-- Time-based eviction driven by the `Policy` trait may remain **lazy** (on access,
-opportunistic sweeps, and/or background work) and need not meet the same worst-case bound.
+The aim is **bounded** worst-case work per `get` / `insert` / `remove`. Where a true
+**O(1)** structure is impractical, **O(log n)** is acceptable. **O(n)** hot paths
+are not — in particular [`evict_until_fit`](../src/cache/inner.rs)'s ready-key
+collect must go.
+
+| Piece                                       | Cost                                                        |
+| ------------------------------------------- | ----------------------------------------------------------- |
+| `get_served` / `insert` / `remove` map ops  | **O(1)** average, **bounded** worst case (incremental resize) |
+| Heap deadline maintenance (push / pop)      | **O(log n)**                                                |
+| Drain `d` already-expired entries           | **O(d log n)**                                              |
+| Slab eviction step (per live victim)        | **O(1)**                                                    |
+| Read-deadline update (heap re-push, lazy)   | **O(log n)** amortised; stale entries discarded on peek     |
+| Capacity check                              | **O(1)** (running `total_weight` of `Ready` slots)          |
+
+**Capacity flow on writes:** drain entries already past their materialised
+deadline first (via the expiry index), then evict live entries via the slab
+(LRU or S3-FIFO) until projected weight fits. The expiry index is **only** for
+past-deadline reclaim — it is **not** consulted to pick capacity victims by
+soonest *future* expiry.
+
+Time-based eviction is otherwise opportunistic (lazy on access plus the drain
+above on writes). It is **not** guaranteed to fire immediately at deadline.
 
 ## Capacity and time semantics
 
@@ -88,6 +105,61 @@ flowchart LR
 ```
 
 
+
+## Benchmark runbook
+
+clache's perf claims are validated by **comparative** benches: every workload
+is run against `moka` and `quick_cache` on the same inputs.
+
+### Microbenches (Criterion)
+
+[`benches/compare_cache.rs`](../benches/compare_cache.rs) defines three
+scenarios (`get_hit`, `insert_churn` varying *N*, `insert_cold`). Each
+`BenchmarkId` carries the implementation tag so `target/criterion/<scenario>/<impl>/<param>/`
+groups clache, moka, and quick_cache side-by-side.
+
+```sh
+cargo bench --bench compare_cache
+cargo bench --bench compare_cache -- --quick get_hit   # smoke run
+```
+
+### Trace-driven (mokabench fork)
+
+Upstream `moka-rs/mokabench` exposes `CacheDriver` only as `pub(crate)`, so a
+new backend cannot be added without modifying the crate. We carry an in-tree
+fork at `third-party/mokabench` (branch `add-clache-driver` on
+`conradludgate/mokabench`) that adds the `clache` feature, a
+`cache::clache::ClacheCache` driver, and `run_multi_threads_clache`.
+
+[`examples/mokabench_compare.rs`](../examples/mokabench_compare.rs) drives the
+three sync backends on identical traces, e.g.:
+
+```sh
+git submodule update --init --recursive third-party/mokabench
+zstd -d -k third-party/mokabench/cache-trace/arc/OLTP.lis.zst
+cargo run --release --example mokabench_compare -- oltp
+```
+
+The `cache-trace` files ship as `.zst`; decompress the ones you need before
+running. TTL/TTI traces are **not yet wired** through the clache driver and
+will `todo!()` until that work lands.
+
+### Frozen pre-refactor baseline
+
+Before any cache-algorithm changes we captured a baseline at the
+`bench-pre-refactor` git tag. The archive lives in
+[`bench-baselines/pre-refactor/`](../bench-baselines/pre-refactor/) (Criterion
+tree, flat `criterion-summary.txt`, mokabench OLTP log, `BASELINE.txt`
+provenance). To diff later work against it:
+
+```sh
+# Restore Criterion tree if target/ was cleaned.
+cp -R bench-baselines/pre-refactor/criterion/* target/criterion/
+cargo bench --bench compare_cache -- --baseline pre_refactor
+```
+
+A regression in the comparative slope (especially `insert_churn` vs *N*) is
+the primary signal — Criterion's per-bench diff is supporting evidence.
 
 ## Open questions
 
