@@ -79,8 +79,7 @@ where
 /// Fall back to 1 when the runtime can't report parallelism.
 fn default_shard_count() -> usize {
     std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
+        .map_or(1, usize::from)
         .next_power_of_two()
         .max(1)
 }

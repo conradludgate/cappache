@@ -787,8 +787,11 @@ impl<K, V, P> Inner<K, V, P> {
         let h = hash_key(&self.hasher, key);
         // Power-of-two shard count, so `h & mask` is in range. With
         // `shard_mask == 0` this collapses to shard 0 (the .shards(1)
-        // case), matching the original single-mutex behaviour.
-        let idx = (h & self.shard_mask) as usize;
+        // case), matching the original single-mutex behaviour. Mask is
+        // sized to `shard_count - 1`, so the masked value always fits
+        // a `usize` regardless of pointer width.
+        let idx = usize::try_from(h & self.shard_mask)
+            .expect("shard mask is bounded by shard_count which fits a usize");
         &self.shards[idx]
     }
 }
@@ -1481,5 +1484,136 @@ mod size_regressions {
             observed, 104,
             "EntrySlot grew to {observed}; check niche packing on Option<SlotId>",
         );
+    }
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+    use crate::config::{CacheBuilder, DynPolicy};
+    use crate::policy::{DefaultPolicy, Weight};
+    use std::sync::Arc;
+
+    type K = String;
+    type V = String;
+
+    fn build(shards: usize, max_weight: u64) -> Arc<Inner<K, V, DynPolicy<K, V>>> {
+        let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
+        let cfg = CacheBuilder::<K, V>::new()
+            .max_weight(Weight::new(max_weight))
+            .shards(shards)
+            .policy(policy)
+            .build();
+        Arc::new(Inner::new(cfg))
+    }
+
+    /// `shard_for` derives the shard purely from `&self.hasher` and
+    /// `&self.shards`, both of which live on `Inner` and are therefore
+    /// shared by every clone. Lock identity is the simplest cross-clone
+    /// stability check: same key on two `Arc<Inner>` clones must hand
+    /// back the *same* `Mutex` reference.
+    #[test]
+    fn shard_for_is_stable_across_clones() {
+        let inner = build(8, 64);
+        let clone = Arc::clone(&inner);
+        for k in ["alpha", "beta", "gamma", "delta", "omega"] {
+            let lhs = std::ptr::from_ref(inner.shard_for(k));
+            let rhs = std::ptr::from_ref(clone.shard_for(k));
+            assert!(
+                std::ptr::eq(lhs, rhs),
+                "key {k} mapped to different shards across clones",
+            );
+        }
+    }
+
+    /// With `shards == 1` the local cap equals the global cap exactly,
+    /// so the standard "weight never exceeds `max_weight`" invariant
+    /// holds without rounding slack. Documents the boundary the test
+    /// fixups above lean on.
+    #[test]
+    fn single_shard_strictly_caps_total_weight() {
+        let inner = build(1, 4);
+        for i in 0..32 {
+            inner.insert(format!("k{i}"), "v".to_string());
+            assert!(
+                inner.weight() <= 4,
+                "weight {} exceeded max=4 with shards=1 after inserting k{i}",
+                inner.weight(),
+            );
+        }
+    }
+
+    /// The plan documents that with `shards > 1` the observed total
+    /// weight may exceed `max_weight` by up to `shards - 1` units of
+    /// rounding slack (each shard rounds its share up). Lock the bound
+    /// with a stress insert so a future change to per-shard accounting
+    /// can't quietly blow past it.
+    #[test]
+    fn multi_shard_total_weight_bounded_by_max_plus_slack() {
+        let shards: usize = 8;
+        let max_weight: u64 = 17;
+        let inner = build(shards, max_weight);
+        let upper = max_weight + shards as u64 - 1;
+        for i in 0..1024 {
+            inner.insert(format!("key-{i}"), "v".to_string());
+            let w = inner.weight();
+            assert!(
+                w <= upper,
+                "weight {w} exceeded documented upper bound {upper} after k{i}",
+            );
+        }
+    }
+
+    /// Per-shard eviction must not leak across shards: filling one shard
+    /// hard should not knock entries out of another shard. We exercise
+    /// this without naming shards by inserting many keys that all map
+    /// to a single shard (via `shard_for`-driven probing) and asserting
+    /// every other shard's slab is untouched.
+    #[test]
+    fn eviction_stays_within_the_owning_shard() {
+        let inner = build(4, 16);
+        let target_shard = std::ptr::from_ref(inner.shard_for(&"anchor".to_string()));
+
+        // Seed every other shard with a sentinel so we can confirm they
+        // survive the storm aimed at `target_shard`.
+        let mut sentinels: Vec<String> = Vec::new();
+        let mut tries = 0u32;
+        while sentinels.len() < 3 && tries < 10_000 {
+            let candidate = format!("sentinel-{tries}");
+            if !std::ptr::eq(
+                std::ptr::from_ref(inner.shard_for(&candidate)),
+                target_shard,
+            ) {
+                inner.insert(candidate.clone(), "x".into());
+                sentinels.push(candidate);
+            }
+            tries += 1;
+        }
+        assert_eq!(
+            sentinels.len(),
+            3,
+            "could not find one sentinel per non-target shard; check hasher distribution"
+        );
+
+        let mut storm = 0u32;
+        let mut placed = 0u32;
+        while placed < 64 && storm < 100_000 {
+            let candidate = format!("hot-{storm}");
+            if std::ptr::eq(
+                std::ptr::from_ref(inner.shard_for(&candidate)),
+                target_shard,
+            ) {
+                inner.insert(candidate, "y".into());
+                placed += 1;
+            }
+            storm += 1;
+        }
+
+        for s in &sentinels {
+            assert!(
+                inner.contains_key(s),
+                "sentinel {s} was evicted by storm in another shard",
+            );
+        }
     }
 }
