@@ -3,6 +3,7 @@
 
 mod inner;
 
+use std::borrow::Borrow;
 use std::convert::Infallible;
 use std::future::Future;
 use std::hash::Hash;
@@ -118,8 +119,15 @@ where
         self.inner.config.lifecycle_listener.as_ref()
     }
 
+    /// Returns the value for `key` if present and not expired. The key may
+    /// be borrowed in any form `K: Borrow<Q>` accepts, so e.g. a
+    /// `Cache<String, _>` accepts `&str` directly: `cache.get("foo")`.
     #[must_use]
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.get_served(key)
     }
 
@@ -127,9 +135,26 @@ where
         self.inner.insert(key, value)
     }
 
+    /// Removes and returns the value for `key`. See [`Self::get`] for the
+    /// `Borrow<Q>` lookup contract.
     #[must_use]
-    pub fn remove(&self, key: &K) -> Option<V> {
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.remove(key)
+    }
+
+    /// Returns whether the cache currently has a served value for `key`. Does
+    /// not promote the entry in LRU order or evict expired entries.
+    #[must_use]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.contains_key(key)
     }
 
     /// Runs the miss initializer for `key` when absent or not yet served, coalescing concurrent waiters.

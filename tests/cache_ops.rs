@@ -500,7 +500,7 @@ mod revalidate_tests {
                 Ok(RevalidateScheduled::Submitted)
             );
             wait_get(&cache, "rwk", "mid").await;
-            assert_eq!(cache.get(&"rwk".into()), Some("mid".into()));
+            assert_eq!(cache.get("rwk"), Some("mid".into()));
             assert_eq!(
                 cache.try_revalidate("rwk".into(), &ex, |_k| async move {
                     Ok::<_, InitError>("new".into())
@@ -508,7 +508,7 @@ mod revalidate_tests {
                 Ok(RevalidateScheduled::Submitted)
             );
             wait_get(&cache, "rwk", "new").await;
-            assert_eq!(cache.get(&"rwk".into()), Some("new".into()));
+            assert_eq!(cache.get("rwk"), Some("new".into()));
         })
         .await;
     }
@@ -526,8 +526,8 @@ mod capacity {
         let cache = test_cache_max_weight_one();
         assert_eq!(cache.insert("a".into(), "va".into()), None);
         assert_eq!(cache.insert("b".into(), "vb".into()), None);
-        let a_live = cache.get(&"a".into()).is_some();
-        let b_live = cache.get(&"b".into()).is_some();
+        let a_live = cache.get("a").is_some();
+        let b_live = cache.get("b").is_some();
         assert!(
             !(a_live && b_live),
             "with max_weight=1 and DefaultPolicy (weight 1 per entry), both keys must not remain \
@@ -546,8 +546,8 @@ mod capacity {
         );
         assert_eq!(cache.insert("a".into(), "va".into()), None);
         assert_eq!(cache.insert("b".into(), "vb".into()), None);
-        assert_eq!(cache.get(&"a".into()), Some("va".into()));
-        assert_eq!(cache.get(&"b".into()), Some("vb".into()));
+        assert_eq!(cache.get("a"), Some("va".into()));
+        assert_eq!(cache.get("b"), Some("vb".into()));
     }
 }
 
@@ -761,6 +761,43 @@ mod concurrency {
     }
 }
 
+mod borrow_lookup {
+    //! `Cache::get`, `remove`, and `contains_key` accept any `&Q` for which
+    //! `K: Borrow<Q>`, so a `Cache<String, _>` is queryable with `&str`
+    //! without owning a `String`.
+
+    use super::*;
+
+    #[test]
+    fn get_remove_contains_accept_str_for_string_keyed_cache() {
+        let cache = test_cache();
+        cache.insert("hello".into(), "world".into());
+
+        assert!(cache.contains_key("hello"));
+        assert_eq!(cache.get("hello"), Some("world".to_string()));
+        assert_eq!(cache.remove("hello"), Some("world".to_string()));
+        assert!(!cache.contains_key("hello"));
+        assert_eq!(cache.get("hello"), None);
+    }
+
+    #[test]
+    fn contains_key_does_not_promote_lru() {
+        let cache = Cache::<K, V>::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(2))
+                .policy(Arc::new(DefaultPolicy))
+                .build(),
+        );
+        cache.insert("a".into(), "va".into());
+        cache.insert("b".into(), "vb".into());
+        // `a` is currently LRU. If contains_key promoted it to MRU, the next
+        // insert would evict `b`; otherwise it evicts `a`.
+        assert!(cache.contains_key("a"));
+        cache.insert("c".into(), "vc".into());
+        assert_eq!(cache.get("a"), None, "contains_key must not have promoted a");
+    }
+}
+
 mod cancellation {
     //! `try_get_with` must not deadlock subsequent callers when the leader's
     //! init future is cancelled (caller dropped, e.g. via `tokio::select!`
@@ -965,7 +1002,7 @@ mod policy_time {
             );
             cache.insert("k".into(), "v".into());
             tokio::time::sleep(Duration::from_millis(120)).await;
-            assert_eq!(cache.get(&"k".into()), None);
+            assert_eq!(cache.get("k"), None);
         })
         .await;
     }
@@ -982,11 +1019,11 @@ mod policy_time {
             );
             cache.insert("k".into(), "v".into());
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(cache.get(&"k".into()), Some("v".into()));
+            assert_eq!(cache.get("k"), Some("v".into()));
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(cache.get(&"k".into()), Some("v".into()));
+            assert_eq!(cache.get("k"), Some("v".into()));
             tokio::time::sleep(Duration::from_millis(120)).await;
-            assert_eq!(cache.get(&"k".into()), None);
+            assert_eq!(cache.get("k"), None);
         })
         .await;
     }
@@ -1003,7 +1040,7 @@ mod policy_time {
             );
             cache.insert("k".into(), "v".into());
             tokio::time::sleep(Duration::from_millis(120)).await;
-            assert_eq!(cache.get(&"k".into()), None);
+            assert_eq!(cache.get("k"), None);
         })
         .await;
     }
@@ -1219,11 +1256,11 @@ mod mutation_guards {
         );
         let ten = "x".repeat(10);
         assert_eq!(cache.insert("a".into(), ten.clone()), None);
-        assert_eq!(cache.remove(&"a".into()), Some(ten));
+        assert_eq!(cache.remove("a"), Some(ten));
         assert_eq!(cache.insert("b".into(), "b".repeat(5)), None);
         assert_eq!(cache.insert("c".into(), "c".repeat(5)), None);
-        assert!(cache.get(&"b".into()).is_some());
-        assert!(cache.get(&"c".into()).is_some());
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("c").is_some());
     }
 }
 

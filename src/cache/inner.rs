@@ -1,4 +1,5 @@
 use std::any::{Any, TypeId};
+use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::Hash;
@@ -639,9 +640,10 @@ where
         }
     }
 
-    pub(crate) fn get_served(&self, key: &K) -> Option<V>
+    pub(crate) fn get_served<Q>(&self, key: &Q) -> Option<V>
     where
-        K: 'static,
+        K: Borrow<Q> + 'static,
+        Q: Hash + Eq + ?Sized,
         V: 'static,
     {
         let now = Instant::now();
@@ -656,9 +658,11 @@ where
             .get(id)
             .is_some_and(|es| !entry_is_served(&es.entry, now));
         if expired {
-            let (_, v, _) = evict_slot(&mut st, id)?;
+            // Use the slot's owned key for the lifecycle event so callers
+            // querying with a borrowed `Q` need not own a `K`.
+            let (k, v, _) = evict_slot(&mut st, id)?;
             drop(st);
-            self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
+            self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
             return None;
         }
 
@@ -672,11 +676,32 @@ where
         let es = slab.get_mut(id)?;
         let value = es.entry.value.clone();
         let generation = es.generation;
-        let new_dl = update_read_deadline(key, &mut es.entry, self.config.policy.as_ref(), now);
+        // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
+        // (mutable) don't overlap, so the borrow checker accepts both.
+        let new_dl =
+            update_read_deadline(&es.key, &mut es.entry, self.config.policy.as_ref(), now);
         if let Some(dl) = new_dl {
             expiry.push(dl, id, generation);
         }
         Some(value)
+    }
+
+    pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let st = self.state.lock().expect("cache mutex poisoned");
+        let Some(&id) = st.entries.get(key) else {
+            return false;
+        };
+        // Read-only check: do not evict expired entries here; let the next
+        // `get`/`insert` reclaim path do it so contains_key has no side
+        // effects beyond taking the lock.
+        let now = Instant::now();
+        st.slab
+            .get(id)
+            .is_some_and(|es| entry_is_served(&es.entry, now))
     }
 
     pub(crate) fn insert(&self, key: K, value: V) -> Option<V>
@@ -723,17 +748,18 @@ where
         prev
     }
 
-    pub(crate) fn remove(&self, key: &K) -> Option<V>
+    pub(crate) fn remove<Q>(&self, key: &Q) -> Option<V>
     where
-        K: 'static,
+        K: Borrow<Q> + 'static,
+        Q: Hash + Eq + ?Sized,
         V: 'static,
     {
         let mut st = self.state.lock().expect("cache mutex poisoned");
         let &id = st.entries.get(key)?;
-        let (_, v, _) = evict_slot(&mut st, id)?;
+        let (k, v, _) = evict_slot(&mut st, id)?;
         drop(st);
         let v_for_listener = v.clone();
-        self.notify_lifecycle(LifecycleReason::Removed, key.clone(), Some(v_for_listener));
+        self.notify_lifecycle(LifecycleReason::Removed, k, Some(v_for_listener));
         Some(v)
     }
 
