@@ -855,10 +855,21 @@ where
     {
         let expired = drain_expired(st, now, Some(skip_key));
 
+        // Hoist the existing-slot weight lookup out of the loop: the
+        // skip_key short-circuit means its slot is never reclaimed in this
+        // pass, so its weight is invariant across iterations. Only
+        // `state.total_weight` changes per iteration; the projection then
+        // becomes a couple of arithmetic ops instead of a HashMap probe.
+        let displaced_weight = st
+            .entries
+            .get(skip_key)
+            .and_then(|&id| st.slab.get(id))
+            .map_or(0, |es| es.weight);
+
         let max = self.config.max_weight.get();
         let mut evicted = Vec::new();
         loop {
-            if !Self::projected_weight_over_capacity(st, skip_key, add_w, max) {
+            if !Self::projected_weight_over_capacity(st, displaced_weight, add_w, max) {
                 break;
             }
             let Some(tail_id) = st.evict_list.tail else {
@@ -900,19 +911,14 @@ where
 
     fn projected_weight_over_capacity(
         st: &State<K, V>,
-        insert_key: &K,
+        displaced_weight: u64,
         new_entry_weight: u64,
         max: u64,
     ) -> bool {
-        let projected = match st.entries.get(insert_key) {
-            Some(&id) => {
-                let ow = st.slab.get(id).map_or(0, |es| es.weight);
-                st.total_weight
-                    .saturating_sub(ow)
-                    .saturating_add(new_entry_weight)
-            }
-            None => st.total_weight.saturating_add(new_entry_weight),
-        };
+        let projected = st
+            .total_weight
+            .saturating_sub(displaced_weight)
+            .saturating_add(new_entry_weight);
         projected > max
     }
 
