@@ -1,5 +1,6 @@
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -60,6 +61,14 @@ pub(crate) struct State<K, V> {
     slab: Slab<K, V>,
     /// Intrusive LRU over slab slots. `head` is MRU, `tail` is LRU.
     evict_list: EvictList,
+    /// Min-heap of (deadline, slot, generation) tuples used to find past-deadline
+    /// entries in `O(log n)`. Validated lazily: a popped tuple is honoured
+    /// only if the slab still holds an `Occupied` slot at `slot` whose `generation`
+    /// matches and whose deadline is exactly `Some(deadline)`. Stale tuples
+    /// (slot reused, deadline shifted by a read hook, or slot evicted) are
+    /// dropped on pop. Read-deadline updates push a new tuple instead of
+    /// removing the old one.
+    expiry: ExpiryHeap,
     pub(crate) refresh_inflight: HashSet<K>,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
@@ -83,13 +92,18 @@ struct EntrySlot<K, V> {
     entry: CacheEntry<V>,
     /// Cached `Policy::weight` so eviction does not need to re-call the user policy.
     weight: u64,
+    /// Bumped on every slot reuse. Heap tuples carry the generation at push time and
+    /// fail validation on pop after the slot has been recycled.
+    generation: u32,
     lru_prev: Option<SlotId>,
     lru_next: Option<SlotId>,
 }
 
 enum SlabEntry<K, V> {
     Occupied(EntrySlot<K, V>),
-    Free { next_free: Option<u32> },
+    /// `generation` is the generation of the **last** occupant; the next insert into
+    /// this slot uses `generation.wrapping_add(1)`.
+    Free { next_free: Option<u32>, generation: u32 },
 }
 
 /// Vector-backed slab with a free-list. Pure-safe (no `unsafe`).
@@ -112,11 +126,14 @@ impl<K, V> Slab<K, V> {
         self.len
     }
 
+    /// Install `entry` and return its slot id. Callers must set `entry.generation`
+    /// to whatever this method returns from [`Self::next_generation_for`] beforehand
+    /// — the slab does not mutate `entry` in place to keep the borrow simple.
     fn insert(&mut self, entry: EntrySlot<K, V>) -> SlotId {
         if let Some(idx) = self.free_head {
             let slot = &mut self.slots[idx as usize];
             let next_free = match slot {
-                SlabEntry::Free { next_free } => *next_free,
+                SlabEntry::Free { next_free, .. } => *next_free,
                 SlabEntry::Occupied(_) => unreachable!("free list points at occupied slot"),
             };
             self.free_head = next_free;
@@ -131,6 +148,25 @@ impl<K, V> Slab<K, V> {
         }
     }
 
+    /// Generation an `EntrySlot` should claim if installed at `idx` next.
+    /// Returns `0` for a fresh tail-extension slot, or `prev_generation.wrapping_add(1)`
+    /// for an existing slot on the free list.
+    fn next_generation_for(&self, idx: u32) -> u32 {
+        match self.slots.get(idx as usize) {
+            Some(SlabEntry::Free { generation, .. }) => generation.wrapping_add(1),
+            Some(SlabEntry::Occupied(_)) | None => 0,
+        }
+    }
+
+    /// Index of the next slot `insert` will populate, used to look up
+    /// [`Self::next_generation_for`] before the new `EntrySlot` is constructed.
+    fn next_slot_index(&self) -> u32 {
+        match self.free_head {
+            Some(idx) => idx,
+            None => u32::try_from(self.slots.len()).expect("slab capacity exceeds u32::MAX"),
+        }
+    }
+
     fn remove(&mut self, id: SlotId) -> Option<EntrySlot<K, V>> {
         let slot = self.slots.get_mut(id.0 as usize)?;
         if !matches!(slot, SlabEntry::Occupied(_)) {
@@ -141,11 +177,17 @@ impl<K, V> Slab<K, V> {
             slot,
             SlabEntry::Free {
                 next_free: prev_free,
+                generation: 0, // overwritten below from the taken EntrySlot.
             },
         );
         let SlabEntry::Occupied(entry) = taken else {
             unreachable!("checked Occupied above")
         };
+        // Re-stamp the Free's `generation` to the removed entry's generation so the next
+        // occupant computes its `generation + 1` cleanly.
+        if let SlabEntry::Free { generation, .. } = slot {
+            *generation = entry.generation;
+        }
         self.free_head = Some(id.0);
         self.len -= 1;
         Some(entry)
@@ -231,6 +273,99 @@ impl EvictList {
     }
 }
 
+/// `(deadline, slot, generation)` tuple stored in [`ExpiryHeap`]. Ordered by
+/// `deadline` so a `BinaryHeap<Reverse<HeapKey>>` yields earliest deadlines
+/// first. `slot` and `generation` are tiebreakers for total ordering; only `deadline`
+/// matters semantically.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HeapKey {
+    deadline: Instant,
+    slot: SlotId,
+    generation: u32,
+}
+
+impl Ord for HeapKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.deadline
+            .cmp(&other.deadline)
+            .then_with(|| self.slot.0.cmp(&other.slot.0))
+            .then_with(|| self.generation.cmp(&other.generation))
+    }
+}
+
+impl PartialOrd for HeapKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct ExpiryHeap(BinaryHeap<Reverse<HeapKey>>);
+
+impl ExpiryHeap {
+    fn push(&mut self, deadline: Instant, slot: SlotId, generation: u32) {
+        self.0.push(Reverse(HeapKey {
+            deadline,
+            slot,
+            generation,
+        }));
+    }
+
+    fn peek(&self) -> Option<HeapKey> {
+        self.0.peek().map(|Reverse(k)| *k)
+    }
+
+    fn pop(&mut self) -> Option<HeapKey> {
+        self.0.pop().map(|Reverse(k)| k)
+    }
+}
+
+/// Drain entries whose materialised deadline is at or before `now`. Each
+/// validated tuple yields an `(K, V)` pair via [`evict_slot`]; stale tuples
+/// (slot recycled / deadline shifted by a read hook / already evicted) are
+/// silently dropped. Drains in `O(d log n)` where `d` is the number of
+/// past-deadline entries observed during this call.
+///
+/// `skip_key`, when set, suppresses eviction of the matching entry: the heap
+/// tuple is dropped (the caller is about to replace this slot anyway and
+/// will push a fresh tuple), but the existing slot is left in place so the
+/// caller can read its old value or fire a different lifecycle reason.
+fn drain_expired<K, V>(st: &mut State<K, V>, now: Instant, skip_key: Option<&K>) -> Vec<(K, V)>
+where
+    K: Eq + Hash,
+{
+    let mut out = Vec::new();
+    while let Some(top) = st.expiry.peek() {
+        if top.deadline > now {
+            break;
+        }
+        st.expiry.pop();
+        let Some(es) = st.slab.get(top.slot) else {
+            continue;
+        };
+        if es.generation != top.generation || es.entry.deadline != Some(top.deadline) {
+            continue;
+        }
+        if let Some(skip) = skip_key
+            && &es.key == skip
+        {
+            continue;
+        }
+        if let Some((k, v, _)) = evict_slot(st, top.slot) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+/// Result of a single [`Inner::reclaim`] pass. Split per lifecycle reason so
+/// the caller fires `TimeExpired` for the deadline drain and `EvictedSize`
+/// for the LRU drain that brought weight back under capacity.
+struct Reclaimed<K, V> {
+    expired: Vec<(K, V)>,
+    evicted: Vec<(K, V)>,
+}
+
 pub(crate) enum MissStep<V> {
     Hit(V),
     Wait(Arc<MissFlight<V>>),
@@ -261,6 +396,8 @@ where
 /// from the LRU list, and returns the owned `(K, V)` plus the entry's cached
 /// weight (already subtracted from `total_weight`). Returns `None` if the
 /// slot was already free (defensive — should not happen under our invariants).
+/// Stale tuples in `state.expiry` are not removed here; lazy validation on
+/// pop discards them once the slot is recycled.
 fn evict_slot<K, V>(st: &mut State<K, V>, id: SlotId) -> Option<(K, V, u64)>
 where
     K: Eq + Hash,
@@ -279,6 +416,51 @@ where
     Some((entry_slot.key, entry_slot.entry.value, entry_slot.weight))
 }
 
+/// Allocate a slab slot for `key`/`entry`/`weight`, push it to MRU, register
+/// it in `state.entries`, bump `total_weight`, and (if applicable) push the
+/// deadline into `state.expiry`. Centralises every install site so the heap
+/// invariant cannot be silently dropped.
+fn install_ready<K, V>(
+    st: &mut State<K, V>,
+    key: K,
+    entry: CacheEntry<V>,
+    weight: u64,
+) -> SlotId
+where
+    K: Eq + Hash + Clone,
+{
+    let State {
+        entries,
+        slab,
+        evict_list,
+        expiry,
+        total_weight,
+        ..
+    } = st;
+    let idx = slab.next_slot_index();
+    let generation = slab.next_generation_for(idx);
+    let deadline = entry.deadline;
+    let id = slab.insert(EntrySlot {
+        key: key.clone(),
+        entry,
+        weight,
+        generation,
+        lru_prev: None,
+        lru_next: None,
+    });
+    debug_assert_eq!(
+        id.0, idx,
+        "slab.insert is expected to use the slot index it advertised"
+    );
+    evict_list.push_mru(slab, id);
+    entries.insert(key, MapSlot::Ready(id));
+    *total_weight = total_weight.saturating_add(weight);
+    if let Some(dl) = deadline {
+        expiry.push(dl, id, generation);
+    }
+    id
+}
+
 impl<K, V> Inner<K, V>
 where
     K: Eq + Hash + Clone + Send + Sync,
@@ -295,6 +477,7 @@ where
                 entries: HashMap::with_capacity(initial_capacity),
                 slab: Slab::with_capacity(initial_capacity),
                 evict_list: EvictList::default(),
+                expiry: ExpiryHeap::default(),
                 refresh_inflight: HashSet::new(),
                 total_weight: 0,
             }),
@@ -327,12 +510,20 @@ where
         }
 
         let State {
-            slab, evict_list, ..
+            slab,
+            evict_list,
+            expiry,
+            ..
         } = &mut *st;
         evict_list.promote_to_mru(slab, id);
         let es = slab.get_mut(id)?;
-        update_read_deadline(key, &mut es.entry, self.config.policy.as_ref(), now);
-        Some(es.entry.value.clone())
+        let value = es.entry.value.clone();
+        let generation = es.generation;
+        let new_dl = update_read_deadline(key, &mut es.entry, self.config.policy.as_ref(), now);
+        if let Some(dl) = new_dl {
+            expiry.push(dl, id, generation);
+        }
+        Some(value)
     }
 
     pub(crate) fn insert(&self, key: K, value: V) -> Option<V>
@@ -346,51 +537,36 @@ where
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
         // Existing value (cloned for return + `Updated` lifecycle) before any
-        // structural change. `reclaim_size` skips `key`, so the existing slot is
-        // still present after reclaim.
+        // structural change. `reclaim` skips `key`, so the existing slot is
+        // still present after reclaim returns.
         let prev = match st.entries.get(&key) {
             Some(&MapSlot::Ready(id)) => st.slab.get(id).map(|es| es.entry.value.clone()),
             _ => None,
         };
 
-        let pending = self.reclaim_size(&mut st, new_w, &key);
+        let reclaimed = self.reclaim(&mut st, new_w, &key, now);
 
         if let Some(&MapSlot::Ready(id)) = st.entries.get(&key) {
-            // Drop the previous slot for this key; we install a fresh one below.
             let _ = evict_slot(&mut st, id);
         }
 
         let deadline = deadline_after_write(self.config.policy.as_ref(), &key, &value, now);
-        let entry_slot = EntrySlot {
-            key: key.clone(),
-            entry: CacheEntry {
+        install_ready(
+            &mut st,
+            key,
+            CacheEntry {
                 value,
                 written_at: now,
                 deadline,
             },
-            weight: new_w,
-            lru_prev: None,
-            lru_next: None,
-        };
-        let State {
-            entries,
-            slab,
-            evict_list,
-            total_weight,
-            ..
-        } = &mut *st;
-        let id = slab.insert(entry_slot);
-        evict_list.push_mru(slab, id);
-        entries.insert(key, MapSlot::Ready(id));
-        *total_weight = total_weight.saturating_add(new_w);
+            new_w,
+        );
 
         drop(st);
         if let Some(ref v) = prev {
             self.notify_lifecycle(LifecycleReason::Updated, key_for_updated, Some(v.clone()));
         }
-        for (ek, ev) in pending {
-            self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
-        }
+        self.fire_reclaim(reclaimed);
         prev
     }
 
@@ -410,19 +586,36 @@ where
         Some(v)
     }
 
-    /// Drain LRU-tail victims until the projected weight (current
-    /// `total_weight`, minus any existing entry for `skip_key`, plus
-    /// `add_weight`) is within `max_weight`. Each drained slot is **O(1)**:
-    /// the LRU tail gives the next victim, eviction unlinks + frees + drops
-    /// from the map. The skip-key short-circuit prevents evicting the entry
-    /// the caller is about to install/replace.
-    fn reclaim_size(&self, st: &mut State<K, V>, add_w: u64, skip_key: &K) -> Vec<(K, V)>
+    /// Two-phase capacity reclaim, called before installing a new entry of
+    /// weight `add_w` for `skip_key`:
+    ///
+    /// 1. **Expiry drain** — pop heap tuples with `deadline ≤ now` and evict
+    ///    the matching slots. Lazy validation discards stale tuples in O(1).
+    ///    Cost: `O(d log n)` for `d` validated victims; `O(s log n)` for
+    ///    `s` stale tuples observed.
+    /// 2. **Size drain** — while the projected post-install weight exceeds
+    ///    `max_weight`, drop the LRU tail. Each victim is O(1): tail lookup,
+    ///    `evict_slot`, repeat. The skip-key short-circuit (promote the
+    ///    skip slot to MRU when it surfaces at the tail) prevents evicting
+    ///    the entry the caller is about to install or replace.
+    ///
+    /// Returns the two victim lists separately so the caller can fire the
+    /// correct lifecycle reason for each phase.
+    fn reclaim(
+        &self,
+        st: &mut State<K, V>,
+        add_w: u64,
+        skip_key: &K,
+        now: Instant,
+    ) -> Reclaimed<K, V>
     where
         K: 'static,
         V: 'static,
     {
+        let expired = drain_expired(st, now, Some(skip_key));
+
         let max = self.config.max_weight.get();
-        let mut pending = Vec::new();
+        let mut evicted = Vec::new();
         loop {
             if !Self::projected_weight_over_capacity(st, skip_key, add_w, max) {
                 break;
@@ -446,9 +639,22 @@ where
             let Some((k, v, _)) = evict_slot(st, tail_id) else {
                 break;
             };
-            pending.push((k, v));
+            evicted.push((k, v));
         }
-        pending
+        Reclaimed { expired, evicted }
+    }
+
+    fn fire_reclaim(&self, r: Reclaimed<K, V>)
+    where
+        K: 'static,
+        V: 'static,
+    {
+        for (k, v) in r.expired {
+            self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
+        }
+        for (k, v) in r.evicted {
+            self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
+        }
     }
 
     fn projected_weight_over_capacity(
@@ -479,37 +685,31 @@ where
         }
     }
 
-    fn finish_miss_ok(&self, st: &mut State<K, V>, key: &K, v: &V, now: Instant) -> Vec<(K, V)>
+    fn finish_miss_ok(
+        &self,
+        st: &mut State<K, V>,
+        key: &K,
+        v: &V,
+        now: Instant,
+    ) -> Reclaimed<K, V>
     where
         K: 'static,
         V: 'static,
     {
         let deadline = deadline_after_write(self.config.policy.as_ref(), key, v, now);
         let nw = self.config.policy.weight(key, v).get();
-        let pending = self.reclaim_size(st, nw, key);
-        let entry_slot = EntrySlot {
-            key: key.clone(),
-            entry: CacheEntry {
+        let reclaimed = self.reclaim(st, nw, key, now);
+        install_ready(
+            st,
+            key.clone(),
+            CacheEntry {
                 value: v.clone(),
                 written_at: now,
                 deadline,
             },
-            weight: nw,
-            lru_prev: None,
-            lru_next: None,
-        };
-        let State {
-            entries,
-            slab,
-            evict_list,
-            total_weight,
-            ..
-        } = st;
-        let id = slab.insert(entry_slot);
-        evict_list.push_mru(slab, id);
-        entries.insert(key.clone(), MapSlot::Ready(id));
-        *total_weight = total_weight.saturating_add(nw);
-        pending
+            nw,
+        );
+        reclaimed
     }
 
     /// Single critical section for one `try_get_with` iteration: served hit, in-flight miss wait, or
@@ -544,14 +744,23 @@ where
                 .is_some_and(|es| entry_is_served(&es.entry, now));
             if still_served {
                 let State {
-                    slab, evict_list, ..
+                    slab,
+                    evict_list,
+                    expiry,
+                    ..
                 } = &mut *st;
                 evict_list.promote_to_mru(slab, id);
                 let es = slab
                     .get_mut(id)
                     .expect("just confirmed Occupied above under our mutex");
-                update_read_deadline(key, &mut es.entry, self.config.policy.as_ref(), now);
-                return MissStep::Hit(es.entry.value.clone());
+                let value = es.entry.value.clone();
+                let generation = es.generation;
+                let new_dl =
+                    update_read_deadline(key, &mut es.entry, self.config.policy.as_ref(), now);
+                if let Some(dl) = new_dl {
+                    expiry.push(dl, id, generation);
+                }
+                return MissStep::Hit(value);
             }
         }
 
@@ -595,11 +804,9 @@ where
 
                     if let Ok(v) = &res {
                         let now = Instant::now();
-                        let pending = self.finish_miss_ok(&mut st, &key, v, now);
+                        let reclaimed = self.finish_miss_ok(&mut st, &key, v, now);
                         drop(st);
-                        for (ek, ev) in pending {
-                            self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
-                        }
+                        self.fire_reclaim(reclaimed);
                         return res;
                     }
                     drop(st);
@@ -626,43 +833,28 @@ where
         V: 'static,
     {
         let mut st = self.state.lock().expect("cache mutex poisoned");
+        let now = Instant::now();
+        let nw = self.config.policy.weight(key, &v).get();
+        let reclaimed = self.reclaim(&mut st, nw, key, now);
         let displaced = match st.entries.get(key) {
             Some(&MapSlot::Ready(id)) => evict_slot(&mut st, id).map(|(_, v, _)| v),
             _ => None,
         };
-        let now = Instant::now();
         let deadline = deadline_after_write(self.config.policy.as_ref(), key, &v, now);
-        let nw = self.config.policy.weight(key, &v).get();
-        let pending = self.reclaim_size(&mut st, nw, key);
-
-        let entry_slot = EntrySlot {
-            key: key.clone(),
-            entry: CacheEntry {
+        install_ready(
+            &mut st,
+            key.clone(),
+            CacheEntry {
                 value: v,
                 written_at: now,
                 deadline,
             },
-            weight: nw,
-            lru_prev: None,
-            lru_next: None,
-        };
-        let State {
-            entries,
-            slab,
-            evict_list,
-            total_weight,
-            ..
-        } = &mut *st;
-        let id = slab.insert(entry_slot);
-        evict_list.push_mru(slab, id);
-        entries.insert(key.clone(), MapSlot::Ready(id));
-        *total_weight = total_weight.saturating_add(nw);
+            nw,
+        );
 
         drop(st);
         drop(displaced);
-        for (ek, ev) in pending {
-            self.notify_lifecycle(LifecycleReason::EvictedSize, ek, Some(ev));
-        }
+        self.fire_reclaim(reclaimed);
     }
 }
 
@@ -705,22 +897,34 @@ fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
     usize::try_from(bounded).unwrap_or(usize::MAX)
 }
 
+/// Apply the read hook to `e.deadline` in place. Returns `Some(new_deadline)`
+/// only when the deadline transitions to a new finite value (different from
+/// the old one); the caller is then responsible for pushing it into the
+/// expiry heap. Returns `None` when the deadline either stayed the same or
+/// became `None`, both of which leave the heap untouched.
 fn update_read_deadline<K, V>(
     key: &K,
     e: &mut CacheEntry<V>,
     policy: &(dyn Policy<K, V> + Send + Sync),
     now: Instant,
-) where
+) -> Option<Instant>
+where
     K: 'static,
     V: 'static,
 {
-    let time_remaining = e.deadline.map_or(crate::policy::TIME_UNBOUNDED, |dl| {
+    let prev = e.deadline;
+    let time_remaining = prev.map_or(crate::policy::TIME_UNBOUNDED, |dl| {
         dl.saturating_duration_since(now)
     });
     let d = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
-    if d >= crate::policy::TIME_UNBOUNDED / 2 {
-        e.deadline = None;
+    let new = if d >= crate::policy::TIME_UNBOUNDED / 2 {
+        None
     } else {
-        e.deadline = now.checked_add(d);
+        now.checked_add(d)
+    };
+    e.deadline = new;
+    match new {
+        Some(dl) if Some(dl) != prev => Some(dl),
+        _ => None,
     }
 }
