@@ -49,6 +49,7 @@ fn test_cache_max_weight_one() -> Cache<K, V> {
     Cache::new(
         CacheBuilder::new()
             .max_weight(Weight::new(1))
+            .shards(1)
             .policy(policy)
             .build(),
     )
@@ -579,6 +580,7 @@ mod capacity {
         let cache = Cache::<K, V>::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(2))
+                .shards(1)
                 .policy(policy)
                 .build(),
         );
@@ -829,6 +831,7 @@ mod borrow_lookup {
         let cache = Cache::<K, V>::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(2))
+                .shards(1)
                 .policy(policy)
                 .build(),
         );
@@ -1162,6 +1165,7 @@ mod mutation_guards {
         let cache = Cache::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(12))
+                .shards(1)
                 .policy(Arc::new(LenWeightPolicy))
                 .lifecycle_listener(listener)
                 .build(),
@@ -1297,6 +1301,7 @@ mod mutation_guards {
         let cache = Cache::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(10))
+                .shards(1)
                 .policy(Arc::new(LenWeightPolicy))
                 .build(),
         );
