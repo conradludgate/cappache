@@ -1,0 +1,3 @@
+# Vendored pollster `Signal::wait`: replacing the body with `()` still completes on multi-core
+# runners because the waker thread eventually runs; skipping keeps signal focused on logic mutants.
+exclude_re = ["replace Signal::wait with ()"]

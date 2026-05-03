@@ -154,7 +154,14 @@ where
         let key_for_updated = key.clone();
         let mut st = self.state.lock().expect("cache mutex poisoned");
 
-        let prev = match st.entries.remove(&key) {
+        let prev = match st.entries.get(&key) {
+            Some(MapSlot::Ready(old)) => Some(old.value.clone()),
+            Some(MapSlot::Miss(_)) | None => None,
+        };
+
+        let pending = self.evict_until_fit(&mut st, Weight::new(new_w), &key);
+
+        let removed_ready = match st.entries.remove(&key) {
             Some(MapSlot::Ready(old)) => {
                 st.total_weight = st
                     .total_weight
@@ -163,8 +170,6 @@ where
             }
             Some(MapSlot::Miss(_)) | None => None,
         };
-
-        let pending = self.evict_until_fit(&mut st, Weight::new(new_w), &key);
 
         let deadline = deadline_after_write(self.config.policy.as_ref(), &key, &value, now);
         st.total_weight = st.total_weight.saturating_add(new_w);
@@ -177,7 +182,7 @@ where
             }),
         );
         drop(st);
-        if let Some(ref v) = prev {
+        if let Some(ref v) = removed_ready {
             self.notify_lifecycle(LifecycleReason::Updated, key_for_updated, Some(v.clone()));
         }
         for (ek, ev) in pending {
@@ -212,8 +217,9 @@ where
         V: Clone + 'static,
     {
         let max = self.config.max_weight.get();
+        let nw = add_w.get();
         let mut pending = Vec::new();
-        while st.total_weight.saturating_add(add_w.get()) > max {
+        while self.projected_weight_over_capacity(st, skip_key, nw, max) {
             let keys: Vec<K> = st
                 .entries
                 .iter()
@@ -236,6 +242,29 @@ where
             }
         }
         pending
+    }
+
+    fn projected_weight_over_capacity(
+        &self,
+        st: &State<K, V>,
+        insert_key: &K,
+        new_entry_weight: u64,
+        max: u64,
+    ) -> bool
+    where
+        K: Eq + Hash + 'static,
+        V: 'static,
+    {
+        let projected = match st.entries.get(insert_key) {
+            Some(MapSlot::Ready(old)) => {
+                let ow = self.ready_entry_weight(insert_key, old);
+                st.total_weight
+                    .saturating_sub(ow)
+                    .saturating_add(new_entry_weight)
+            }
+            Some(MapSlot::Miss(_)) | None => st.total_weight.saturating_add(new_entry_weight),
+        };
+        projected > max
     }
 
     fn notify_lifecycle(&self, reason: LifecycleReason, key: K, value: Option<V>)

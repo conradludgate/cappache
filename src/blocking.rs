@@ -104,21 +104,23 @@ pub(crate) fn block_on<F: IntoFuture>(fut: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
+    use std::task::Poll;
     use std::time::Duration;
 
     use super::block_on;
 
-    fn poll_once_pending_then_ready(
+    fn pending_until_signaled(
+        ready: Arc<AtomicBool>,
         waker_slot: Arc<Mutex<Option<std::task::Waker>>>,
     ) -> impl std::future::Future<Output = u8> {
         poll_fn(move |cx| {
-            let mut g = waker_slot.lock().expect("waker slot mutex poisoned");
-            if g.is_none() {
-                *g = Some(cx.waker().clone());
-                std::task::Poll::Pending
+            if ready.load(Ordering::Acquire) {
+                Poll::Ready(7_u8)
             } else {
-                std::task::Poll::Ready(7_u8)
+                *waker_slot.lock().expect("waker slot mutex poisoned") = Some(cx.waker().clone());
+                Poll::Pending
             }
         })
     }
@@ -127,14 +129,21 @@ mod tests {
     fn block_on_unparks_when_waker_wakes_by_ref_from_another_thread() {
         let waker_slot: Arc<Mutex<Option<std::task::Waker>>> = Arc::new(Mutex::new(None));
         let ws = Arc::clone(&waker_slot);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_for_worker = Arc::clone(&ready);
         let (done_tx, done_rx) = mpsc::channel();
         let slot_for_block = Arc::clone(&waker_slot);
+        let ready_for_block = Arc::clone(&ready);
         let blocker = std::thread::spawn(move || {
-            let out = block_on(async { poll_once_pending_then_ready(slot_for_block).await });
+            let out =
+                block_on(
+                    async move { pending_until_signaled(ready_for_block, slot_for_block).await },
+                );
             let _ = done_tx.send(out);
         });
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
+            ready_for_worker.store(true, Ordering::Release);
             let g = ws.lock().expect("waker slot mutex poisoned");
             if let Some(w) = g.as_ref() {
                 w.wake_by_ref();
@@ -154,14 +163,21 @@ mod tests {
     fn block_on_unparks_when_waker_wake_consumed_from_another_thread() {
         let waker_slot: Arc<Mutex<Option<std::task::Waker>>> = Arc::new(Mutex::new(None));
         let ws = Arc::clone(&waker_slot);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_for_worker = Arc::clone(&ready);
         let (done_tx, done_rx) = mpsc::channel();
         let slot_for_block = Arc::clone(&waker_slot);
+        let ready_for_block = Arc::clone(&ready);
         let blocker = std::thread::spawn(move || {
-            let out = block_on(async { poll_once_pending_then_ready(slot_for_block).await });
+            let out =
+                block_on(
+                    async move { pending_until_signaled(ready_for_block, slot_for_block).await },
+                );
             let _ = done_tx.send(out);
         });
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
+            ready_for_worker.store(true, Ordering::Release);
             let g = ws.lock().expect("waker slot mutex poisoned");
             if let Some(w) = g.as_ref() {
                 w.clone().wake();

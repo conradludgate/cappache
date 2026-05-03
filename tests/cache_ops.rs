@@ -835,9 +835,43 @@ mod policy_time {
         })
         .await;
     }
+
+    #[tokio::test]
+    async fn ttl_expire_then_try_get_with_runs_initializer() {
+        with_timeout(Duration::from_secs(30), async {
+            let ttl = Duration::from_millis(80);
+            let cache = Arc::new(Cache::<K, V>::new(
+                CacheBuilder::<K, V>::new()
+                    .max_weight(Weight::new(100))
+                    .policy(Arc::new(TtlFromWrite::new(ttl, DefaultPolicy)))
+                    .build(),
+            ));
+            let k = "tk".to_string();
+            cache.insert(k.clone(), "old".into());
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_c = Arc::clone(&calls);
+            let out = cache
+                .clone()
+                .try_get_with(k.clone(), move || {
+                    let c = Arc::clone(&calls_c);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, ()>("fresh".to_string())
+                    }
+                })
+                .await
+                .expect("try_get_with");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(out, "fresh");
+            assert_eq!(cache.get(&k), Some("fresh".into()));
+        })
+        .await;
+    }
 }
 
 mod mutation_guards {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use super::*;
@@ -864,6 +898,143 @@ mod mutation_guards {
         fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
             TIME_UNBOUNDED
         }
+    }
+
+    #[test]
+    fn replace_under_budget_pressure_evicts_non_insert_key_first() {
+        let (listener, log) = RecordingListener::new_pair();
+        let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(12))
+                .policy(Arc::new(LenWeightPolicy))
+                .lifecycle_listener(listener)
+                .build(),
+        );
+        let keep = "keep".to_string();
+        let repl = "repl".to_string();
+        cache.insert(keep.clone(), "k".repeat(5));
+        cache.insert(repl.clone(), "r".repeat(5));
+
+        cache.insert(repl.clone(), "R".repeat(9));
+
+        let evicted_first = {
+            let evts = log.lock().unwrap();
+            evts.iter()
+                .find(|(reason, _, _)| *reason == LifecycleReason::EvictedSize)
+                .map(|(reason, key, val)| (*reason, key.clone(), val.clone()))
+        };
+        assert!(
+            evicted_first.is_some(),
+            "expected a size eviction while resizing repl under a tight budget"
+        );
+        assert_eq!(
+            evicted_first.unwrap().1,
+            keep,
+            "must evict another Ready slot before evicting the insert key being resized"
+        );
+    }
+
+    #[derive(Clone)]
+    struct WriteUnboundedWitness(Arc<AtomicBool>);
+
+    impl Policy<K, V> for WriteUnboundedWitness {
+        fn weight(&self, _k: &K, _v: &V) -> Weight {
+            Weight::new(1)
+        }
+
+        fn expire_after_read(
+            &self,
+            _k: &K,
+            _v: &V,
+            _read_at: Instant,
+            _written_at: Instant,
+            time_remaining: Duration,
+        ) -> Duration {
+            self.0
+                .store(time_remaining == TIME_UNBOUNDED, Ordering::SeqCst);
+            TIME_UNBOUNDED
+        }
+
+        fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
+            TIME_UNBOUNDED
+        }
+    }
+
+    #[test]
+    fn get_passes_sentinel_time_remaining_when_write_is_unbounded_and_deadline_none() {
+        let witness = Arc::new(AtomicBool::new(false));
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(100))
+                .policy(Arc::new(WriteUnboundedWitness(witness.clone())))
+                .build(),
+        );
+        let k = "k".to_string();
+        cache.insert(k.clone(), "v".into());
+        assert!(cache.get(&k).is_some());
+        assert!(
+            witness.load(Ordering::SeqCst),
+            "live hits must pass the TIME_UNBOUNDED sentinel as time_remaining when no finite deadline is stored"
+        );
+    }
+
+    #[derive(Clone)]
+    struct MidReadBoundWitness {
+        reads: Arc<AtomicUsize>,
+        second_hit_tr_is_sentinel: Arc<AtomicBool>,
+    }
+
+    impl Policy<K, V> for MidReadBoundWitness {
+        fn weight(&self, _k: &K, _v: &V) -> Weight {
+            Weight::new(1)
+        }
+
+        fn expire_after_read(
+            &self,
+            _k: &K,
+            _v: &V,
+            _read_at: Instant,
+            _written_at: Instant,
+            time_remaining: Duration,
+        ) -> Duration {
+            let n = self.reads.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                TIME_UNBOUNDED / 2 + Duration::from_nanos(1)
+            } else {
+                self.second_hit_tr_is_sentinel
+                    .store(time_remaining == TIME_UNBOUNDED, Ordering::SeqCst);
+                TIME_UNBOUNDED
+            }
+        }
+
+        fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
+            TIME_UNBOUNDED
+        }
+    }
+
+    #[test]
+    fn mid_band_read_allowance_materializes_deadline_none_until_next_hit() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicBool::new(false));
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(100))
+                .policy(Arc::new(MidReadBoundWitness {
+                    reads: reads.clone(),
+                    second_hit_tr_is_sentinel: second.clone(),
+                }))
+                .build(),
+        );
+        let k = "k".to_string();
+        cache.insert(k.clone(), "v".into());
+        assert!(cache.get(&k).is_some());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert!(cache.get(&k).is_some());
+        assert!(
+            second.load(Ordering::SeqCst),
+            "after folding mid-band read allowance into None, the next hit must still observe TIME_UNBOUNDED remaining"
+        );
     }
 
     #[test]
