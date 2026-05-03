@@ -13,6 +13,7 @@
 //! and their own cap (so the effective deadline is the stricter of the two). [`Policy::weight`] is
 //! delegated to the inner policy.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Relative cost of an entry toward the cache weight budget.
@@ -56,6 +57,36 @@ pub trait Policy<K, V>: Send + Sync {
     ) -> Duration;
 
     fn expire_after_write(&self, key: &K, value: &V, written_at: Instant) -> Duration;
+}
+
+/// Forwards every method through `Arc::deref`, so an `Arc<dyn Policy<K, V> +
+/// Send + Sync>` (or any other `Arc<P>`) satisfies the generic policy
+/// parameter on [`crate::Cache`]. This is what keeps the type-erased path
+/// cheap — callers who want monomorphisation pass a concrete `P` directly,
+/// callers who want a vtable pass `Arc<dyn Policy<…>>` and pay the same
+/// indirection they always did.
+impl<K, V, T> Policy<K, V> for Arc<T>
+where
+    T: Policy<K, V> + ?Sized,
+{
+    fn weight(&self, key: &K, value: &V) -> Weight {
+        (**self).weight(key, value)
+    }
+
+    fn expire_after_read(
+        &self,
+        key: &K,
+        value: &V,
+        read_at: Instant,
+        last_modified_at: Instant,
+        time_remaining: Duration,
+    ) -> Duration {
+        (**self).expire_after_read(key, value, read_at, last_modified_at, time_remaining)
+    }
+
+    fn expire_after_write(&self, key: &K, value: &V, written_at: Instant) -> Duration {
+        (**self).expire_after_write(key, value, written_at)
+    }
 }
 
 /// Unit weight and no finite time limit from either hook.

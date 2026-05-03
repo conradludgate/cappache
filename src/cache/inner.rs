@@ -148,8 +148,8 @@ where
     }
 }
 
-pub(crate) struct Inner<K: 'static, V: 'static> {
-    pub(crate) config: CacheConfig<K, V>,
+pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
+    pub(crate) config: CacheConfig<K, V, P>,
     /// All `Ready` / `Miss` map state. **`std::sync::Mutex` only** — never `tokio::sync::Mutex`; the
     /// lock is released before awaiting user `init` futures in [`Self::try_get_with`].
     pub(crate) state: Mutex<State<K, V>>,
@@ -514,13 +514,14 @@ fn remove_lane<K, V>(
 /// follower-installed replacement) and broadcasts `LaneOutcome::Cancelled` so
 /// any follower waiting on this exact flight retries instead of blocking
 /// forever on a sender that will never publish.
-struct LeaderGuard<'a, K, V, E>
+struct LeaderGuard<'a, K, V, E, P>
 where
     K: Eq + Hash + 'static,
     V: Clone + Send + Sync + 'static,
     E: Clone + Send + Sync + 'static,
+    P: 'static,
 {
-    inner: &'a Inner<K, V>,
+    inner: &'a Inner<K, V, P>,
     key: &'a K,
     flight: Arc<MissFlight<V, E>>,
     /// Type-erased view of `flight`, kept alongside so identity comparison
@@ -529,11 +530,12 @@ where
     armed: bool,
 }
 
-impl<K, V, E> Drop for LeaderGuard<'_, K, V, E>
+impl<K, V, E, P> Drop for LeaderGuard<'_, K, V, E, P>
 where
     K: Eq + Hash + 'static,
     V: Clone + Send + Sync + 'static,
     E: Clone + Send + Sync + 'static,
+    P: 'static,
 {
     fn drop(&mut self) {
         if !self.armed {
@@ -620,12 +622,13 @@ where
     id
 }
 
-impl<K, V> Inner<K, V>
+impl<K, V, P> Inner<K, V, P>
 where
     K: Eq + Hash + Clone + Send + Sync,
     V: Clone + Send + Sync,
+    P: Policy<K, V>,
 {
-    pub(crate) fn new(config: CacheConfig<K, V>) -> Self {
+    pub(crate) fn new(config: CacheConfig<K, V, P>) -> Self {
         // Pre-size both the lookup map and the slab to the cache's weight budget so
         // steady-state inserts never trigger a one-shot O(n) rehash. `weight ≥ 1`
         // is the working assumption that bounds entry count by `max_weight`.
@@ -683,7 +686,7 @@ where
         // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
         // (mutable) don't overlap, so the borrow checker accepts both.
         let new_dl =
-            update_read_deadline(&es.key, &mut es.entry, self.config.policy.as_ref(), now);
+            update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
         if let Some(dl) = new_dl {
             expiry.push(dl, id, generation);
         }
@@ -792,7 +795,7 @@ where
             let _ = evict_slot(&mut st, id);
         }
 
-        let deadline = deadline_after_write(self.config.policy.as_ref(), &key, &value, now);
+        let deadline = deadline_after_write(&self.config.policy, &key, &value, now);
         install_ready(
             &mut st,
             key,
@@ -943,7 +946,7 @@ where
         K: 'static,
         V: 'static,
     {
-        let deadline = deadline_after_write(self.config.policy.as_ref(), key, v, now);
+        let deadline = deadline_after_write(&self.config.policy, key, v, now);
         let nw = self.config.policy.weight(key, v).get();
         let reclaimed = self.reclaim(st, nw, key, now);
         install_ready(
@@ -1004,7 +1007,7 @@ where
                 let value = es.entry.value.clone();
                 let generation = es.generation;
                 let new_dl =
-                    update_read_deadline(key, &mut es.entry, self.config.policy.as_ref(), now);
+                    update_read_deadline(key, &mut es.entry, &self.config.policy, now);
                 if let Some(dl) = new_dl {
                     expiry.push(dl, id, generation);
                 }
@@ -1114,7 +1117,7 @@ where
             Some(&id) => evict_slot(&mut st, id).map(|(_, v, _)| v),
             None => None,
         };
-        let deadline = deadline_after_write(self.config.policy.as_ref(), key, &v, now);
+        let deadline = deadline_after_write(&self.config.policy, key, &v, now);
         install_ready(
             &mut st,
             key.clone(),
@@ -1137,15 +1140,11 @@ where
     }
 }
 
-fn deadline_after_write<K, V>(
-    policy: &(dyn Policy<K, V> + Send + Sync),
-    key: &K,
-    value: &V,
-    now: Instant,
-) -> Option<Instant>
+fn deadline_after_write<K, V, P>(policy: &P, key: &K, value: &V, now: Instant) -> Option<Instant>
 where
     K: 'static,
     V: 'static,
+    P: Policy<K, V> + ?Sized,
 {
     let d = policy.expire_after_write(key, value, now);
     if d >= crate::policy::TIME_UNBOUNDED / 2 {
@@ -1181,15 +1180,16 @@ fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
 /// the old one); the caller is then responsible for pushing it into the
 /// expiry heap. Returns `None` when the deadline either stayed the same or
 /// became `None`, both of which leave the heap untouched.
-fn update_read_deadline<K, V>(
+fn update_read_deadline<K, V, P>(
     key: &K,
     e: &mut CacheEntry<V>,
-    policy: &(dyn Policy<K, V> + Send + Sync),
+    policy: &P,
     now: Instant,
 ) -> Option<Instant>
 where
     K: 'static,
     V: 'static,
+    P: Policy<K, V> + ?Sized,
 {
     let prev = e.deadline;
     let time_remaining = prev.map_or(crate::policy::TIME_UNBOUNDED, |dl| {

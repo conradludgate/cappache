@@ -17,36 +17,39 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clache::{
-    Cache, CacheBuilder, DefaultPolicy, Executor, IdleTimeout, LifecycleListener, LifecycleReason,
-    Policy, RevalidateScheduled, TIME_UNBOUNDED, TtlFromWrite, Weight,
+    Cache, CacheBuilder, DefaultPolicy, DynPolicy, Executor, IdleTimeout, LifecycleListener,
+    LifecycleReason, Policy, RevalidateScheduled, TIME_UNBOUNDED, TtlFromWrite, Weight,
 };
 
 type K = String;
 type V = String;
 
 fn test_cache() -> Cache<K, V> {
+    let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
     Cache::new(
         CacheBuilder::new()
             .max_weight(Weight::new(10_000))
-            .policy(Arc::new(DefaultPolicy))
+            .policy(policy)
             .build(),
     )
 }
 
 fn test_cache_ttl_zero_write() -> Cache<K, V> {
+    let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(Duration::ZERO, DefaultPolicy));
     Cache::new(
         CacheBuilder::new()
             .max_weight(Weight::new(10_000))
-            .policy(Arc::new(TtlFromWrite::new(Duration::ZERO, DefaultPolicy)))
+            .policy(policy)
             .build(),
     )
 }
 
 fn test_cache_max_weight_one() -> Cache<K, V> {
+    let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
     Cache::new(
         CacheBuilder::new()
             .max_weight(Weight::new(1))
-            .policy(Arc::new(DefaultPolicy))
+            .policy(policy)
             .build(),
     )
 }
@@ -539,10 +542,11 @@ mod capacity {
 
     #[test]
     fn max_weight_two_keeps_both_unit_weight_entries() {
+        let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
         let cache = Cache::<K, V>::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(2))
-                .policy(Arc::new(DefaultPolicy))
+                .policy(policy)
                 .build(),
         );
         assert_eq!(cache.insert("a".into(), "va".into()), None);
@@ -788,10 +792,11 @@ mod borrow_lookup {
 
     #[test]
     fn contains_key_does_not_promote_lru() {
+        let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
         let cache = Cache::<K, V>::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(2))
-                .policy(Arc::new(DefaultPolicy))
+                .policy(policy)
                 .build(),
         );
         cache.insert("a".into(), "va".into());
@@ -1000,10 +1005,11 @@ mod policy_time {
     async fn idle_timeout_expires_after_idle_without_reads() {
         with_timeout(Duration::from_secs(30), async {
             let idle = Duration::from_millis(90);
+            let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
                     .max_weight(Weight::new(100))
-                    .policy(Arc::new(IdleTimeout::new(idle, DefaultPolicy)))
+                    .policy(policy)
                     .build(),
             );
             cache.insert("k".into(), "v".into());
@@ -1017,10 +1023,11 @@ mod policy_time {
     async fn idle_timeout_read_extends_deadline() {
         with_timeout(Duration::from_secs(30), async {
             let idle = Duration::from_millis(100);
+            let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
                     .max_weight(Weight::new(100))
-                    .policy(Arc::new(IdleTimeout::new(idle, DefaultPolicy)))
+                    .policy(policy)
                     .build(),
             );
             cache.insert("k".into(), "v".into());
@@ -1038,10 +1045,11 @@ mod policy_time {
     async fn ttl_from_write_expires_after_ttl_without_reads() {
         with_timeout(Duration::from_secs(30), async {
             let ttl = Duration::from_millis(80);
+            let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(ttl, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
                     .max_weight(Weight::new(100))
-                    .policy(Arc::new(TtlFromWrite::new(ttl, DefaultPolicy)))
+                    .policy(policy)
                     .build(),
             );
             cache.insert("k".into(), "v".into());
@@ -1055,10 +1063,11 @@ mod policy_time {
     async fn ttl_expire_then_try_get_with_runs_initializer() {
         with_timeout(Duration::from_secs(30), async {
             let ttl = Duration::from_millis(80);
+            let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(ttl, DefaultPolicy));
             let cache = Arc::new(Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
                     .max_weight(Weight::new(100))
-                    .policy(Arc::new(TtlFromWrite::new(ttl, DefaultPolicy)))
+                    .policy(policy)
                     .build(),
             ));
             let k = "tk".to_string();

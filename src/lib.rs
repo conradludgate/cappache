@@ -40,7 +40,7 @@ pub mod policy;
 pub mod rt;
 
 pub use cache::Cache;
-pub use config::{CacheBuilder, CacheConfig};
+pub use config::{CacheBuilder, CacheConfig, DynPolicy};
 pub use lifecycle::{LifecycleListener, LifecycleReason};
 pub use policy::{DefaultPolicy, IdleTimeout, Policy, TIME_UNBOUNDED, TtlFromWrite, Weight};
 pub use rt::{Executor, RevalidateScheduled};
@@ -53,6 +53,7 @@ mod compile_tests {
 
     fn assert_sync<T: Sync>() {}
 
+    #[derive(Clone)]
     struct CustomPolicy;
 
     impl Policy<String, String> for CustomPolicy {
@@ -89,6 +90,19 @@ mod compile_tests {
     #[test]
     fn builder_accepts_custom_policy() {
         let _ = CacheBuilder::<String, String>::new().policy(Arc::new(CustomPolicy));
+    }
+
+    /// Monomorphic policy path: concrete `P = CustomPolicy` (no `Arc`,
+    /// no vtable). This is the `Cache<K, V, P>` variant the type
+    /// parameter on `Cache` was added for; keep a compile-only check so
+    /// it stays callable without the `Arc::new` dance.
+    #[test]
+    fn cache_accepts_concrete_policy_without_arc() {
+        let cfg = CacheBuilder::<String, String>::new()
+            .max_weight(Weight::new(1))
+            .policy(CustomPolicy)
+            .build();
+        let _: Cache<String, String, CustomPolicy> = Cache::new(cfg);
     }
 
     #[test]

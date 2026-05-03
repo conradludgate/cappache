@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use clache::{
-    Cache, CacheBuilder, DefaultPolicy, IdleTimeout, LifecycleListener, LifecycleReason, Policy,
-    TIME_UNBOUNDED, TtlFromWrite, Weight,
+    Cache, CacheBuilder, DefaultPolicy, DynPolicy, IdleTimeout, LifecycleListener, LifecycleReason,
+    Policy, TIME_UNBOUNDED, TtlFromWrite, Weight,
 };
 
 struct SurfacePolicy;
@@ -262,10 +262,11 @@ fn cache_string_string_is_send_sync() {
 
 #[test]
 fn cache_clone_shares_state() {
+    let policy: DynPolicy<String, String> = Arc::new(DefaultPolicy);
     let cache = Cache::<String, String>::new(
         CacheBuilder::new()
             .max_weight(Weight::new(8))
-            .policy(Arc::new(DefaultPolicy))
+            .policy(policy)
             .build(),
     );
     let handle = cache.clone();
@@ -277,10 +278,11 @@ fn cache_clone_shares_state() {
 
 #[test]
 fn len_is_empty_weight_track_inserts_and_removes() {
+    let policy: DynPolicy<String, String> = Arc::new(DefaultPolicy);
     let cache = Cache::<String, String>::new(
         CacheBuilder::new()
             .max_weight(Weight::new(100))
-            .policy(Arc::new(DefaultPolicy))
+            .policy(policy)
             .build(),
     );
     assert!(cache.is_empty());
@@ -314,10 +316,11 @@ fn clear_drops_entries_and_fires_removed_for_each() {
     let events: Events = Arc::new(Mutex::new(Vec::new()));
     let listener: Arc<dyn LifecycleListener<String, String> + Send + Sync> =
         Arc::new(Recorder(Arc::clone(&events)));
+    let policy: DynPolicy<String, String> = Arc::new(DefaultPolicy);
     let cache = Cache::<String, String>::new(
         CacheBuilder::new()
             .max_weight(Weight::new(100))
-            .policy(Arc::new(DefaultPolicy))
+            .policy(policy)
             .lifecycle_listener(listener)
             .build(),
     );

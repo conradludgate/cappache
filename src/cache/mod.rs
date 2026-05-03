@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Waker};
 
 use pin_project_lite::pin_project;
 
-use crate::config::CacheConfig;
+use crate::config::{CacheConfig, DynPolicy};
 use crate::lifecycle::LifecycleListener;
 use crate::policy::Policy;
 use crate::rt::{Executor, RevalidateScheduled};
@@ -44,17 +44,18 @@ impl<Fut: Future> Future for OkIntoResult<Fut> {
 }
 
 /// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by [`Cache::try_revalidate`].
-pub struct RefreshWork<K: 'static, V: 'static, E: 'static> {
-    pub(crate) inner: Arc<inner::Inner<K, V>>,
+pub struct RefreshWork<K: 'static, V: 'static, E: 'static, P: 'static = DynPolicy<K, V>> {
+    pub(crate) inner: Arc<inner::Inner<K, V, P>>,
     pub(crate) key: K,
     pub(crate) fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>>,
 }
 
-impl<K, V, E> Future for RefreshWork<K, V, E>
+impl<K, V, E, P> Future for RefreshWork<K, V, E, P>
 where
     K: Eq + Hash + Clone + Send + Sync + Unpin + 'static,
     V: Clone + Send + Sync + 'static,
     E: Send + 'static,
+    P: Policy<K, V> + Send + Sync + 'static,
 {
     type Output = ();
 
@@ -81,11 +82,15 @@ where
 /// state, so call sites can hand out clones to spawned workers without
 /// rebuilding configuration. The underlying state lives until the last
 /// handle is dropped.
-pub struct Cache<K: 'static, V: 'static> {
-    inner: Arc<inner::Inner<K, V>>,
+///
+/// `P` is the policy type. The default ([`DynPolicy`]) keeps the cache
+/// generic-erased; pass a concrete `P: Policy<K, V>` to inline policy
+/// hooks and skip the vtable on every cache operation.
+pub struct Cache<K: 'static, V: 'static, P: 'static = DynPolicy<K, V>> {
+    inner: Arc<inner::Inner<K, V, P>>,
 }
 
-impl<K: 'static, V: 'static> Clone for Cache<K, V> {
+impl<K: 'static, V: 'static, P: 'static> Clone for Cache<K, V, P> {
     /// Cloning a `Cache` is `Arc`-cheap: both handles refer to the same
     /// shared state. Mutations from one are visible from the other.
     fn clone(&self) -> Self {
@@ -95,13 +100,14 @@ impl<K: 'static, V: 'static> Clone for Cache<K, V> {
     }
 }
 
-impl<K, V> Cache<K, V>
+impl<K, V, P> Cache<K, V, P>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    P: Policy<K, V> + Clone + Send + Sync + 'static,
 {
     #[must_use]
-    pub fn new(config: CacheConfig<K, V>) -> Self {
+    pub fn new(config: CacheConfig<K, V, P>) -> Self {
         Self {
             inner: Arc::new(inner::Inner::new(config)),
         }
@@ -112,14 +118,18 @@ where
         self.inner.config.max_weight
     }
 
+    /// Returns a clone of the policy. For the default `DynPolicy`
+    /// (`Arc<dyn Policy>`) this is an `Arc::clone`; for a concrete `P` it
+    /// invokes `P: Clone`.
     #[must_use]
-    pub fn policy(&self) -> Arc<dyn Policy<K, V> + Send + Sync> {
-        Arc::clone(&self.inner.config.policy)
+    pub fn policy(&self) -> P {
+        self.inner.config.policy.clone()
     }
 
+    /// Returns a borrow of the policy. Cheap regardless of `P`.
     #[must_use]
-    pub fn policy_ref(&self) -> &(dyn Policy<K, V> + Send + Sync) {
-        self.inner.config.policy.as_ref()
+    pub fn policy_ref(&self) -> &P {
+        &self.inner.config.policy
     }
 
     #[must_use]
@@ -272,7 +282,7 @@ where
     ) -> Result<RevalidateScheduled, E>
     where
         E: Clone + Send + Sync + 'static,
-        Ex: Executor<RefreshWork<K, V, E>> + ?Sized,
+        Ex: Executor<RefreshWork<K, V, E, P>> + ?Sized,
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = Result<V, E>> + Send + 'static,
         K: Unpin,
@@ -316,7 +326,7 @@ where
     /// is ever produced (unreachable for this API).
     pub fn revalidate<Ex, F, Fut>(&self, key: K, executor: &Ex, init: F) -> RevalidateScheduled
     where
-        Ex: Executor<RefreshWork<K, V, Infallible>> + ?Sized,
+        Ex: Executor<RefreshWork<K, V, Infallible, P>> + ?Sized,
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = V> + Send + 'static,
         K: Unpin,
