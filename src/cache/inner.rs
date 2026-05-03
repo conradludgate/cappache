@@ -8,7 +8,14 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use clashcore::CachePadded;
+use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+
+/// One cache-padded shard. Aliased so the verbose `CachePadded<RwLock<...>>`
+/// stack does not need to spell itself out at every use site (and so
+/// clippy stops flagging `Inner::shards` for `type_complexity`).
+type Shard<K, V> = CachePadded<RwLock<State<K, V>>>;
 use std::hash::BuildHasher;
 use tokio::sync::watch;
 
@@ -262,14 +269,24 @@ where
 
 pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) config: CacheConfig<K, V, P>,
-    /// Per-shard state, addressed by `hash(key) & shard_mask`. Power-of-
-    /// two shard count so the mask is always `len - 1`. Single-key paths
-    /// take exactly one lock; multi-key paths fold across all shards.
-    /// **`std::sync::Mutex` only** — never `tokio::sync::Mutex`; the lock
-    /// is released before awaiting user `init` futures in
-    /// [`Self::try_get_with`].
-    pub(crate) shards: Box<[Mutex<State<K, V>>]>,
-    pub(crate) shard_mask: u64,
+    /// Per-shard state, cache-padded to keep adjacent shards out of each
+    /// other's cache lines. Single-key paths take exactly one shard's
+    /// `RwLock` (always `.write()` today — the read paths still mutate
+    /// LRU/expiry state); multi-key paths fold across all shards.
+    ///
+    /// `clashcore::lock::RwLock` is `lock_api::RwLock<RawRwLock, T>`: a
+    /// single-CAS uncontended fast path with no poisoning. Releasing
+    /// before awaiting user `init` futures in [`Self::try_get_with`]
+    /// remains a hard requirement.
+    pub(crate) shards: Box<[Shard<K, V>]>,
+    /// `usize::BITS - log2(shards.len())` for the shard count, used by
+    /// the `(h << 7) >> shift` indexing borrowed from `clashcore`'s
+    /// `ClashCollection`. The left-shift hides the high 7 bits of the
+    /// hash from shard selection so `hashbrown`'s SIMD tag does not
+    /// collide with our shard partition. Unused (and set to `0`) when
+    /// `shards.len() == 1`; that case short-circuits to index 0 in
+    /// [`Self::shard_for`] to avoid an `usize::BITS` shift (UB).
+    pub(crate) shard_shift: u32,
     /// Hasher used both to pick a shard and (per shard) to hash table
     /// entries. Stored at the `Inner` level so all shards share the same
     /// seed — that keeps a key's bucket position stable across `Cache`
@@ -844,12 +861,11 @@ where
         if !self.armed {
             return;
         }
-        // Tolerate poisoning: the leader might already be unwinding from a
-        // panic in `init`, and double-panicking from Drop aborts the process.
-        let mut st = match self.inner.shard_for(self.key).lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        // `clashcore::RwLock` does not poison, so a panicking leader leaves
+        // the shard in its last consistent state — we can take the write
+        // lock here and clean up without the std::sync::Mutex `into_inner`
+        // dance.
+        let mut st = self.inner.shard_for(self.key).write();
         remove_lane(&mut st, self.key, &self.flight_any);
         drop(st);
         self.flight.cancel();
@@ -883,10 +899,7 @@ where
         if !self.armed {
             return;
         }
-        let mut st = match self.inner.shard_for(self.key).lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut st = self.inner.shard_for(self.key).write();
         remove_lane(&mut st, self.key, &self.flight_any);
         drop(st);
         self.flight.cancel();
@@ -977,25 +990,33 @@ where
 }
 
 impl<K, V, P> Inner<K, V, P> {
-    /// Locks the shard responsible for `key`. Single-key paths funnel
-    /// through here so the shard mapping is centralised; cross-shard work
-    /// (`len`, `weight`, `clear`) iterates `self.shards` directly.
+    /// Returns the shard responsible for `key`. Single-key paths funnel
+    /// through here so the shard mapping is centralised; cross-shard
+    /// work (`len`, `weight`, `clear`) iterates `self.shards` directly.
     ///
     /// Kept on a bound-free impl block so that the `LeaderGuard::drop`
     /// path can call it without re-asserting the full `Inner` bounds.
-    fn shard_for<Q>(&self, key: &Q) -> &Mutex<State<K, V>>
+    /// Borrowed verbatim from `clashcore::ClashCollection::determine_shard`:
+    /// `(hash << 7) >> shift` keeps the high 7 bits of the hash for
+    /// hashbrown's SIMD tag while picking a shard from the next bits.
+    fn shard_for<Q>(&self, key: &Q) -> &Shard<K, V>
     where
         K: Borrow<Q>,
         Q: Hash + ?Sized,
     {
-        let h = hash_key(&self.hasher, key);
-        // Power-of-two shard count, so `h & mask` is in range. With
-        // `shard_mask == 0` this collapses to shard 0 (the .shards(1)
-        // case), matching the original single-mutex behaviour. Mask is
-        // sized to `shard_count - 1`, so the masked value always fits
-        // a `usize` regardless of pointer width.
-        let idx = usize::try_from(h & self.shard_mask)
-            .expect("shard mask is bounded by shard_count which fits a usize");
+        let idx = if self.shards.len() == 1 {
+            0
+        } else {
+            // Mirrors `clashcore::ClashCollection::determine_shard`: cast
+            // the 64-bit hash down to `usize` and pick the upper
+            // `log2(shard_count)` bits after the 7-bit SIMD-tag shift.
+            // High bits get dropped on 32-bit targets, which is fine — the
+            // default hasher distributes well enough that the truncation
+            // does not bias shard selection.
+            #[allow(clippy::cast_possible_truncation)]
+            let h = hash_key(&self.hasher, key) as usize;
+            (h << 7) >> self.shard_shift
+        };
         &self.shards[idx]
     }
 }
@@ -1020,7 +1041,7 @@ where
         let initial_capacity = capacity_hint_from_max_weight(shard_max_weight);
         let shards = (0..shard_count)
             .map(|_| {
-                Mutex::new(State {
+                CachePadded::new(RwLock::new(State {
                     entries: HashTable::with_capacity(initial_capacity),
                     inflight: HashMap::new(),
                     slab: Slab::with_capacity(initial_capacity),
@@ -1028,15 +1049,23 @@ where
                     expiry: ExpiryHeap::default(),
                     stale_pushes: 0,
                     total_weight: 0,
-                })
+                }))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let shard_mask = (shard_count as u64) - 1;
+        // Match clashcore::ClashCollection's shard indexing: shift leaves
+        // the high 7 bits of the hash undisturbed for hashbrown's SIMD
+        // tag. The single-shard branch in `shard_for` bypasses the shift
+        // entirely so `usize::BITS` here would be UB — set to 0 instead.
+        let shard_shift = if shard_count == 1 {
+            0
+        } else {
+            usize::BITS - shard_count.trailing_zeros()
+        };
         Self {
             config,
             shards,
-            shard_mask,
+            shard_shift,
             hasher: DefaultHashBuilder::default(),
             shard_max_weight,
         }
@@ -1049,7 +1078,7 @@ where
         V: 'static,
     {
         let now = Instant::now();
-        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).write();
 
         let id = entries_find(&st.entries, &self.hasher, &st.slab, key)?;
 
@@ -1093,7 +1122,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let st = self.shard_for(key).write();
         let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) else {
             return false;
         };
@@ -1112,7 +1141,7 @@ where
     pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().expect("cache mutex poisoned").slab.len())
+            .map(|s| s.write().slab.len())
             .sum()
     }
 
@@ -1122,7 +1151,7 @@ where
     pub(crate) fn is_empty(&self) -> bool {
         self.shards
             .iter()
-            .all(|s| s.lock().expect("cache mutex poisoned").slab.len() == 0)
+            .all(|s| s.write().slab.len() == 0)
     }
 
     /// Sums per-shard `total_weight`. Same consistency caveat as
@@ -1130,7 +1159,7 @@ where
     pub(crate) fn weight(&self) -> u64 {
         self.shards
             .iter()
-            .map(|s| s.lock().expect("cache mutex poisoned").total_weight)
+            .map(|s| s.write().total_weight)
             .sum()
     }
 
@@ -1145,7 +1174,7 @@ where
         V: 'static,
     {
         for shard in &self.shards {
-            let mut st = shard.lock().expect("cache mutex poisoned");
+            let mut st = shard.write();
             let State {
                 entries,
                 inflight,
@@ -1195,7 +1224,7 @@ where
         let now = Instant::now();
         let new_w = self.config.policy.weight(&key, &value).get();
         let key_for_updated = key.clone();
-        let mut st = self.shard_for(&key).lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(&key).write();
 
         // Single lookup: cache the existing slot id, then derive both the
         // returned `prev` value and the displaced-slot eviction from it.
@@ -1238,7 +1267,7 @@ where
         Q: Hash + Eq + ?Sized,
         V: 'static,
     {
-        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).write();
         let id = entries_find(&st.entries, &self.hasher, &st.slab, key)?;
         let (k, v, _) = evict_slot(&mut st, &self.hasher, id)?;
         drop(st);
@@ -1388,7 +1417,7 @@ where
     {
         let now = Instant::now();
         let shard = self.shard_for(key);
-        let mut st = shard.lock().expect("cache mutex poisoned");
+        let mut st = shard.write();
 
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let expired = st
@@ -1400,7 +1429,7 @@ where
             {
                 drop(st);
                 self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
-                st = shard.lock().expect("cache mutex poisoned");
+                st = shard.write();
             }
         }
 
@@ -1482,11 +1511,7 @@ where
                     };
                     let fut = init();
                     let res = fut.await;
-                    let mut st = guard
-                        .inner
-                        .shard_for(&key)
-                        .lock()
-                        .expect("cache mutex poisoned");
+                    let mut st = guard.inner.shard_for(&key).write();
                     remove_lane(&mut st, &key, &guard.flight_any);
 
                     let reclaimed = if let Ok(v) = &res {
@@ -1527,7 +1552,7 @@ where
     {
         let now = Instant::now();
         let shard = self.shard_for(key);
-        let mut st = shard.lock().expect("cache mutex poisoned");
+        let mut st = shard.write();
 
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let expired = st
@@ -1539,7 +1564,7 @@ where
             {
                 drop(st);
                 self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
-                st = shard.lock().expect("cache mutex poisoned");
+                st = shard.write();
             }
         }
 
@@ -1624,11 +1649,7 @@ where
                         armed: true,
                     };
                     let value = init(&key);
-                    let mut st = guard
-                        .inner
-                        .shard_for(&key)
-                        .lock()
-                        .expect("cache mutex poisoned");
+                    let mut st = guard.inner.shard_for(&key).write();
                     remove_lane(&mut st, &key, &guard.flight_any);
                     let now = Instant::now();
                     let reclaimed = self.finish_miss_ok(&mut st, &key, &value, now);
@@ -1652,7 +1673,7 @@ where
     where
         K: Eq + Hash,
     {
-        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).write();
         let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) else {
             return RefreshGate::AbsentKey;
         };
@@ -1676,7 +1697,7 @@ where
     where
         K: Eq + Hash,
     {
-        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).write();
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key)
             && let Some(es) = st.slab.get_mut(id)
         {
@@ -1689,7 +1710,7 @@ where
         K: 'static,
         V: 'static,
     {
-        let mut st = self.shard_for(key).lock().expect("cache mutex poisoned");
+        let mut st = self.shard_for(key).write();
         let now = Instant::now();
         let nw = self.config.policy.weight(key, &v).get();
         let reclaimed = self.reclaim(&mut st, nw, key, now);
@@ -1949,7 +1970,7 @@ mod shard_tests {
             }
         }
 
-        let st = inner.shards[0].lock().expect("cache mutex poisoned");
+        let st = inner.shards[0].write();
         let live = st.slab.len();
         let heap_len = st.expiry.0.len();
         assert!(
