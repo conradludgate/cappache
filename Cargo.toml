@@ -29,3 +29,7 @@ anyhow = "1"
 [[bench]]
 name = "compare_cache"
 harness = false
+
+[[bench]]
+name = "concurrent"
+harness = false
