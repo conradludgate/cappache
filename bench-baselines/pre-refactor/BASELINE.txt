@@ -1,0 +1,59 @@
+pre-refactor performance baseline
+==================================
+
+This directory archives clache, moka, and quick_cache performance numbers
+captured **before** any cache refactor, so post-refactor work can be
+compared against an immutable point of reference.
+
+Provenance
+----------
+
+clache repo SHA           : dc1769018ed8ac9bf8617862a735df48c3a69068
+mokabench submodule SHA   : f8f166628d9a20cfdb5119d23b069bee71d86e06
+cache-trace submodule SHA : ef0a9de8cf0202a1f2fee186a0af497774b0f0a9
+
+rustc                     : 1.95.0 (59807616e 2026-04-14) aarch64-apple-darwin
+host OS                   : macOS 26.4 (BuildVersion 25E246)
+captured                  : Sunday, May 3, 2026
+
+Layout
+------
+
+criterion/                  Persisted Criterion baseline tree mirroring
+                            target/criterion (the per-bench `pre_refactor`
+                            sub-directory is what `--baseline pre_refactor`
+                            consumes).
+criterion-summary.txt       Human-readable timings extracted from the
+                            `cargo bench` stdout (mean + throughput per
+                            (scenario, impl, param)).
+mokabench/oltp.log          `cargo run --release --example mokabench_compare
+                            -- oltp` stdout: clache vs moka vs quick_cache
+                            on the ARC OLTP trace, 8 client threads, four
+                            capacities (256, 512, 1000, 2000).
+
+How to compare against this baseline
+------------------------------------
+
+1. Restore the Criterion tree (only needed after a `cargo clean`):
+
+       cp -R bench-baselines/pre-refactor/criterion/* target/criterion/
+
+2. Re-run microbenches and diff against the snapshot:
+
+       cargo bench --bench compare_cache -- --baseline pre_refactor
+
+3. Re-run the trace-driven bench and diff outputs by hand:
+
+       cargo run --release --example mokabench_compare -- oltp \
+           > /tmp/oltp.log
+       diff bench-baselines/pre-refactor/mokabench/oltp.log /tmp/oltp.log
+
+Notes
+-----
+
+- ARC `S3` (16M rows) is not part of this baseline. clache's current
+  evict_until_fit scan makes high-capacity S3 runs prohibitively slow
+  pre-refactor; once Phase 2 lands, S3 should be added to this directory
+  for the second baseline (`post_refactor` / `pre-refactor-traces/s3.log`).
+- The mokabench `clache` driver does not yet wire TTL / TTI policies, so
+  TTL/TTI traces are skipped here.

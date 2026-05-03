@@ -1,0 +1,72 @@
+Benchmarking get_hit/clache/4096
+get_hit/clache/4096     time:   [31.898 ns 31.964 ns 32.028 ns]
+                        thrpt:  [31.222 Melem/s 31.286 Melem/s 31.350 Melem/s]
+Benchmarking get_hit/moka/4096
+get_hit/moka/4096       time:   [42.703 ns 42.762 ns 42.829 ns]
+                        thrpt:  [23.348 Melem/s 23.385 Melem/s 23.418 Melem/s]
+Benchmarking get_hit/quick_cache/4096
+                        time:   [3.3992 ns 3.4599 ns 3.5086 ns]
+                        thrpt:  [285.02 Melem/s 289.02 Melem/s 294.19 Melem/s]
+Benchmarking insert_churn/clache/1024
+                        time:   [7.4199 ms 7.4755 ms 7.5366 ms]
+                        thrpt:  [135.87 Kelem/s 136.98 Kelem/s 138.01 Kelem/s]
+Benchmarking insert_churn/moka/1024
+insert_churn/moka/1024  time:   [348.63 µs 350.93 µs 353.07 µs]
+                        thrpt:  [2.9003 Melem/s 2.9180 Melem/s 2.9372 Melem/s]
+Benchmarking insert_churn/quick_cache/1024
+                        time:   [33.707 µs 33.757 µs 33.816 µs]
+                        thrpt:  [30.281 Melem/s 30.334 Melem/s 30.380 Melem/s]
+Benchmarking insert_churn/clache/4096
+                        time:   [29.608 ms 29.759 ms 29.916 ms]
+                        thrpt:  [136.92 Kelem/s 137.64 Kelem/s 138.34 Kelem/s]
+Benchmarking insert_churn/moka/4096
+insert_churn/moka/4096  time:   [1.3907 ms 1.4008 ms 1.4102 ms]
+                        thrpt:  [2.9046 Melem/s 2.9240 Melem/s 2.9453 Melem/s]
+Benchmarking insert_churn/quick_cache/4096
+                        time:   [135.06 µs 135.73 µs 136.61 µs]
+                        thrpt:  [29.984 Melem/s 30.178 Melem/s 30.328 Melem/s]
+Benchmarking insert_churn/clache/16384
+                        time:   [111.94 ms 112.63 ms 113.29 ms]
+                        thrpt:  [144.61 Kelem/s 145.46 Kelem/s 146.36 Kelem/s]
+Benchmarking insert_churn/moka/16384
+insert_churn/moka/16384 time:   [5.4907 ms 5.5192 ms 5.5488 ms]
+                        thrpt:  [2.9527 Melem/s 2.9685 Melem/s 2.9839 Melem/s]
+Benchmarking insert_churn/quick_cache/16384
+                        time:   [540.33 µs 541.19 µs 542.07 µs]
+                        thrpt:  [30.225 Melem/s 30.274 Melem/s 30.322 Melem/s]
+Benchmarking insert_churn/clache/65536
+                        time:   [421.67 ms 424.19 ms 426.67 ms]
+                        thrpt:  [153.60 Kelem/s 154.50 Kelem/s 155.42 Kelem/s]
+Benchmarking insert_churn/moka/65536
+insert_churn/moka/65536 time:   [22.106 ms 22.220 ms 22.339 ms]
+                        thrpt:  [2.9337 Melem/s 2.9494 Melem/s 2.9646 Melem/s]
+Benchmarking insert_churn/quick_cache/65536
+                        time:   [2.1645 ms 2.1678 ms 2.1714 ms]
+                        thrpt:  [30.181 Melem/s 30.232 Melem/s 30.277 Melem/s]
+Benchmarking insert_cold/clache/1024
+insert_cold/clache/1024 time:   [70.211 µs 70.337 µs 70.473 µs]
+                        thrpt:  [14.530 Melem/s 14.559 Melem/s 14.585 Melem/s]
+Benchmarking insert_cold/moka/1024
+insert_cold/moka/1024   time:   [125.38 µs 125.71 µs 126.03 µs]
+                        thrpt:  [8.1248 Melem/s 8.1455 Melem/s 8.1673 Melem/s]
+Benchmarking insert_cold/quick_cache/1024
+                        time:   [33.323 µs 33.409 µs 33.492 µs]
+                        thrpt:  [30.575 Melem/s 30.651 Melem/s 30.729 Melem/s]
+Benchmarking insert_cold/clache/4096
+insert_cold/clache/4096 time:   [291.49 µs 292.36 µs 293.35 µs]
+                        thrpt:  [13.963 Melem/s 14.010 Melem/s 14.052 Melem/s]
+Benchmarking insert_cold/moka/4096
+insert_cold/moka/4096   time:   [513.74 µs 514.72 µs 515.75 µs]
+                        thrpt:  [7.9418 Melem/s 7.9578 Melem/s 7.9728 Melem/s]
+Benchmarking insert_cold/quick_cache/4096
+                        time:   [112.45 µs 112.81 µs 113.24 µs]
+                        thrpt:  [36.171 Melem/s 36.308 Melem/s 36.425 Melem/s]
+Benchmarking insert_cold/clache/16384
+                        time:   [1.1963 ms 1.1988 ms 1.2015 ms]
+                        thrpt:  [13.637 Melem/s 13.667 Melem/s 13.696 Melem/s]
+Benchmarking insert_cold/moka/16384
+insert_cold/moka/16384  time:   [2.4651 ms 2.4999 ms 2.5381 ms]
+                        thrpt:  [6.4552 Melem/s 6.5537 Melem/s 6.6465 Melem/s]
+Benchmarking insert_cold/quick_cache/16384
+                        time:   [421.93 µs 422.76 µs 423.53 µs]
+                        thrpt:  [38.685 Melem/s 38.755 Melem/s 38.831 Melem/s]
