@@ -1,0 +1,16 @@
+   Compiling clache v0.1.0 (/Users/conrad.ludgate/Documents/code/clache)
+    Finished `release` profile [optimized] target(s) in 0.35s
+     Running `target/release/examples/mokabench_compare oltp`
+Cache, Max Capacity, Clients, Inserts, Reads, Hit Ratio, Duration Secs
+clache Sync Cache, 256, 8, 802743, 914145, 12.186, 0.675
+Moka Sync Cache, 256, 8, 658804, 914145, 27.932, 0.446
+QuickCache Sync Cache, 256, 8, 712845, 914145, 22.021, 0.090
+clache Sync Cache, 512, 8, 718531, 914145, 21.399, 0.596
+Moka Sync Cache, 512, 8, 600429, 914145, 34.318, 0.380
+QuickCache Sync Cache, 512, 8, 654962, 914145, 28.353, 0.056
+clache Sync Cache, 1000, 8, 621001, 914145, 32.068, 0.560
+Moka Sync Cache, 1000, 8, 552363, 914145, 39.576, 0.359
+QuickCache Sync Cache, 1000, 8, 595032, 914145, 34.908, 0.041
+clache Sync Cache, 2000, 8, 528165, 914145, 42.223, 0.515
+Moka Sync Cache, 2000, 8, 508548, 914145, 44.369, 0.314
+QuickCache Sync Cache, 2000, 8, 532748, 914145, 41.722, 0.035

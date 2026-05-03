@@ -146,18 +146,27 @@ The `cache-trace` files ship as `.zst`; decompress the ones you need before
 running. TTL/TTI traces are **not yet wired** through the clache driver and
 will `todo!()` until that work lands.
 
-### Frozen pre-refactor baseline
+### Frozen baselines
 
-Before any cache-algorithm changes we captured a baseline at the
-`bench-pre-refactor` git tag. The archive lives in
-[`bench-baselines/pre-refactor/`](../bench-baselines/pre-refactor/) (Criterion
-tree, flat `criterion-summary.txt`, mokabench OLTP log, `BASELINE.txt`
-provenance). To diff later work against it:
+Two endpoints are archived so future work can diff against either side
+of the Phase 2 refactor:
+
+- [`bench-baselines/pre-refactor/`](../bench-baselines/pre-refactor/) —
+  captured at the `bench-pre-refactor` tag, before the slab + LRU + heap
+  engine landed. Includes `BASELINE.txt`, the Criterion tree (with the
+  `pre_refactor` baseline), `criterion-summary.txt`, and `mokabench/oltp.log`.
+- [`bench-baselines/post-refactor/`](../bench-baselines/post-refactor/) —
+  captured immediately after Phase 2 on the same machine. Includes
+  `POST_REFACTOR.md` (deltas + provenance), the Criterion tree (with both
+  `pre_refactor` and `post_refactor` baselines persisted side-by-side),
+  and `mokabench/oltp.log`.
+
+Diff against either endpoint:
 
 ```sh
-# Restore Criterion tree if target/ was cleaned.
-cp -R bench-baselines/pre-refactor/criterion/* target/criterion/
-cargo bench --bench compare_cache -- --baseline pre_refactor
+cp -R bench-baselines/post-refactor/criterion/* target/criterion/
+cargo bench --bench compare_cache -- --baseline pre_refactor   # vs Phase 0
+cargo bench --bench compare_cache -- --baseline post_refactor  # vs Phase 2
 ```
 
 A regression in the comparative slope (especially `insert_churn` vs *N*) is
