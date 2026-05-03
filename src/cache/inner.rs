@@ -908,6 +908,15 @@ where
             .sum()
     }
 
+    /// Short-circuiting form of `len() == 0`: bails out on the first
+    /// non-empty shard so a busy cache only pays for a single lock+probe.
+    /// Inherits the non-snapshot caveat from [`Self::len`].
+    pub(crate) fn is_empty(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|s| s.lock().expect("cache mutex poisoned").slab.len() == 0)
+    }
+
     /// Sums per-shard `total_weight`. Same consistency caveat as
     /// [`Self::len`].
     pub(crate) fn weight(&self) -> u64 {

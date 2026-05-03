@@ -177,19 +177,32 @@ where
 
     /// Number of `Ready` entries currently held. In-flight miss leaders are
     /// not counted.
+    ///
+    /// With more than one shard the per-shard locks are taken sequentially,
+    /// so the returned count is **not** snapshot-consistent across shards
+    /// against concurrent writers; treat it as a coarse gauge rather than a
+    /// transactional read.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// Equivalent to `self.len() == 0`.
+    /// Returns `true` when no `Ready` entry is currently held.
+    ///
+    /// Short-circuits on the first non-empty shard, so it is cheaper than
+    /// `self.len() == 0` when any shard has data; it shares the same
+    /// non-snapshot caveat as [`Self::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.inner.is_empty()
     }
 
-    /// Sum of [`Policy::weight`] over all `Ready` entries. Always ≤
-    /// [`Self::max_weight`].
+    /// Sum of [`Policy::weight`] over all `Ready` entries.
+    ///
+    /// With `shards == 1` the result is bounded by [`Self::max_weight`].
+    /// With more shards each one rounds its local cap up, so the sum may
+    /// exceed `max_weight` by up to `shards - 1` units of slack. Like
+    /// [`Self::len`], the sum is not snapshot-consistent across shards.
     #[must_use]
     pub fn weight(&self) -> u64 {
         self.inner.weight()
