@@ -10,3 +10,11 @@ tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+moka = { version = "0.12", default-features = false, features = ["sync"] }
+quick_cache = { version = "0.6", default-features = false }
+fastrand = "2"
+
+[[bench]]
+name = "compare_cache"
+harness = false
