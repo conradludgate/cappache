@@ -14,6 +14,16 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 quick_cache = { version = "0.6", default-features = false }
 fastrand = "2"
+# Trace-driven comparison harness. Path points at the in-tree fork of
+# moka-rs/mokabench (third-party/mokabench is a submodule); the `clache`
+# feature reaches back through `path = "../.."` to this crate.
+mokabench = { path = "third-party/mokabench", default-features = false, features = [
+    "clache",
+    "moka-v012",
+    "quick_cache",
+    "rt-tokio",
+] }
+anyhow = "1"
 
 [[bench]]
 name = "compare_cache"
