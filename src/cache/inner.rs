@@ -17,6 +17,7 @@ use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 /// clippy stops flagging `Inner::shards` for `type_complexity`).
 type Shard<K, V> = CachePadded<RwLock<State<K, V>>>;
 use std::hash::BuildHasher;
+
 use tokio::sync::watch;
 
 use crate::config::CacheConfig;
@@ -48,6 +49,41 @@ pub(crate) enum LaneOutcome<V, E> {
     Cancelled,
 }
 
+/// Common cache-side surface for an in-flight miss lane. The cache only
+/// needs to signal cancellation through this trait; the leader/follower
+/// publish-and-wait API is concrete on the typed flight (`publish_result` /
+/// `await_settled` for async, `publish` / `wait` for sync) so user-facing
+/// code keeps full type information for `(V, E)` or `V`.
+pub(crate) trait Flight: Any + Send + Sync {
+    fn cancel(&self);
+}
+
+/// Construction sibling of [`Flight`]: gives `install_or_join_lane` a way
+/// to mint a fresh lane without naming the concrete type at the call
+/// site. Both `MissFlight<V, E>` and `SyncMissFlight<V>` impl it.
+pub(crate) trait NewFlight: Flight + Sized {
+    fn fresh() -> Self;
+}
+
+impl<V, E> NewFlight for MissFlight<V, E>
+where
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
+    fn fresh() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> NewFlight for SyncMissFlight<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    fn fresh() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-(key, error type) coalescing point for `try_get_with`. Followers with
 /// the same `E` subscribe to the same flight; followers with a different `E`
 /// install their own lane and run their own `init`. Mirrors moka's typed miss
@@ -70,12 +106,8 @@ where
         Self { settle: tx }
     }
 
-    fn publish(&self, r: Result<V, E>) {
+    fn publish_result(&self, r: Result<V, E>) {
         let _ = self.settle.send(Some(LaneOutcome::Settled(r)));
-    }
-
-    fn cancel(&self) {
-        let _ = self.settle.send(Some(LaneOutcome::Cancelled));
     }
 
     /// `None` when the leader cancelled (sender published `Cancelled`, or
@@ -99,11 +131,22 @@ where
     }
 }
 
+impl<V, E> Flight for MissFlight<V, E>
+where
+    V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+{
+    fn cancel(&self) {
+        let _ = self.settle.send(Some(LaneOutcome::Cancelled));
+    }
+}
+
 /// Per-key Condvar-backed coalescing point for the sync
 /// `get_or_insert_with` path. Lives alongside the async
-/// [`MissFlight<V, E>`] entries in `State::inflight` under a sentinel
-/// [`TypeId`] so the same in-flight book-keeping serves both worlds
-/// without depending on the tokio runtime.
+/// [`MissFlight<V, E>`] entries in `State::inflight`, distinguished by the
+/// concrete `TypeId` of the flight type — sync followers downcast through
+/// [`InflightLane::downcast::<SyncMissFlight<V>>`] and so cannot
+/// accidentally join an async flight (and vice versa).
 pub(crate) struct SyncMissFlight<V>
 where
     V: Clone + Send + Sync + 'static,
@@ -135,14 +178,6 @@ where
         self.cond.notify_all();
     }
 
-    fn cancel(&self) {
-        let mut s = self.state.lock().expect("sync flight mutex poisoned");
-        if matches!(*s, SyncFlightState::Pending) {
-            *s = SyncFlightState::Cancelled;
-            self.cond.notify_all();
-        }
-    }
-
     /// Returns `Some(v)` once the leader publishes a value. Returns
     /// `None` when the leader cancelled (init future dropped or leader
     /// guard fired); the caller is then expected to re-enter the probe
@@ -161,47 +196,39 @@ where
     }
 }
 
-/// Sentinel `E` used to tag sync lanes alongside the typed
-/// `try_get_with` lanes. Lookups for a sync lane go through
-/// [`InflightLane::downcast_sync`], not the generic `downcast::<E>` —
-/// the marker exists purely so the `inflight` map can store both flight
-/// kinds in the same `Vec<InflightLane<V>>` without a separate map.
-struct SyncMarker;
+impl<V> Flight for SyncMissFlight<V>
+where
+    V: Clone + Send + Sync + 'static,
+{
+    fn cancel(&self) {
+        let mut s = self.state.lock().expect("sync flight mutex poisoned");
+        if matches!(*s, SyncFlightState::Pending) {
+            *s = SyncFlightState::Cancelled;
+            self.cond.notify_all();
+        }
+    }
+}
 
-/// One in-flight miss for a key. Lanes are matched by `TypeId<E>`; the
-/// `Arc<dyn Any + Send + Sync>` carries the typed `MissFlight<V, E>` for
-/// downcast on the follower side, and `cancel_fn` lets a future cancel-all
-/// path (e.g. `clear()`) cancel a flight without knowing `E` statically.
+/// One in-flight miss for a key. Lanes are matched by `TypeId<F>` (the
+/// concrete flight type, e.g. `MissFlight<V, E>` or `SyncMissFlight<V>`),
+/// and `flight` is type-erased through [`Any`] so the per-key vec can mix
+/// sync and async lanes uniformly. The `Flight` vtable lets cancel-all
+/// paths fire `cancel()` without knowing the concrete type statically.
 ///
-/// `_v` keeps the `V` parameter at the type level (needed by `downcast::<E>`
-/// to reconstruct the typed `MissFlight<V, E>`) without restricting `State`'s
-/// auto traits — `fn() -> V` is unconditionally `Send + Sync`.
+/// `_v` keeps `V` at the type level so `downcast::<F>` can reconstruct
+/// the typed flight without leaking `V` into `State`'s auto-trait set —
+/// `fn() -> V` is unconditionally `Send + Sync`.
 struct InflightLane<V> {
     type_id: TypeId,
     flight: Arc<dyn Any + Send + Sync>,
-    /// Type-erased cancel hook. Set per-lane (`cancel_typed::<V, E>` for
-    /// async, `cancel_sync::<V>` for sync) so `Cache::clear` and other
-    /// cancel-all paths can fire `LaneOutcome::Cancelled` without
-    /// reconstructing the concrete flight type.
+    /// Captured at construction so cancel goes through the `Flight` vtable
+    /// without the call site needing to name the concrete type.
     cancel_fn: fn(&Arc<dyn Any + Send + Sync>),
     _v: PhantomData<fn() -> V>,
 }
 
-fn cancel_typed<V, E>(a: &Arc<dyn Any + Send + Sync>)
-where
-    V: Clone + Send + Sync + 'static,
-    E: Clone + Send + Sync + 'static,
-{
-    if let Some(f) = (**a).downcast_ref::<MissFlight<V, E>>() {
-        f.cancel();
-    }
-}
-
-fn cancel_sync<V>(a: &Arc<dyn Any + Send + Sync>)
-where
-    V: Clone + Send + Sync + 'static,
-{
-    if let Some(f) = (**a).downcast_ref::<SyncMissFlight<V>>() {
+fn dispatch_cancel<F: Flight>(any: &Arc<dyn Any + Send + Sync>) {
+    if let Some(f) = (**any).downcast_ref::<F>() {
         f.cancel();
     }
 }
@@ -210,59 +237,33 @@ impl<V> InflightLane<V>
 where
     V: Clone + Send + Sync + 'static,
 {
-    fn new<E>(flight: Arc<MissFlight<V, E>>) -> Self
-    where
-        E: Clone + Send + Sync + 'static,
-    {
+    fn new<F: Flight>(flight: Arc<F>) -> Self {
         Self {
-            type_id: TypeId::of::<E>(),
+            type_id: TypeId::of::<F>(),
             flight: flight as Arc<dyn Any + Send + Sync>,
-            cancel_fn: cancel_typed::<V, E>,
+            cancel_fn: dispatch_cancel::<F>,
             _v: PhantomData,
         }
     }
 
-    fn downcast<E>(&self) -> Option<Arc<MissFlight<V, E>>>
-    where
-        E: Clone + Send + Sync + 'static,
-    {
-        if self.type_id != TypeId::of::<E>() {
+    fn downcast<F: Flight>(&self) -> Option<Arc<F>> {
+        if self.type_id != TypeId::of::<F>() {
             return None;
         }
-        Arc::clone(&self.flight)
-            .downcast::<MissFlight<V, E>>()
-            .ok()
-    }
-
-    fn new_sync(flight: Arc<SyncMissFlight<V>>) -> Self {
-        Self {
-            type_id: TypeId::of::<SyncMarker>(),
-            flight: flight as Arc<dyn Any + Send + Sync>,
-            cancel_fn: cancel_sync::<V>,
-            _v: PhantomData,
-        }
-    }
-
-    fn downcast_sync(&self) -> Option<Arc<SyncMissFlight<V>>> {
-        if self.type_id != TypeId::of::<SyncMarker>() {
-            return None;
-        }
-        Arc::clone(&self.flight)
-            .downcast::<SyncMissFlight<V>>()
-            .ok()
+        Arc::clone(&self.flight).downcast::<F>().ok()
     }
 
     /// Identity-only comparison: two lanes match if they wrap the same
-    /// `Arc<MissFlight<_, _>>` allocation. Used by `LeaderGuard` and the
-    /// leader's manual cleanup to avoid removing a fresh lane that replaced
-    /// the original.
+    /// `Arc<F>` allocation. Used by [`LeaderGuard`] and the leader's
+    /// manual cleanup to avoid removing a fresh lane that replaced the
+    /// original.
     fn ptr_eq_any(&self, other: &Arc<dyn Any + Send + Sync>) -> bool {
         Arc::as_ptr(&self.flight).cast::<()>() == Arc::as_ptr(other).cast::<()>()
     }
 
-    /// Type-erased cancel: fires `LaneOutcome::Cancelled` (async) /
-    /// signals the Condvar (sync) so any joined followers re-enter the
-    /// probe loop. Called by `Cache::clear` and other cancel-all paths.
+    /// Used by `Cache::clear` (and any other cancel-all paths) to signal
+    /// every follower waiting on this lane that the leader is gone, so
+    /// they re-enter the probe loop instead of blocking forever.
     fn cancel(&self) {
         (self.cancel_fn)(&self.flight);
     }
@@ -272,10 +273,9 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) config: CacheConfig<K, V, P>,
     /// Per-shard state, cache-padded to keep adjacent shards out of each
     /// other's cache lines. Single-key paths take exactly one shard's
-    /// `RwLock` — `.write()` for value-returning reads (`get`) because
-    /// they touch LRU / expiry / lifecycle state, `.read()` for
-    /// pure-observation surfaces (`contains_key`, `len`, `is_empty`,
-    /// `weight`); multi-key paths fold across all shards.
+    /// `RwLock` (mostly `.write()` because reads mutate LRU and expiry
+    /// state; pure read-only views — `contains_key`, `len`, `is_empty`,
+    /// `weight` — take `.read()`). Multi-key paths fold across all shards.
     ///
     /// `clashcore::lock::RwLock` is `lock_api::RwLock<RawRwLock, T>`: a
     /// single-CAS uncontended fast path with no poisoning. Releasing
@@ -386,7 +386,6 @@ fn entries_insert<K, V>(
     });
 }
 
-
 pub(crate) struct State<K, V> {
     /// Lookup table for `Ready` entries. Stores only `SlotId`; the key
     /// itself lives once on the slab as `EntrySlot::key`. Migrating from
@@ -446,10 +445,9 @@ struct EntrySlot<K, V> {
     /// Cached `Policy::weight` so eviction does not need to re-call the user policy.
     weight: u64,
     /// Bumped on every slot reuse. Heap tuples carry the generation at push time and
-    /// fail validation on pop after the slot has been recycled. `u64` is wide enough
-    /// that wraparound is unreachable on a real workload (would require ~10^11
-    /// reuses/sec for 50 years before overflowing), so the wrapping_add only exists
-    /// to keep the arithmetic well-defined.
+    /// fail validation on pop after the slot has been recycled. `u64` so the
+    /// counter cannot wrap inside any practical process lifetime; a wrapped
+    /// counter could revalidate a stale heap tuple that aliases the new slot.
     generation: u64,
     lru_prev: Option<SlotId>,
     lru_next: Option<SlotId>,
@@ -463,7 +461,8 @@ struct EntrySlot<K, V> {
 enum SlabEntry<K, V> {
     Occupied(EntrySlot<K, V>),
     /// `generation` is the generation of the **last** occupant; the next insert into
-    /// this slot uses `generation.wrapping_add(1)`.
+    /// this slot uses `generation.wrapping_add(1)`. `u64` matches the live
+    /// `EntrySlot::generation`.
     Free {
         next_free: Option<SlotId>,
         generation: u64,
@@ -532,7 +531,9 @@ impl<K, V> Slab<K, V> {
 
     /// Generation an `EntrySlot` should claim if installed at `idx` next.
     /// Returns `0` for a fresh tail-extension slot, or `prev_generation.wrapping_add(1)`
-    /// for an existing slot on the free list.
+    /// for an existing slot on the free list. The generation tag is the
+    /// first half of the stale-tuple gate in [`drain_expired`]; the
+    /// deadline equality check is the second.
     fn next_generation_for(&self, idx: u32) -> u64 {
         match self.slots.get(idx as usize) {
             Some(SlabEntry::Free { generation, .. }) => generation.wrapping_add(1),
@@ -544,9 +545,7 @@ impl<K, V> Slab<K, V> {
     /// [`Self::next_generation_for`] before the new `EntrySlot` is constructed.
     fn next_slot_index(&self) -> u32 {
         match self.free_head {
-            Some(id) => {
-                u32::try_from(id.to_index()).expect("slab capacity exceeds u32::MAX")
-            }
+            Some(id) => u32::try_from(id.to_index()).expect("slab capacity exceeds u32::MAX"),
             None => u32::try_from(self.slots.len()).expect("slab capacity exceeds u32::MAX"),
         }
     }
@@ -678,6 +677,8 @@ impl Ord for HeapKey {
 }
 
 impl PartialOrd for HeapKey {
+    // `BinaryHeap` calls through `Ord::cmp`, so this body is never
+    // exercised from the cache; required only to satisfy the trait.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -796,34 +797,25 @@ struct Reclaimed<K, V> {
     evicted: Vec<(K, V)>,
 }
 
-pub(crate) enum MissStep<V, E>
+/// Outcome of a single probe attempt on a miss-coalescing flight type `F`.
+/// `F` is `MissFlight<V, E>` for the async paths and `SyncMissFlight<V>`
+/// for the sync path; both share the Hit/Wait/Leader trichotomy.
+pub(crate) enum MissStep<V, F>
 where
-    V: Clone + Send + Sync + 'static,
-    E: Clone + Send + Sync + 'static,
-{
-    Hit(V),
-    Wait(Arc<MissFlight<V, E>>),
-    Leader { miss: Arc<MissFlight<V, E>> },
-}
-
-enum SyncMissStep<V>
-where
+    F: Flight,
     V: Clone + Send + Sync + 'static,
 {
     Hit(V),
-    Wait(Arc<SyncMissFlight<V>>),
-    Leader { miss: Arc<SyncMissFlight<V>> },
+    Wait(Arc<F>),
+    Leader { miss: Arc<F> },
 }
 
 /// Identity-only lane removal. Compares Arc pointer addresses; ignores any
 /// fresh lane installed for the same key by an unrelated leader (cancelled
 /// then re-entered). If the per-key vec becomes empty the entry is dropped to
 /// keep `inflight` from accumulating dead keys.
-fn remove_lane<K, V>(
-    st: &mut State<K, V>,
-    key: &K,
-    flight: &Arc<dyn Any + Send + Sync>,
-) where
+fn remove_lane<K, V>(st: &mut State<K, V>, key: &K, flight: &Arc<dyn Any + Send + Sync>)
+where
     K: Eq + Hash,
     V: Clone + Send + Sync + 'static,
 {
@@ -835,32 +827,63 @@ fn remove_lane<K, V>(
     }
 }
 
-/// RAII cleanup for the `try_get_with` leader. On drop (cancel or panic),
-/// removes the lane (identified by Arc identity, so we won't disturb a
-/// follower-installed replacement) and broadcasts `LaneOutcome::Cancelled` so
-/// any follower waiting on this exact flight retries instead of blocking
-/// forever on a sender that will never publish.
-struct LeaderGuard<'a, K, V, E, P>
+/// Searches `inflight[key]` for a lane of concrete flight type `F`.
+/// Returns `Wait(lane)` if a follower can join the existing leader,
+/// otherwise installs a fresh `F` lane and returns `Leader { miss }`.
+/// Type discrimination is by `TypeId<F>`, so an async (`MissFlight<V, E>`)
+/// and sync (`SyncMissFlight<V>`) lane for the same key never join each
+/// other.
+fn install_or_join_lane<K, V, F>(st: &mut State<K, V>, key: &K) -> MissStep<V, F>
 where
+    K: Eq + Hash + Clone + 'static,
+    V: Clone + Send + Sync + 'static,
+    F: Flight + NewFlight,
+{
+    if let Some(lanes) = st.inflight.get(key)
+        && let Some(lane) = lanes.iter().find_map(InflightLane::downcast::<F>)
+    {
+        return MissStep::Wait(lane);
+    }
+
+    let miss = Arc::new(F::fresh());
+    st.inflight
+        .entry(key.clone())
+        .or_default()
+        .push(InflightLane::new(Arc::clone(&miss)));
+    MissStep::Leader { miss }
+}
+
+/// RAII cleanup for any miss-coalescing leader. On drop (cancel or panic),
+/// removes the lane (identified by Arc identity, so we won't disturb a
+/// follower-installed replacement) and dispatches `Flight::cancel` so any
+/// follower waiting on this exact flight retries instead of blocking
+/// forever on a sender / Condvar that will never publish.
+///
+/// One generic guard covers both `try_get_with` (`F = MissFlight<V, E>`)
+/// and `get_or_insert_with` (`F = SyncMissFlight<V>`); the only
+/// per-flight behaviour difference is the cancellation channel, which is
+/// already abstracted by `Flight::cancel`.
+struct LeaderGuard<'a, F, K, V, P>
+where
+    F: Flight,
     K: Eq + Hash + 'static,
     V: Clone + Send + Sync + 'static,
-    E: Clone + Send + Sync + 'static,
     P: 'static,
 {
     inner: &'a Inner<K, V, P>,
     key: &'a K,
-    flight: Arc<MissFlight<V, E>>,
+    flight: Arc<F>,
     /// Type-erased view of `flight`, kept alongside so identity comparison
-    /// against stored lanes does not need to know `E` at the call site.
+    /// against stored lanes does not need to know `F` at the call site.
     flight_any: Arc<dyn Any + Send + Sync>,
     armed: bool,
 }
 
-impl<K, V, E, P> Drop for LeaderGuard<'_, K, V, E, P>
+impl<F, K, V, P> Drop for LeaderGuard<'_, F, K, V, P>
 where
+    F: Flight,
     K: Eq + Hash + 'static,
     V: Clone + Send + Sync + 'static,
-    E: Clone + Send + Sync + 'static,
     P: 'static,
 {
     fn drop(&mut self) {
@@ -878,46 +901,15 @@ where
     }
 }
 
-/// RAII cleanup for the sync `get_or_insert_with` leader. Mirror of
-/// [`LeaderGuard`] but parameterised over the Condvar-backed
-/// [`SyncMissFlight`]; on cancel/panic it removes the lane and signals
-/// any sync followers to retry.
-struct SyncLeaderGuard<'a, K, V, P>
-where
-    K: Eq + Hash + 'static,
-    V: Clone + Send + Sync + 'static,
-    P: 'static,
-{
-    inner: &'a Inner<K, V, P>,
-    key: &'a K,
-    flight: Arc<SyncMissFlight<V>>,
-    flight_any: Arc<dyn Any + Send + Sync>,
-    armed: bool,
-}
-
-impl<K, V, P> Drop for SyncLeaderGuard<'_, K, V, P>
-where
-    K: Eq + Hash + 'static,
-    V: Clone + Send + Sync + 'static,
-    P: 'static,
-{
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut st = self.inner.shard_for(self.key).write();
-        remove_lane(&mut st, self.key, &self.flight_any);
-        drop(st);
-        self.flight.cancel();
-    }
-}
-
 /// Removes the slab slot at `id` and the matching `entries` map row, drops it
 /// from the LRU list, and returns the owned `(K, V)` plus the entry's cached
 /// weight (already subtracted from `total_weight`). Returns `None` if the
 /// slot was already free (defensive — should not happen under our invariants).
 /// Stale tuples in `state.expiry` are not removed here; lazy validation on
-/// pop discards them once the slot is recycled.
+/// pop discards them once the slot is recycled. Stale `entries` rows are
+/// likewise self-cleaned by the `slab.get(id).is_some_and(...)` filter
+/// inside [`entries_find`] — so even if a bucket walk misses the row
+/// to remove, no probe will ever return a value for a freed slot.
 fn evict_slot<K, V>(
     st: &mut State<K, V>,
     hasher: &DefaultHashBuilder,
@@ -1130,8 +1122,7 @@ where
             let generation = es.generation;
             // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
             // (mutable) don't overlap, so the borrow checker accepts both.
-            let update =
-                update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
+            let update = update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
             (value, generation, update)
         };
         if let Some(dl) = update.new_deadline {
@@ -1158,9 +1149,9 @@ where
             .is_some_and(|es| entry_is_served(&es.entry, now))
     }
 
-    /// Sums per-shard `slab.len()`. Briefly takes each shard's lock in
-    /// turn; not snapshot-consistent under concurrent mutation, but each
-    /// shard's contribution is taken atomically.
+    /// Sums per-shard `slab.len()`. Briefly takes each shard's read lock
+    /// in turn; not snapshot-consistent under concurrent mutation, but
+    /// each shard's contribution is taken atomically.
     pub(crate) fn len(&self) -> usize {
         self.shards.iter().map(|s| s.read().slab.len()).sum()
     }
@@ -1215,8 +1206,7 @@ where
             // Cancel pending miss lanes before releasing the lock so
             // followers see Cancelled instead of waiting on a sender we
             // are about to drop.
-            let cancelled: Vec<Vec<InflightLane<V>>> =
-                inflight.drain().map(|(_, v)| v).collect();
+            let cancelled: Vec<Vec<InflightLane<V>>> = inflight.drain().map(|(_, v)| v).collect();
             drop(st);
 
             for lanes in &cancelled {
@@ -1431,26 +1421,36 @@ where
         (reclaimed, displaced)
     }
 
-    /// Single critical section for one `try_get_with` iteration: served hit, in-flight miss wait, or
-    /// install miss leader. Avoids TOCTOU between separate `get_served` / miss checks / leader insert.
-    fn miss_probe<E>(&self, key: &K) -> MissStep<V, E>
+    /// Acquires the shard write lock, drains an expired entry (if any),
+    /// promotes a still-live entry to MRU + pushes a refreshed read-side
+    /// expiry, then hands control to `then` with the held lock and the
+    /// hit (if any). The closure runs in the same critical section so
+    /// the install/join-lane decision sees no TOCTOU window between hit
+    /// detection and lane install.
+    ///
+    /// Releases and retakes the shard lock around the `TimeExpired`
+    /// lifecycle callback so observers may re-enter the cache. The
+    /// closure pattern keeps the [`RwLockWriteGuard`] type private to
+    /// this method so we do not need `lock_api` as a direct dep.
+    fn with_probe_for_hit<R>(
+        &self,
+        shard: &Shard<K, V>,
+        key: &K,
+        then: impl FnOnce(&mut State<K, V>, Option<V>) -> R,
+    ) -> R
     where
         K: 'static,
         V: 'static,
-        E: Clone + Send + Sync + 'static,
     {
-        let now = Instant::now();
-        let shard = self.shard_for(key);
         let mut st = shard.write();
 
+        let now = Instant::now();
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let expired = st
                 .slab
                 .get(id)
                 .is_some_and(|es| !entry_is_served(&es.entry, now));
-            if expired
-                && let Some((_, v, _)) = evict_slot(&mut st, &self.hasher, id)
-            {
+            if expired && let Some((_, v, _)) = evict_slot(&mut st, &self.hasher, id) {
                 drop(st);
                 self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
                 st = shard.write();
@@ -1458,6 +1458,7 @@ where
         }
 
         let now = Instant::now();
+        let mut hit = None;
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let still_served = st
                 .slab
@@ -1474,31 +1475,37 @@ where
                         .expect("just confirmed Occupied above under our mutex");
                     let value = es.entry.value.clone();
                     let generation = es.generation;
-                    let update =
-                        update_read_deadline(key, &mut es.entry, &self.config.policy, now);
+                    let update = update_read_deadline(key, &mut es.entry, &self.config.policy, now);
                     (value, generation, update)
                 };
                 if let Some(dl) = update.new_deadline {
                     expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
                 }
-                return MissStep::Hit(value);
+                hit = Some(value);
             }
         }
 
-        // No live Ready. Look for an in-flight lane with the same E and join
-        // it as a follower; otherwise install a fresh lane and become leader.
-        if let Some(lanes) = st.inflight.get(key)
-            && let Some(lane) = lanes.iter().find_map(InflightLane::downcast::<E>)
-        {
-            return MissStep::Wait(lane);
-        }
+        then(&mut st, hit)
+    }
 
-        let miss = Arc::new(MissFlight::<V, E>::new());
-        st.inflight
-            .entry(key.clone())
-            .or_default()
-            .push(InflightLane::new(Arc::clone(&miss)));
-        MissStep::Leader { miss }
+    /// Single critical section for one miss iteration on flight type `F`:
+    /// served hit, in-flight miss wait, or install miss leader. Avoids
+    /// TOCTOU between separate `get_served` / miss checks / leader insert.
+    /// Used by both `try_get_with` (`F = MissFlight<V, E>`) and
+    /// `get_or_insert_with` (`F = SyncMissFlight<V>`).
+    fn miss_probe<F>(&self, key: &K) -> MissStep<V, F>
+    where
+        K: Eq + Hash + Clone + 'static,
+        V: Clone + Send + Sync + 'static,
+        F: Flight + NewFlight,
+    {
+        let shard = self.shard_for(key);
+        self.with_probe_for_hit(shard, key, |st, hit| {
+            if let Some(v) = hit {
+                return MissStep::Hit(v);
+            }
+            install_or_join_lane::<K, V, F>(st, key)
+        })
     }
 
     pub(crate) async fn try_get_with<F, Fut, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
@@ -1511,7 +1518,7 @@ where
     {
         let mut init = Some(init);
         loop {
-            match self.miss_probe::<E>(&key) {
+            match self.miss_probe::<MissFlight<V, E>>(&key) {
                 MissStep::Hit(v) => return Ok(v),
                 MissStep::Wait(f) => {
                     if let Some(res) = f.await_settled().await {
@@ -1526,7 +1533,7 @@ where
                         .expect("init consumed: only the leader arm consumes it");
                     let flight_any: Arc<dyn Any + Send + Sync> =
                         Arc::clone(&miss) as Arc<dyn Any + Send + Sync>;
-                    let mut guard = LeaderGuard {
+                    let mut guard = LeaderGuard::<MissFlight<V, E>, K, V, P> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
@@ -1549,7 +1556,7 @@ where
                     // immediately calls `get(key)` cannot observe a state
                     // where the value was reported settled but is not yet
                     // installed in `entries`.
-                    guard.flight.publish(res.clone());
+                    guard.flight.publish_result(res.clone());
                     guard.armed = false;
                     drop(guard);
                     drop(st);
@@ -1570,76 +1577,6 @@ where
         }
     }
 
-    /// Sync mirror of [`Self::miss_probe`]: returns a hit, a follower
-    /// flight to wait on, or installs a fresh sync-leader lane. Sync and
-    /// async flights coexist in the same `inflight` map under a sentinel
-    /// `TypeId`, so a sync caller never joins an async leader (and vice
-    /// versa) — both kinds run their own `init` if no compatible
-    /// follower is found, matching the typed-lanes semantics.
-    fn sync_miss_probe(&self, key: &K) -> SyncMissStep<V>
-    where
-        K: Eq + Hash + Clone,
-        V: Clone + Send + Sync + 'static,
-    {
-        let now = Instant::now();
-        let shard = self.shard_for(key);
-        let mut st = shard.write();
-
-        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
-            let expired = st
-                .slab
-                .get(id)
-                .is_some_and(|es| !entry_is_served(&es.entry, now));
-            if expired
-                && let Some((_, v, _)) = evict_slot(&mut st, &self.hasher, id)
-            {
-                drop(st);
-                self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
-                st = shard.write();
-            }
-        }
-
-        let now = Instant::now();
-        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
-            let still_served = st
-                .slab
-                .get(id)
-                .is_some_and(|es| entry_is_served(&es.entry, now));
-            if still_served {
-                let (value, generation, update) = {
-                    let State {
-                        slab, evict_list, ..
-                    } = &mut *st;
-                    evict_list.promote_to_mru(slab, id);
-                    let es = slab
-                        .get_mut(id)
-                        .expect("just confirmed Occupied above under our mutex");
-                    let value = es.entry.value.clone();
-                    let generation = es.generation;
-                    let update =
-                        update_read_deadline(key, &mut es.entry, &self.config.policy, now);
-                    (value, generation, update)
-                };
-                if let Some(dl) = update.new_deadline {
-                    expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
-                }
-                return SyncMissStep::Hit(value);
-            }
-        }
-
-        if let Some(lanes) = st.inflight.get(key)
-            && let Some(lane) = lanes.iter().find_map(InflightLane::downcast_sync)
-        {
-            return SyncMissStep::Wait(lane);
-        }
-
-        let miss = Arc::new(SyncMissFlight::<V>::new());
-        st.inflight
-            .entry(key.clone())
-            .or_default()
-            .push(InflightLane::new_sync(Arc::clone(&miss)));
-        SyncMissStep::Leader { miss }
-    }
 
     /// Sync miss-coalescing entry point. The user closure runs **without**
     /// the shard lock held, so the cache stays responsive on other keys
@@ -1657,22 +1594,22 @@ where
     {
         let mut init = Some(init);
         loop {
-            match self.sync_miss_probe(&key) {
-                SyncMissStep::Hit(v) => return v,
-                SyncMissStep::Wait(f) => {
+            match self.miss_probe::<SyncMissFlight<V>>(&key) {
+                MissStep::Hit(v) => return v,
+                MissStep::Wait(f) => {
                     if let Some(v) = f.wait() {
                         return v;
                     }
                     // Leader cancelled — its lane is gone; loop and either
                     // observe a fresh value or take leadership ourselves.
                 }
-                SyncMissStep::Leader { miss } => {
+                MissStep::Leader { miss } => {
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
                     let flight_any: Arc<dyn Any + Send + Sync> =
                         Arc::clone(&miss) as Arc<dyn Any + Send + Sync>;
-                    let mut guard = SyncLeaderGuard {
+                    let mut guard = LeaderGuard::<SyncMissFlight<V>, K, V, P> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
@@ -1786,7 +1723,9 @@ fn entry_is_served<V>(e: &CacheEntry<V>, now: Instant) -> bool {
 /// set huge weight budgets: once the per-entry `Policy::weight` is `≥ 1`,
 /// total entry count is bounded by `max_weight`, but we still cap the
 /// *allocation* here because the configured budget is a weight unit, not
-/// necessarily an entry count.
+/// necessarily an entry count. Pure pre-allocation hint — both the
+/// hashtable and slab grow on demand, so the exact value only affects
+/// the cost of the first few inserts.
 const CAPACITY_HINT_CAP: u64 = 1 << 20;
 
 fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
@@ -1855,17 +1794,19 @@ mod size_regressions {
         assert_eq!(std::mem::size_of::<SlotId>(), 4);
     }
 
-    /// Bound `EntrySlot<String, String>` to a portable upper budget.
-    /// Composition: two `String`s (48) + `CacheEntry<String>` worst case
-    /// 64 (`String` 24 + `Instant` 16 + `Option<Instant>` 24) + `weight`
-    /// 8 + `generation` 8 + two `Option<SlotId>` 8 (niche-packed via
-    /// `NonZeroU32`) + `refresh_inflight` 1 byte rounded for alignment.
-    /// Real targets sit well under this (e.g. macOS aarch64 ≈ 104,
-    /// `x86_64` Linux ≈ 136); the budget catches regressions like the
-    /// niche being lost or LRU links doubling without locking the size
-    /// to a single platform.
+    /// Lock the `EntrySlot` shape for a representative `<String, String>`
+    /// cache against an upper bound rather than an exact byte count, so
+    /// the test stays useful across platforms (`Instant` differs in size
+    /// between macOS arm64 and `x86_64` / Linux). The load-bearing claim
+    /// is "the LRU links cost 8 bytes total, not 16, because
+    /// `Option<SlotId>` is niche-packed" plus "we did not accidentally
+    /// double-bump a field width".
     #[test]
     fn entry_slot_size_within_budget() {
+        // Two `String`s (48) + `CacheEntry<String>` worst-case 64 +
+        // `weight` 8 + `generation` 8 + two `Option<SlotId>` 8 (niche)
+        // + `refresh_inflight` 1 byte (rounded to alignment) gives a
+        // platform-portable upper bound.
         const BUDGET: usize = 144;
         let observed = std::mem::size_of::<EntrySlot<String, String>>();
         assert!(
@@ -1878,10 +1819,11 @@ mod size_regressions {
 
 #[cfg(test)]
 mod shard_tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::{CacheBuilder, DynPolicy};
     use crate::policy::{DefaultPolicy, Weight};
-    use std::sync::Arc;
 
     type K = String;
     type V = String;
@@ -1961,8 +1903,9 @@ mod shard_tests {
     /// transient batch since the last rebuild.
     #[test]
     fn heap_stays_bounded_under_read_extending_policy() {
-        use crate::policy::{IdleTimeout, Weight};
         use std::time::Duration;
+
+        use crate::policy::{IdleTimeout, Weight};
 
         let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(
             Duration::from_mins(1),
