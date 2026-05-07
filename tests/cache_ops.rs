@@ -614,6 +614,82 @@ mod revalidate_tests {
         );
     }
 
+    /// A panic in the initializer closure (before any future is even
+    /// constructed) must not wedge the per-slot `refresh_inflight` flag.
+    /// Without RAII cleanup the next `try_revalidate` returns
+    /// `SkippedInFlight` forever.
+    #[test]
+    fn try_revalidate_after_initializer_panic_can_be_resubmitted() {
+        let cache = test_cache();
+        let ex = CountingExecutor::default();
+        let k = "rev_panic".to_string();
+        cache.insert(k.clone(), "old".into());
+
+        let cache_ref = &cache;
+        let ex_ref = &ex;
+        let k_panic = k.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            cache_ref.try_revalidate(k_panic, ex_ref, |_| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, InitError>> + Send>,
+            > { panic!("init blew up") })
+        }));
+        assert!(result.is_err(), "panic should propagate to caller");
+
+        let r2 = cache.try_revalidate(k.clone(), &ex, |_| async move {
+            Ok::<_, InitError>("new".to_string())
+        });
+        assert_eq!(
+            r2,
+            Ok(RevalidateScheduled::Submitted),
+            "panic in init must clear refresh_inflight"
+        );
+    }
+
+    /// Captures `RefreshWork` and drops it without polling. Mimics a runtime
+    /// that shuts down before the spawned job runs.
+    #[derive(Clone, Default)]
+    struct DroppingExecutor {
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl<Fut> Executor<Fut> for DroppingExecutor
+    where
+        Fut: Future + Send + 'static,
+    {
+        fn execute(&self, fut: Fut) {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            drop(fut);
+        }
+    }
+
+    /// `RefreshWork::poll` is the only call site for `refresh_inflight_remove`,
+    /// so a future that is dropped without ever being polled would otherwise
+    /// strand the flag. `Drop` on `RefreshWork` clears it so the slot is
+    /// schedulable again.
+    #[test]
+    fn try_revalidate_when_refresh_work_dropped_unpolled_can_be_resubmitted() {
+        let cache = test_cache();
+        let ex = DroppingExecutor::default();
+        let k = "rev_dropped".to_string();
+        cache.insert(k.clone(), "old".into());
+
+        let r1 = cache.try_revalidate(k.clone(), &ex, |_| async move {
+            tokio::task::yield_now().await;
+            Ok::<_, InitError>("never_seen".to_string())
+        });
+        assert_eq!(r1, Ok(RevalidateScheduled::Submitted));
+        assert_eq!(ex.seen.load(Ordering::SeqCst), 1);
+
+        let counting = CountingExecutor::default();
+        let r2 = cache.try_revalidate(k, &counting, |_| async move {
+            Ok::<_, InitError>("after_drop".to_string())
+        });
+        assert_eq!(
+            r2,
+            Ok(RevalidateScheduled::Submitted),
+            "RefreshWork drop must clear refresh_inflight"
+        );
+    }
 }
 
 // Revalidate data plane: after `Submitted` and the executor runs `RefreshWork` to completion,
