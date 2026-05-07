@@ -657,9 +657,13 @@ mod revalidate_tests {
         let ex_ref = &ex;
         let k_panic = k.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            cache_ref.try_revalidate(k_panic, ex_ref, |_| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<String, InitError>> + Send>,
-            > { panic!("init blew up") })
+            cache_ref.try_revalidate(
+                k_panic,
+                ex_ref,
+                |_| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<String, InitError>> + Send>,
+                > { panic!("init blew up") },
+            )
         }));
         assert!(result.is_err(), "panic should propagate to caller");
 
@@ -2005,7 +2009,6 @@ mod insert_vs_leader {
     }
 }
 
-
 mod inflight_accounting {
     //! `len` and `weight` enumerate `Ready` slots only — a parked
     //! `try_get_with` leader has reserved an inflight lane but no slab
@@ -2049,7 +2052,6 @@ mod inflight_accounting {
         .await;
     }
 }
-
 
 mod clear_during_revalidate {
     //! `Cache::clear` runs while a `RefreshWork` is held by an executor that
