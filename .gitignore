@@ -1,2 +1,5 @@
 /target
 /mutants.out.old
+
+/mutants.out/*
+!/mutants.out/missed.txt
