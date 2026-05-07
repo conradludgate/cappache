@@ -43,11 +43,47 @@ impl<Fut: Future> Future for OkIntoResult<Fut> {
     }
 }
 
+/// RAII for [`Cache::try_revalidate`]: clears the per-slot `refresh_inflight`
+/// flag if the function unwinds (panicking `init`, panicking first poll, or
+/// panicking `Executor::execute`) before ownership of the flag is handed to
+/// the spawned [`RefreshWork`]. Disarmed on the success path; from there
+/// `RefreshWork::Drop` takes over.
+struct RefreshGuard<'a, K, V, P>
+where
+    K: Eq + Hash + 'static,
+    V: 'static,
+    P: 'static,
+{
+    inner: &'a Arc<inner::Inner<K, V, P>>,
+    key: &'a K,
+    armed: bool,
+}
+
+impl<K, V, P> Drop for RefreshGuard<'_, K, V, P>
+where
+    K: Eq + Hash + 'static,
+    V: 'static,
+    P: 'static,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.refresh_inflight_remove(self.key);
+        }
+    }
+}
+
 /// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by [`Cache::try_revalidate`].
+///
+/// `cleanup` is captured at construction (where the `K: Eq + Hash` bounds
+/// are in scope) and invoked from [`Drop`] to clear `refresh_inflight` if
+/// the executor drops the job without polling it to completion. `cleaned`
+/// short-circuits that path once `poll` reaches `Ready`.
 pub struct RefreshWork<K: 'static, V: 'static, E: 'static, P: 'static = DynPolicy<K, V>> {
     pub(crate) inner: Arc<inner::Inner<K, V, P>>,
     pub(crate) key: K,
     pub(crate) fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>>,
+    pub(crate) cleanup: fn(&inner::Inner<K, V, P>, &K),
+    pub(crate) cleaned: bool,
 }
 
 impl<K, V, E, P> Future for RefreshWork<K, V, E, P>
@@ -66,12 +102,28 @@ where
             Poll::Ready(Ok(v)) => {
                 this.inner.apply_refresh_ok(&this.key, v);
                 this.inner.refresh_inflight_remove(&this.key);
+                this.cleaned = true;
                 Poll::Ready(())
             }
             Poll::Ready(Err(_)) => {
                 this.inner.refresh_inflight_remove(&this.key);
+                this.cleaned = true;
                 Poll::Ready(())
             }
+        }
+    }
+}
+
+impl<K, V, E, P> Drop for RefreshWork<K, V, E, P>
+where
+    K: 'static,
+    V: 'static,
+    E: 'static,
+    P: 'static,
+{
+    fn drop(&mut self) {
+        if !self.cleaned {
+            (self.cleanup)(&self.inner, &self.key);
         }
     }
 }
@@ -302,12 +354,21 @@ where
             }
         }
 
+        // RAII: clear `refresh_inflight` if `init`, the first poll, or
+        // `executor.execute` panics or returns Err before ownership of the
+        // flag is transferred to the spawned `RefreshWork`. Disarm only on
+        // the "fully handed off" path.
+        let mut guard = RefreshGuard {
+            inner: &self.inner,
+            key: &key,
+            armed: true,
+        };
+
         let mut fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>> = Box::pin(init(&key));
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(Err(e)) => {
-                self.inner.refresh_inflight_remove(&key);
                 return Err(e);
             }
             Poll::Ready(Ok(v)) => {
@@ -317,10 +378,14 @@ where
             Poll::Pending => {}
         }
 
+        guard.armed = false;
+        drop(guard);
         executor.execute(RefreshWork {
             inner: Arc::clone(&self.inner),
             key,
             fut,
+            cleanup: |inner, key| inner.refresh_inflight_remove(key),
+            cleaned: false,
         });
         Ok(RevalidateScheduled::Submitted)
     }

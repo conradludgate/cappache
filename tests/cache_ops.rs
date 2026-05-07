@@ -108,6 +108,34 @@ where
     }
 }
 
+/// Counts `execute` calls and holds onto each submitted future (boxed as
+/// `Any`) so the cache observes a steady "in flight" job. Use this when
+/// asserting `SkippedInFlight` against a follow-up submission — dropping
+/// the future would clear `refresh_inflight` and let the second call
+/// return `Submitted` instead.
+#[derive(Clone, Default)]
+struct HoldingExecutor {
+    executed: Arc<AtomicUsize>,
+    held: Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>>,
+}
+
+impl HoldingExecutor {
+    fn executed_count(&self) -> usize {
+        self.executed.load(Ordering::SeqCst)
+    }
+}
+
+impl<Fut> Executor<Fut> for HoldingExecutor
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn execute(&self, fut: Fut) {
+        self.executed.fetch_add(1, Ordering::SeqCst);
+        self.held.lock().unwrap().push(Box::new(fut));
+    }
+}
+
 /// For `#[tokio::test]` only: schedules work on the test's **current-thread** runtime via [`tokio::spawn`].
 /// Drive completion with awaits / [`tokio::task::yield_now`] so spawned tasks run on that scheduler.
 #[derive(Clone, Copy, Default)]
@@ -435,7 +463,7 @@ mod revalidate_tests {
     #[test]
     fn try_revalidate_second_while_in_flight_skipped() {
         let cache = test_cache();
-        let ex = CountingExecutor::default();
+        let ex = HoldingExecutor::default();
         let k = "rev2".to_string();
         cache.insert(k.clone(), "old".into());
         let _ = cache
@@ -510,7 +538,7 @@ mod revalidate_tests {
     #[test]
     fn revalidate_skipped_when_try_in_flight() {
         let cache = test_cache();
-        let ex = CountingExecutor::default();
+        let ex = HoldingExecutor::default();
         let k = "rev_inf2".to_string();
         cache.insert(k.clone(), "old".into());
         let _ = cache

@@ -1019,6 +1019,23 @@ impl<K, V, P> Inner<K, V, P> {
         };
         &self.shards[idx]
     }
+
+    /// Clears the per-slot `refresh_inflight` flag for `key`. Best-effort:
+    /// if the slot has been evicted in the meantime there is nothing to
+    /// clear. Lives on the bound-free impl so cleanup paths
+    /// (`RefreshGuard`, `RefreshWork::Drop`) can invoke it without the
+    /// fuller `Policy<K, V>` bound the method-bearing impl carries.
+    pub(crate) fn refresh_inflight_remove(&self, key: &K)
+    where
+        K: Eq + Hash,
+    {
+        let mut st = self.shard_for(key).write();
+        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key)
+            && let Some(es) = st.slab.get_mut(id)
+        {
+            es.refresh_inflight = false;
+        }
+    }
 }
 
 impl<K, V, P> Inner<K, V, P>
@@ -1704,23 +1721,6 @@ where
         } else {
             es.refresh_inflight = true;
             RefreshGate::Submit
-        }
-    }
-
-    /// Clears the per-slot `refresh_inflight` flag once a refresh job
-    /// finishes (success, error, or future drop). Best-effort: if the slot
-    /// was evicted while the refresh was in flight there is nothing to
-    /// clear, which is fine — the next `try_revalidate` would land on a
-    /// different slot anyway.
-    pub(crate) fn refresh_inflight_remove(&self, key: &K)
-    where
-        K: Eq + Hash,
-    {
-        let mut st = self.shard_for(key).write();
-        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key)
-            && let Some(es) = st.slab.get_mut(id)
-        {
-            es.refresh_inflight = false;
         }
     }
 
