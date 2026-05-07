@@ -1,7 +1,5 @@
 use std::any::TypeId;
 use std::borrow::Borrow;
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
 use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,8 +7,8 @@ use std::time::Instant;
 use clashcore::CachePadded;
 use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
-use slotmap::Key;
 
+use super::expiry::{ExpiryHeap, drain_expired, expiry_push_extend};
 use super::flight::{
     Flight, InflightLane, LeaderGuard, MissFlight, MissStep, NewFlight, SyncMissFlight,
     install_or_join_lane, remove_lane,
@@ -181,7 +179,7 @@ pub(crate) struct State<K, V> {
     /// FIFO links. `slotmap` carries a per-slot version on the key;
     /// recycled slots produce a fresh [`SlotKey`] that no stale heap
     /// tuple or `entries` row will validate against.
-    slab: EntrySlab<K, V>,
+    pub(super) slab: EntrySlab<K, V>,
     /// S3-FIFO Small queue. New inserts land here at the head and age
     /// toward the tail. The reclaim path's `evict_from_small` decides
     /// per slot whether to promote into `main` (warm) or evict +
@@ -212,148 +210,16 @@ pub(crate) struct State<K, V> {
     /// deadline check covers read hooks that pushed a fresh tuple for the
     /// same live slot. Read-deadline updates always push a new tuple
     /// rather than mutating the old one.
-    expiry: ExpiryHeap,
+    pub(super) expiry: ExpiryHeap,
     /// Number of heap pushes that superseded a still-finite prior deadline
     /// for the same slot (i.e. left a stale tuple behind). Read-extending
     /// policies — `IdleTimeout`, custom `expire_after_read` hooks — can
     /// pile these up arbitrarily under read-heavy workloads. When the
     /// stale count exceeds the live slab size we rebuild the heap from
     /// scratch so memory stays bounded by `slab.len()`.
-    stale_pushes: u64,
+    pub(super) stale_pushes: u64,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
-}
-
-/// `(deadline, slot)` tuple stored in [`ExpiryHeap`]. Ordered by
-/// `deadline` so a `BinaryHeap<Reverse<HeapKey>>` yields earliest
-/// deadlines first; the slot's packed FFI form is a tiebreaker for
-/// total ordering only — the slotmap version inside [`SlotKey`] is what
-/// gates stale tuples on pop, not anything in the heap ordering.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct HeapKey {
-    deadline: Instant,
-    slot: SlotKey,
-}
-
-impl Ord for HeapKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.deadline
-            .cmp(&other.deadline)
-            .then_with(|| self.slot.data().as_ffi().cmp(&other.slot.data().as_ffi()))
-    }
-}
-
-impl PartialOrd for HeapKey {
-    // `BinaryHeap` calls through `Ord::cmp`, so this body is never
-    // exercised from the cache; required only to satisfy the trait.
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Default)]
-struct ExpiryHeap(BinaryHeap<Reverse<HeapKey>>);
-
-impl ExpiryHeap {
-    fn push(&mut self, deadline: Instant, slot: SlotKey) {
-        self.0.push(Reverse(HeapKey { deadline, slot }));
-    }
-
-    fn peek(&self) -> Option<HeapKey> {
-        self.0.peek().map(|Reverse(k)| *k)
-    }
-
-    fn pop(&mut self) -> Option<HeapKey> {
-        self.0.pop().map(|Reverse(k)| k)
-    }
-
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-/// Push a deadline tuple into the expiry heap and bump `stale_pushes`
-/// when the push leaves a previous (still-finite) tuple for the same slot
-/// behind. When stale tuples outnumber live entries the heap is rebuilt
-/// from the slab so memory stays bounded by `slab.len()`. Pure-`State`
-/// helper so it's reachable from both the read and miss-probe paths.
-fn expiry_push_extend<K, V>(
-    st: &mut State<K, V>,
-    deadline: Instant,
-    slot: SlotKey,
-    superseded_finite: bool,
-) {
-    st.expiry.push(deadline, slot);
-    if superseded_finite {
-        st.stale_pushes = st.stale_pushes.saturating_add(1);
-        // Rebuilding under the same lock keeps the invariant simple
-        // (no stale tuple ever escapes a probe) and is amortised: the
-        // trigger only fires once per `slab.len()` superseded pushes.
-        if st.stale_pushes > st.slab.len() as u64 {
-            rebuild_expiry(st);
-        }
-    }
-}
-
-/// Walk the slab and rebuild the expiry heap from the live deadline of
-/// each occupied slot. `stale_pushes` resets to 0; the new heap holds at
-/// most one tuple per live entry.
-fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
-    st.expiry.clear();
-    for (id, es) in &st.slab {
-        if let Some(dl) = es.entry.deadline {
-            st.expiry.push(dl, id);
-        }
-    }
-    st.stale_pushes = 0;
-}
-
-/// Drain entries whose materialised deadline is at or before `now`. Each
-/// validated tuple yields an `(K, V)` pair via [`evict_slot`]; stale tuples
-/// (slot recycled / deadline shifted by a read hook / already evicted) are
-/// silently dropped. Drains in `O(d log n)` where `d` is the number of
-/// past-deadline entries observed during this call.
-///
-/// `skip_key`, when set, suppresses eviction of the matching entry: the heap
-/// tuple is dropped (the caller is about to replace this slot anyway and
-/// will push a fresh tuple), but the existing slot is left in place so the
-/// caller can read its old value or fire a different lifecycle reason.
-fn drain_expired<K, V, H>(
-    st: &mut State<K, V>,
-    hasher: &H,
-    now: Instant,
-    skip_key: Option<&K>,
-) -> Vec<(K, V)>
-where
-    K: Eq + Hash,
-    H: BuildHasher,
-{
-    let mut out = Vec::new();
-    while let Some(top) = st.expiry.peek() {
-        if top.deadline > now {
-            break;
-        }
-        st.expiry.pop();
-        // `slab.get` returns `None` if the slot was evicted or recycled;
-        // the slotmap version on `top.slot` is the gate, no separate
-        // generation field needed. The deadline check still discards
-        // tuples that a read hook superseded for the same live slot.
-        let Some(es) = st.slab.get(top.slot) else {
-            continue;
-        };
-        if es.entry.deadline != Some(top.deadline) {
-            continue;
-        }
-        if let Some(skip) = skip_key
-            && &es.key == skip
-        {
-            continue;
-        }
-        if let Some((k, v, _)) = evict_slot(st, hasher, top.slot) {
-            out.push((k, v));
-        }
-    }
-    out
 }
 
 /// Result of a single [`Inner::reclaim`] pass. Split per lifecycle reason so
@@ -375,7 +241,7 @@ struct Reclaimed<K, V> {
 /// likewise self-cleaned by the `slab.get(id).is_some_and(...)` filter
 /// inside [`entries_find`] — so even if a bucket walk misses the row
 /// to remove, no probe will ever return a value for a freed slot.
-fn evict_slot<K, V, H>(
+pub(super) fn evict_slot<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
     id: SlotKey,
@@ -1569,7 +1435,7 @@ mod shard_tests {
 
         let st = inner.shards[0].write();
         let live = st.slab.len();
-        let heap_len = st.expiry.0.len();
+        let heap_len = st.expiry.len();
         assert!(
             heap_len <= 2 * live + 1,
             "expiry heap grew to {heap_len} for {live} live entries; rebuild trigger broken",

@@ -1,6 +1,7 @@
 //! In-memory concurrent cache: synchronous `get` / `insert` / `remove`, async miss path, and
 //! executor-driven refresh.
 
+mod expiry;
 mod flight;
 mod inner;
 mod slab;
