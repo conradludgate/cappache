@@ -61,13 +61,60 @@ unifies those `TypeId` keys.
 
 - `Cache::get_or_insert_with` is the sync counterpart to `get_with`. It single-flights through
 the same per-shard `inflight` map as `try_get_with`/`get_with`, but each lane carries a Condvar-backed
-`SyncMissFlight<V>` instead of a `tokio::sync::watch`. The shard `Mutex` is dropped before the user
+`SyncMissFlight<V>` instead of a `tokio::sync::watch`. The shard `RwLock` is dropped before the user
 closure runs, so other keys remain responsive while one key's leader produces a value.
-- Sync and async lanes are tagged by `TypeId<E>` (sentinel `SyncMarker` for sync), mirroring the
-typed-lanes design: a sync caller never joins an async leader (and vice versa); both kinds run
-their own `init` if no compatible follower is found.
+- Sync and async lanes share the same `inflight: HashMap<K, Vec<InflightLane<V>>>` map. Lane
+discrimination is by the concrete `TypeId<F>` of the flight type, where `F` implements the internal
+`Flight` trait (`MissFlight<V, E>` for `try_get_with`, `SyncMissFlight<V>` for `get_or_insert_with`).
+A sync caller never joins an async leader (and vice versa); both kinds run their own `init` if no
+compatible follower is found. There is no sentinel marker type: the concrete `TypeId<F>` *is* the
+distinction.
 - Do not call `get_or_insert_with` from a Tokio worker thread if the closure would itself block on
 that runtime — the current-thread block is a hard wait; prefer the async miss helpers there.
+
+## Typed lanes
+
+Miss coalescing splits flights by `(K, TypeId<F>)` where `F` is the concrete in-flight type:
+
+- `MissFlight<V, E>` for each error type `E` used by `try_get_with` callers. Two `try_get_with`
+  calls on the same key but with different `E` types do not share a leader — each runs its own
+  `init` and returns its own `Result<V, E>`. This avoids forcing a common error supertype across
+  unrelated callers and matches `moka`'s typed miss lanes.
+- `SyncMissFlight<V>` for `get_or_insert_with`. Sync lanes coexist with the async ones; the
+  `Flight` trait is the cancel-on-leader-drop interface (`watch::Sender::send(Cancelled)` for
+  async, Condvar `notify_all` for sync) so cross-shard cancel paths (`clear`, future cancel-all)
+  do not need to know which kind of flight they are tearing down.
+
+Lane install / follower-join is centralised in `install_or_join_lane::<F>(state, key)`; the
+read-side hit-detection (drain expired, MRU promote, push read-side expiry) is centralised in
+`Inner::with_probe_for_hit`. `Inner::miss_probe::<F>` glues both together inside one shard
+critical section so there is no TOCTOU window between hit detection and lane install.
+
+## Cross-shard `clear`
+
+`Cache::clear` walks `Inner::shards` in deterministic index order (`for shard in &self.shards`).
+Per shard:
+
+1. Take the shard's write lock.
+2. Drain the slab via the LRU tail walk into a `Vec<(K, V)>` (oldest-first inside the shard).
+3. Reset entries map, expiry heap, stale-push counter, total weight.
+4. Drain the in-flight lanes into a side vec.
+5. Release the shard lock.
+6. Cancel every drained `InflightLane` so any waiting follower returns `None` from `wait` /
+   `await_settled` and re-enters its probe loop.
+7. Fire `LifecycleReason::Removed` for each drained entry, in LRU-tail order.
+
+Implications callers can rely on:
+
+- `Removed` callbacks for keys in shard *i* fire before any callback for keys in shard *j > i*.
+- Within a shard, callback order is "LRU oldest first" — an implementation detail today, but the
+  cross-shard ordering above is the load-bearing invariant for tests and observers.
+- `clear` does not block follower threads waiting on cancelled lanes — they see the cancel signal
+  and re-probe, so a `clear` that races a `try_get_with` is safe even when the cleared key is the
+  one being initialised. The same shape is what makes
+  `clear_during_inflight_try_revalidate_does_not_wedge_flag` pass: the slot owning
+  `refresh_inflight` is evicted along with the rest, so the next `try_revalidate` sees a fresh
+  shard.
 
 ## Caller-driven `revalidate`
 

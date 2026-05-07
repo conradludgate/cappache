@@ -392,6 +392,18 @@ where
 
     /// Infallible wrapper around [`Self::try_revalidate`].
     ///
+    /// `revalidate` reuses the same job pipeline as [`Self::try_revalidate`]
+    /// but parameterises the spawned [`RefreshWork`] over [`Infallible`]
+    /// (the `init` future cannot fail). An executor that implements
+    /// `Executor<RefreshWork<K, V, E, P>>` for every `E` — for example a
+    /// blanket `impl<Fut: Future + Send + 'static> Executor<Fut> for
+    /// MyExecutor` — therefore covers both `try_revalidate` *and*
+    /// `revalidate` without any per-method specialisation. If you write an
+    /// executor with a concrete `Fut` type instead, you need both
+    /// `Executor<RefreshWork<K, V, MyError, P>>` and
+    /// `Executor<RefreshWork<K, V, Infallible, P>>` impls to use both
+    /// methods.
+    ///
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::try_revalidate`], and if an [`Infallible`] `Err`
