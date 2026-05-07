@@ -485,11 +485,9 @@ mod revalidate_tests {
     fn revalidate_absent_key_returns_absent_and_does_not_schedule() {
         let cache = test_cache();
         let ex = CountingExecutor::default();
-        let s = cache.revalidate(
-            "missing_inf".to_string(),
-            &ex,
-            |_key| async move { "never_run".to_string() },
-        );
+        let s = cache.revalidate("missing_inf".to_string(), &ex, |_key| async move {
+            "never_run".to_string()
+        });
         assert_eq!(s, RevalidateScheduled::AbsentKey);
         assert_eq!(ex.executed_count(), 0);
     }
@@ -589,6 +587,33 @@ mod revalidate_tests {
         })
         .await;
     }
+
+    /// A `try_revalidate` whose initializer fails must release the
+    /// per-slot in-flight flag so the caller can retry. The
+    /// successful sibling case is covered by the test above (which
+    /// resubmits after the executor completes); this one pins the
+    /// error path: a synchronously-failing first attempt must not
+    /// leave the slot wedged in `SkippedInFlight`.
+    #[test]
+    fn try_revalidate_after_initializer_error_can_be_resubmitted() {
+        let cache = test_cache();
+        let ex = CountingExecutor::default();
+        let k = "rev_err_clear".to_string();
+        cache.insert(k.clone(), "old".into());
+        let r1 = cache.try_revalidate(k.clone(), &ex, |_| async move {
+            Err::<String, InitError>(InitError(1))
+        });
+        assert_eq!(r1, Err(InitError(1)));
+        let r2 = cache.try_revalidate(k.clone(), &ex, |_| async move {
+            Ok::<_, InitError>("new".to_string())
+        });
+        assert_eq!(
+            r2,
+            Ok(RevalidateScheduled::Submitted),
+            "in-flight flag did not clear after the failed first revalidate"
+        );
+    }
+
 }
 
 // Revalidate data plane: after `Submitted` and the executor runs `RefreshWork` to completion,
@@ -655,6 +680,74 @@ mod lifecycle {
                     && val.as_ref() == Some(&"v".to_string())
             }),
             "expected Removed(tracked, Some(v)); got {evts:?}"
+        );
+    }
+
+    /// An entry that has expired but is still resident in the slab
+    /// fires `TimeExpired` (with the prior value) the first time
+    /// any subsequent operation triggers an opportunistic drain.
+    /// Here the drain runs as part of `reclaim` during a second
+    /// insert; the listener observes the expiry as a side-effect
+    /// of unrelated traffic.
+    #[test]
+    fn expired_entry_drained_by_subsequent_insert_emits_time_expired() {
+        let (listener, log) = RecordingListener::new_pair();
+        let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+        let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(Duration::ZERO, DefaultPolicy));
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(8))
+                .shards(1)
+                .policy(policy)
+                .lifecycle_listener(listener)
+                .build(),
+        );
+        cache.insert("k1".into(), "v1".into());
+        cache.insert("k2".into(), "v2".into());
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|(r, k, v)| {
+                *r == LifecycleReason::TimeExpired
+                    && k == "k1"
+                    && v.as_ref() == Some(&"v1".to_string())
+            }),
+            "expected TimeExpired(k1, Some(v1)); got {events:?}"
+        );
+    }
+
+    /// Replacing a key — even one whose deadline has already passed
+    /// — emits `Updated` with the prior value, never `TimeExpired`.
+    /// The opportunistic drain that runs alongside the install must
+    /// recognise the insert key and skip it so the lifecycle taxonomy
+    /// stays unambiguous: `Updated` always means "explicit replace by
+    /// the user", `TimeExpired` always means "deadline drove this".
+    #[test]
+    fn replacing_expired_key_emits_updated_not_time_expired() {
+        let (listener, log) = RecordingListener::new_pair();
+        let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+        let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(Duration::ZERO, DefaultPolicy));
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(8))
+                .shards(1)
+                .policy(policy)
+                .lifecycle_listener(listener)
+                .build(),
+        );
+        cache.insert("k".into(), "v1".into());
+        cache.insert("k".into(), "v2".into());
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|(r, k, v)| {
+                *r == LifecycleReason::Updated && k == "k" && v.as_ref() == Some(&"v1".to_string())
+            }),
+            "expected Updated(k, Some(v1)); got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(r, k, _)| *r == LifecycleReason::TimeExpired && k == "k"),
+            "TimeExpired must not fire for the key being replaced; got {events:?}"
         );
     }
 }
@@ -880,7 +973,44 @@ mod borrow_lookup {
         // insert would evict `b`; otherwise it evicts `a`.
         assert!(cache.contains_key("a"));
         cache.insert("c".into(), "vc".into());
-        assert_eq!(cache.get("a"), None, "contains_key must not have promoted a");
+        assert_eq!(
+            cache.get("a"),
+            None,
+            "contains_key must not have promoted a"
+        );
+    }
+
+    /// `get` *does* promote the touched entry to MRU. Pair with
+    /// `contains_key_does_not_promote_lru`: together they pin down
+    /// the asymmetry — only value-returning reads count as a "touch"
+    /// for LRU ordering.
+    #[test]
+    fn get_promotes_touched_entry_to_mru() {
+        let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
+        let cache = Cache::<K, V>::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(2))
+                .shards(1)
+                .policy(policy)
+                .build(),
+        );
+        cache.insert("a".into(), "va".into());
+        cache.insert("b".into(), "vb".into());
+        // Touching `a` promotes it; the next over-budget insert must
+        // now evict `b` (the new LRU) rather than `a`.
+        assert_eq!(cache.get("a"), Some("va".into()));
+        cache.insert("c".into(), "vc".into());
+        assert_eq!(
+            cache.get("a"),
+            Some("va".into()),
+            "get failed to promote a to MRU"
+        );
+        assert_eq!(
+            cache.get("b"),
+            None,
+            "b should have been evicted as the new LRU"
+        );
+        assert_eq!(cache.get("c"), Some("vc".into()));
     }
 }
 
@@ -1015,6 +1145,79 @@ mod cancellation {
             assert_eq!(cache.get(&key), Some("recovered".to_string()));
         })
         .await;
+    }
+
+    /// Sync sibling of `panicking_leader_lets_follower_progress`: a
+    /// panic from the closure passed to `get_or_insert_with` must
+    /// release the leader's inflight lane so a follow-up call can
+    /// install a value instead of joining a flight that will never
+    /// settle.
+    #[test]
+    fn panicking_sync_init_lets_next_caller_progress() {
+        let cache: Arc<Cache<K, V>> = Arc::new(test_cache());
+        let key = "sync_panic".to_string();
+        let panic_cache = Arc::clone(&cache);
+        let panic_key = key.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            panic_cache.get_or_insert_with(panic_key, |_| -> String { panic!("init blew up") });
+        }));
+        assert!(result.is_err(), "panic should propagate to the caller");
+        let v = cache.get_or_insert_with(key.clone(), |_| "recovered".to_string());
+        assert_eq!(v, "recovered");
+        assert_eq!(cache.get(&key), Some("recovered".to_string()));
+    }
+
+    /// A sync follower already blocked inside `get_or_insert_with`
+    /// must wake when the leader's initializer panics — the
+    /// leader's drop guard cancels the in-flight lane and signals
+    /// every Condvar waiter, who then re-enter the probe loop and
+    /// install their own value.
+    #[test]
+    fn panicking_sync_leader_lets_concurrent_follower_progress() {
+        use std::sync::{Barrier, mpsc};
+        use std::thread;
+
+        let cache: Arc<Cache<K, V>> = Arc::new(test_cache());
+        let key = "sync_panic_follower".to_string();
+        let leader_started = Arc::new(Barrier::new(2));
+        let release_leader = Arc::new(Barrier::new(2));
+
+        let c_leader = Arc::clone(&cache);
+        let k_leader = key.clone();
+        let started = Arc::clone(&leader_started);
+        let release = Arc::clone(&release_leader);
+        let leader = thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                c_leader.get_or_insert_with(k_leader, |_| -> String {
+                    started.wait();
+                    release.wait();
+                    panic!("sync init blew up");
+                });
+            }));
+        });
+
+        leader_started.wait();
+
+        let (tx, rx) = mpsc::channel();
+        let c_follow = Arc::clone(&cache);
+        let k_follow = key.clone();
+        let follower = thread::spawn(move || {
+            let v = c_follow.get_or_insert_with(k_follow, |_| "follower".to_string());
+            let _ = tx.send(v);
+        });
+
+        thread::sleep(Duration::from_millis(80));
+        release_leader.wait();
+        leader.join().expect("leader thread join");
+
+        let v = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("follower deadlocked: leader's panic did not signal sync waiters");
+        assert_eq!(
+            v, "follower",
+            "follower must install its own value once the leader's flight is cancelled"
+        );
+        follower.join().expect("follower thread join");
     }
 }
 
@@ -1162,6 +1365,87 @@ mod policy_time {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(out, "fresh");
             assert_eq!(cache.get(&k), Some("fresh".into()));
+        })
+        .await;
+    }
+
+    /// Read-extending policies (`IdleTimeout`) shift an entry's
+    /// deadline forward on every read, leaving the original heap
+    /// tuple stale. A subsequent unrelated write triggers
+    /// opportunistic drain of the heap; that drain must validate
+    /// the popped tuple against the live entry's *current* deadline
+    /// and skip it instead of evicting a still-fresh entry.
+    #[tokio::test]
+    async fn idle_timeout_does_not_evict_recently_read_entry_after_first_deadline_passes() {
+        with_timeout(Duration::from_secs(30), async {
+            let idle = Duration::from_millis(150);
+            let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
+            let cache = Cache::<K, V>::new(
+                CacheBuilder::new()
+                    .max_weight(Weight::new(8))
+                    .shards(1)
+                    .policy(policy)
+                    .build(),
+            );
+            cache.insert("k".into(), "v".into());
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(cache.get("k"), Some("v".to_string()));
+            // The original (~+150ms) deadline is now in the past;
+            // the read-extended deadline (~+230ms) is still ahead.
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            cache.insert("trigger".into(), "tv".into());
+            assert_eq!(
+                cache.get("k"),
+                Some("v".to_string()),
+                "stale heap tuple drove a spurious eviction of a still-live entry"
+            );
+        })
+        .await;
+    }
+
+    /// Sustained read traffic against `IdleTimeout` accumulates stale
+    /// heap tuples, which the cache periodically rebuilds from the
+    /// slab to keep memory bounded. After the rebuild, all entries
+    /// must remain individually reachable by deadline-driven
+    /// eviction: an unrelated insert triggered after every entry has
+    /// idled out fires a `TimeExpired` event for each.
+    #[tokio::test]
+    async fn idle_timeout_evicts_quiesced_entries_after_sustained_reads() {
+        with_timeout(Duration::from_secs(30), async {
+            let (listener, log) = RecordingListener::new_pair();
+            let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+            let idle = Duration::from_millis(80);
+            let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
+            let cache = Cache::<K, V>::new(
+                CacheBuilder::new()
+                    .max_weight(Weight::new(64))
+                    .shards(1)
+                    .policy(policy)
+                    .lifecycle_listener(listener)
+                    .build(),
+            );
+            for i in 0..4 {
+                cache.insert(format!("k{i}"), format!("v{i}"));
+            }
+            for _ in 0..32 {
+                for i in 0..4 {
+                    let _ = cache.get(&format!("k{i}"));
+                }
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cache.insert("trigger".into(), "tv".into());
+
+            let events = log.lock().unwrap().clone();
+            for i in 0..4 {
+                let key = format!("k{i}");
+                assert!(
+                    events
+                        .iter()
+                        .any(|(r, k, _)| *r == LifecycleReason::TimeExpired && *k == key),
+                    "expected TimeExpired({key}); got {events:?}"
+                );
+            }
         })
         .await;
     }
@@ -1352,6 +1636,27 @@ mod mutation_guards {
         assert!(cache.get("b").is_some());
         assert!(cache.get("c").is_some());
     }
+
+    /// Replacing a sole entry whose weight already exceeds the budget
+    /// must complete: there is nothing else to evict, and the install
+    /// path is allowed to leave the cache temporarily over-budget
+    /// (otherwise callers could never replace an oversized entry).
+    /// Regression guard for the `slab.len() <= 1` short-circuit in
+    /// `Inner::reclaim` — without it the eviction loop would try to
+    /// promote the entry being replaced back to MRU and never break.
+    #[test]
+    fn oversized_entry_can_be_replaced_when_it_alone_exceeds_budget() {
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(4))
+                .shards(1)
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        cache.insert("k".into(), "12345".into());
+        cache.insert("k".into(), "67890".into());
+        assert_eq!(cache.get("k"), Some("67890".into()));
+    }
 }
 
 mod deferred {
@@ -1368,5 +1673,125 @@ mod deferred {
             "TtlFromWrite(ZERO): expire_after_write is zero — get must not serve the entry once the \
              core compares deadline to now (see Policy docs)"
         );
+    }
+}
+
+mod clear {
+    //! `Cache::clear` resets the cache *and* unblocks any callers
+    //! currently waiting on a single-flight initializer. The contract
+    //! is: a caller that started before `clear()` must never deadlock
+    //! and must observe a fresh cache (its retry installs its own
+    //! value rather than receiving the pre-clear leader's eventual
+    //! result).
+
+    use super::*;
+
+    /// An in-flight `try_get_with` follower wakes when `clear()`
+    /// runs, retries against the now-empty cache, and installs its
+    /// own initializer's value. The leader is kept parked beyond
+    /// the assertion so the only path that can satisfy the
+    /// follower's await is the cancel signal from `clear()`.
+    #[tokio::test]
+    async fn clear_during_inflight_try_get_with_lets_follower_install_fresh_value() {
+        with_timeout(Duration::from_secs(10), async {
+            let cache = Arc::new(test_cache());
+            let key = "shared".to_string();
+            let leader_blocked = Arc::new(tokio::sync::Notify::new());
+            let release_leader = Arc::new(tokio::sync::Notify::new());
+
+            let c_leader = Arc::clone(&cache);
+            let k_leader = key.clone();
+            let blocked = Arc::clone(&leader_blocked);
+            let release = Arc::clone(&release_leader);
+            let leader = tokio::spawn(async move {
+                c_leader
+                    .try_get_with(k_leader, move || async move {
+                        blocked.notify_one();
+                        release.notified().await;
+                        Ok::<_, InitError>("leader".to_string())
+                    })
+                    .await
+            });
+            leader_blocked.notified().await;
+
+            let c_follow = Arc::clone(&cache);
+            let k_follow = key.clone();
+            let follower = tokio::spawn(async move {
+                c_follow
+                    .try_get_with(k_follow, || async move {
+                        Ok::<_, InitError>("follower".to_string())
+                    })
+                    .await
+            });
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            cache.clear();
+
+            let res = follower
+                .await
+                .expect("follower task panicked")
+                .expect("follower returned err");
+            assert_eq!(
+                res, "follower",
+                "follower must re-enter the probe loop and produce its own value, not the leader's"
+            );
+
+            release_leader.notify_one();
+            let _ = leader.await;
+        })
+        .await;
+    }
+
+    /// Sync sibling of the previous test: a thread blocked inside
+    /// `get_or_insert_with` must also wake when `clear()` runs and
+    /// install its own value on retry.
+    #[test]
+    fn clear_during_inflight_get_or_insert_with_lets_follower_install_fresh_value() {
+        use std::sync::{Barrier, mpsc};
+        use std::thread;
+
+        let cache: Arc<Cache<K, V>> = Arc::new(test_cache());
+        let key = "sync_clear_follower".to_string();
+        let leader_started = Arc::new(Barrier::new(2));
+        let release_leader = Arc::new(Barrier::new(2));
+
+        let c_leader = Arc::clone(&cache);
+        let k_leader = key.clone();
+        let started = Arc::clone(&leader_started);
+        let release = Arc::clone(&release_leader);
+        let leader = thread::spawn(move || {
+            c_leader.get_or_insert_with(k_leader, |_| {
+                started.wait();
+                release.wait();
+                "leader".to_string()
+            })
+        });
+
+        leader_started.wait();
+
+        let (tx, rx) = mpsc::channel();
+        let c_follow = Arc::clone(&cache);
+        let k_follow = key.clone();
+        let follower = thread::spawn(move || {
+            let v = c_follow.get_or_insert_with(k_follow, |_| "follower".to_string());
+            let _ = tx.send(v);
+        });
+
+        thread::sleep(Duration::from_millis(80));
+        cache.clear();
+
+        let v = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("follower deadlocked: clear() did not signal sync waiters");
+        assert_eq!(
+            v, "follower",
+            "sync follower must install its own value after the cancel-and-retry cycle"
+        );
+        follower.join().expect("follower thread");
+
+        release_leader.wait();
+        leader.join().expect("leader thread");
     }
 }

@@ -76,7 +76,9 @@ where
 /// Default shard count = next-power-of-two of available parallelism,
 /// minimum 1. Picked to spread per-shard contention across cores
 /// without inflating per-cache memory beyond what callers expect.
-/// Fall back to 1 when the runtime can't report parallelism.
+/// Fall back to 1 when the runtime can't report parallelism. Pure
+/// concurrency-tuning default — every value is functionally correct,
+/// only contention behaviour changes.
 fn default_shard_count() -> usize {
     std::thread::available_parallelism()
         .map_or(1, usize::from)
