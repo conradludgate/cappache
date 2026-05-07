@@ -1992,3 +1992,98 @@ mod insert_vs_leader {
     }
 }
 
+
+mod inflight_accounting {
+    //! `len` and `weight` enumerate `Ready` slots only — a parked
+    //! `try_get_with` leader has reserved an inflight lane but no slab
+    //! slot, so it must not show up in either count until the leader
+    //! actually publishes a value.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn len_and_weight_do_not_count_inflight_miss_leaders() {
+        with_timeout(Duration::from_secs(30), async {
+            let cache = Arc::new(test_cache());
+            let key = "inflight".to_string();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let c_leader = Arc::clone(&cache);
+            let k_leader = key.clone();
+            let leader = tokio::spawn(async move {
+                c_leader
+                    .try_get_with(k_leader, move || async move {
+                        let _ = entered_tx.send(());
+                        release_rx.await.expect("released");
+                        Ok::<_, ()>("v".to_string())
+                    })
+                    .await
+            });
+
+            entered_rx.await.expect("leader entered init");
+            assert_eq!(cache.len(), 0, "inflight leader must not count toward len");
+            assert_eq!(cache.weight(), 0, "inflight leader has no installed weight");
+            assert!(cache.is_empty(), "is_empty must agree with len/weight");
+
+            release_tx.send(()).expect("released");
+            let _ = leader.await.expect("leader join");
+
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.weight(), 1);
+            assert!(!cache.is_empty());
+        })
+        .await;
+    }
+}
+
+
+mod clear_during_revalidate {
+    //! `Cache::clear` runs while a `RefreshWork` is held by an executor that
+    //! has not polled it. Clearing the cache evicts the slot that owns the
+    //! `refresh_inflight` flag, so the next `try_revalidate` must not return
+    //! `SkippedInFlight` (it now sees a fresh slot or an absent key, both of
+    //! which are valid scheduling outcomes).
+
+    use super::*;
+
+    #[test]
+    fn clear_during_inflight_try_revalidate_does_not_wedge_flag() {
+        let cache = test_cache();
+        let ex = HoldingExecutor::default();
+        let k = "rev_clear".to_string();
+        cache.insert(k.clone(), "old".into());
+        let first = cache
+            .try_revalidate(k.clone(), &ex, |_| async move {
+                tokio::task::yield_now().await;
+                Ok::<_, InitError>("new".to_string())
+            })
+            .expect("first submit");
+        assert_eq!(first, RevalidateScheduled::Submitted);
+
+        cache.clear();
+
+        let second = cache
+            .try_revalidate(k.clone(), &ex, |_| async move {
+                Ok::<_, InitError>("post_clear".to_string())
+            })
+            .expect("second submit");
+        assert_eq!(
+            second,
+            RevalidateScheduled::AbsentKey,
+            "clear evicts the slot, so revalidate has no Ready entry to refresh"
+        );
+
+        cache.insert(k.clone(), "fresh".into());
+        let third = cache
+            .try_revalidate(k, &ex, |_| async move {
+                Ok::<_, InitError>("after_reinsert".to_string())
+            })
+            .expect("third submit");
+        assert_eq!(
+            third,
+            RevalidateScheduled::Submitted,
+            "newly inserted slot must be schedulable; flag must not have leaked across clear"
+        );
+    }
+}
