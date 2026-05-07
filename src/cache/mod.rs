@@ -1,7 +1,9 @@
 //! In-memory concurrent cache: synchronous `get` / `insert` / `remove`, async miss path, and
 //! executor-driven refresh.
 
+mod flight;
 mod inner;
+mod slab;
 
 use std::borrow::Borrow;
 use std::convert::Infallible;
