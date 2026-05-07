@@ -73,14 +73,6 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = Default
     pub(crate) shard_max_weight: u64,
 }
 
-/// Hash a key using the table's `BuildHasher`. Centralising the hash
-/// derivation guarantees insert and lookup hash the same bytes the same
-/// way; otherwise a `Borrow`-related mismatch would silently produce
-/// missed lookups.
-pub(super) fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
-    hasher.hash_one(key)
-}
-
 /// Inverse-fraction sizing for the S3-FIFO Small queue: per shard,
 /// `small_max_weight = shard_max_weight / SMALL_DENOMINATOR`. Yang et
 /// al. (SOSP'23) §4 default to S = 10%; the V1 mokabench validation
@@ -114,7 +106,7 @@ where
     Q: Hash + Eq + ?Sized,
     H: BuildHasher,
 {
-    let h = hash_key(hasher, key);
+    let h = hasher.hash_one(key);
     entries
         .find(h, |&id| {
             slab.get(id).is_some_and(|es| es.key.borrow() == key)
@@ -136,8 +128,7 @@ fn entries_insert<K, V, H>(
     H: BuildHasher,
 {
     entries.insert_unique(key_hash, id, |&other| {
-        hash_key(
-            hasher,
+        hasher.hash_one(
             &slab
                 .get(other)
                 .expect("entries refer only to occupied slots")
@@ -263,7 +254,7 @@ where
     if matches!(queue, Queue::Small) {
         *small_weight = small_weight.saturating_sub(entry_slot.weight);
     }
-    let h = hash_key(hasher, &entry_slot.key);
+    let h = hasher.hash_one(&entry_slot.key);
     if let Ok(occ) = entries.find_entry(h, |&other| other == id) {
         occ.remove();
     }
@@ -300,7 +291,7 @@ where
         ..
     } = st;
     let deadline = entry.deadline;
-    let key_hash = hash_key(hasher, &key);
+    let key_hash = hasher.hash_one(&key);
     // Ghost membership is consume-on-hit: a true return removes the
     // fingerprint and routes the entry into Main with freq=0.
     let to_main = ghost.remove(key_hash);
@@ -357,7 +348,7 @@ where
             // default hasher distributes well enough that the truncation
             // does not bias shard selection.
             #[allow(clippy::cast_possible_truncation)]
-            let h = hash_key(&self.hasher, key) as usize;
+            let h = self.hasher.hash_one(key) as usize;
             (h << 7) >> self.shard_shift
         };
         &self.shards[idx]

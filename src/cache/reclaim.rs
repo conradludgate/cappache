@@ -18,9 +18,7 @@ use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
 use super::expiry::drain_expired;
-use super::inner::{
-    Inner, SMALL_DENOMINATOR, State, entries_find, evict_slot, hash_key,
-};
+use super::inner::{Inner, SMALL_DENOMINATOR, State, entries_find, evict_slot};
 use super::slab::Queue;
 
 /// Result of a single [`reclaim`] pass. Split per lifecycle reason so the
@@ -129,7 +127,7 @@ where
         (
             &tail_slot.key == skip_key,
             tail_slot.freq,
-            hash_key(&inner.hasher, &tail_slot.key),
+            inner.hasher.hash_one(&tail_slot.key),
         )
     };
 
