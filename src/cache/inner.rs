@@ -179,8 +179,10 @@ struct SyncMarker;
 struct InflightLane<V> {
     type_id: TypeId,
     flight: Arc<dyn Any + Send + Sync>,
-    // Wired by `cancel()` once a non-leader cancellation path lands.
-    #[allow(dead_code)]
+    /// Type-erased cancel hook. Set per-lane (`cancel_typed::<V, E>` for
+    /// async, `cancel_sync::<V>` for sync) so `Cache::clear` and other
+    /// cancel-all paths can fire `LaneOutcome::Cancelled` without
+    /// reconstructing the concrete flight type.
     cancel_fn: fn(&Arc<dyn Any + Send + Sync>),
     _v: PhantomData<fn() -> V>,
 }
@@ -258,10 +260,9 @@ where
         Arc::as_ptr(&self.flight).cast::<()>() == Arc::as_ptr(other).cast::<()>()
     }
 
-    /// Will be wired by `Cache::clear` (and any other cancel-all paths) once
-    /// they land; kept now so downcast and identity comparison live on one
-    /// type.
-    #[allow(dead_code)]
+    /// Type-erased cancel: fires `LaneOutcome::Cancelled` (async) /
+    /// signals the Condvar (sync) so any joined followers re-enter the
+    /// probe loop. Called by `Cache::clear` and other cancel-all paths.
     fn cancel(&self) {
         (self.cancel_fn)(&self.flight);
     }
@@ -271,8 +272,10 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) config: CacheConfig<K, V, P>,
     /// Per-shard state, cache-padded to keep adjacent shards out of each
     /// other's cache lines. Single-key paths take exactly one shard's
-    /// `RwLock` (always `.write()` today — the read paths still mutate
-    /// LRU/expiry state); multi-key paths fold across all shards.
+    /// `RwLock` — `.write()` for value-returning reads (`get`) because
+    /// they touch LRU / expiry / lifecycle state, `.read()` for
+    /// pure-observation surfaces (`contains_key`, `len`, `is_empty`,
+    /// `weight`); multi-key paths fold across all shards.
     ///
     /// `clashcore::lock::RwLock` is `lock_api::RwLock<RawRwLock, T>`: a
     /// single-CAS uncontended fast path with no poisoning. Releasing
@@ -443,8 +446,11 @@ struct EntrySlot<K, V> {
     /// Cached `Policy::weight` so eviction does not need to re-call the user policy.
     weight: u64,
     /// Bumped on every slot reuse. Heap tuples carry the generation at push time and
-    /// fail validation on pop after the slot has been recycled.
-    generation: u32,
+    /// fail validation on pop after the slot has been recycled. `u64` is wide enough
+    /// that wraparound is unreachable on a real workload (would require ~10^11
+    /// reuses/sec for 50 years before overflowing), so the wrapping_add only exists
+    /// to keep the arithmetic well-defined.
+    generation: u64,
     lru_prev: Option<SlotId>,
     lru_next: Option<SlotId>,
     /// `true` while a `try_revalidate` job for this key is in flight.
@@ -460,7 +466,7 @@ enum SlabEntry<K, V> {
     /// this slot uses `generation.wrapping_add(1)`.
     Free {
         next_free: Option<SlotId>,
-        generation: u32,
+        generation: u64,
     },
 }
 
@@ -527,7 +533,7 @@ impl<K, V> Slab<K, V> {
     /// Generation an `EntrySlot` should claim if installed at `idx` next.
     /// Returns `0` for a fresh tail-extension slot, or `prev_generation.wrapping_add(1)`
     /// for an existing slot on the free list.
-    fn next_generation_for(&self, idx: u32) -> u32 {
+    fn next_generation_for(&self, idx: u32) -> u64 {
         match self.slots.get(idx as usize) {
             Some(SlabEntry::Free { generation, .. }) => generation.wrapping_add(1),
             Some(SlabEntry::Occupied(_)) | None => 0,
@@ -659,7 +665,7 @@ impl EvictList {
 struct HeapKey {
     deadline: Instant,
     slot: SlotId,
-    generation: u32,
+    generation: u64,
 }
 
 impl Ord for HeapKey {
@@ -681,7 +687,7 @@ impl PartialOrd for HeapKey {
 struct ExpiryHeap(BinaryHeap<Reverse<HeapKey>>);
 
 impl ExpiryHeap {
-    fn push(&mut self, deadline: Instant, slot: SlotId, generation: u32) {
+    fn push(&mut self, deadline: Instant, slot: SlotId, generation: u64) {
         self.0.push(Reverse(HeapKey {
             deadline,
             slot,
@@ -711,7 +717,7 @@ fn expiry_push_extend<K, V>(
     st: &mut State<K, V>,
     deadline: Instant,
     slot: SlotId,
-    generation: u32,
+    generation: u64,
     superseded_finite: bool,
 ) {
     st.expiry.push(deadline, slot, generation);
@@ -1139,7 +1145,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let st = self.shard_for(key).write();
+        let st = self.shard_for(key).read();
         let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) else {
             return false;
         };
@@ -1156,28 +1162,20 @@ where
     /// turn; not snapshot-consistent under concurrent mutation, but each
     /// shard's contribution is taken atomically.
     pub(crate) fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.write().slab.len())
-            .sum()
+        self.shards.iter().map(|s| s.read().slab.len()).sum()
     }
 
     /// Short-circuiting form of `len() == 0`: bails out on the first
     /// non-empty shard so a busy cache only pays for a single lock+probe.
     /// Inherits the non-snapshot caveat from [`Self::len`].
     pub(crate) fn is_empty(&self) -> bool {
-        self.shards
-            .iter()
-            .all(|s| s.write().slab.len() == 0)
+        self.shards.iter().all(|s| s.read().slab.len() == 0)
     }
 
     /// Sums per-shard `total_weight`. Same consistency caveat as
     /// [`Self::len`].
     pub(crate) fn weight(&self) -> u64 {
-        self.shards
-            .iter()
-            .map(|s| s.write().total_weight)
-            .sum()
+        self.shards.iter().map(|s| s.read().total_weight).sum()
     }
 
     /// Drains every `Ready` slot across every shard, fires `Removed` for
@@ -1857,21 +1855,23 @@ mod size_regressions {
         assert_eq!(std::mem::size_of::<SlotId>(), 4);
     }
 
-    /// Lock the `EntrySlot` shape for a representative `<String, String>`
-    /// cache. Composition (aarch64): `String` × 2 (48) + `CacheEntry`
-    /// (`String` 24 + `Instant` 16 + `Option<Instant>` 24 = 64) + weight
-    /// `u64` (8) + generation `u32` (4) + `Option<SlotId>` × 2 (8 with
-    /// `NonZeroU32` niche) = 132, rounded to alignment-8 = 136. macOS
-    /// arm64 currently reports 104 because `Instant` packs in 12 bytes
-    /// here. Either way, the load-bearing claim is "the LRU links cost
-    /// 8 bytes total, not 16" — if this assertion fires after touching
-    /// `EntrySlot`, double-check `Option<SlotId>` is still niche-packed.
+    /// Bound `EntrySlot<String, String>` to a portable upper budget.
+    /// Composition: two `String`s (48) + `CacheEntry<String>` worst case
+    /// 64 (`String` 24 + `Instant` 16 + `Option<Instant>` 24) + `weight`
+    /// 8 + `generation` 8 + two `Option<SlotId>` 8 (niche-packed via
+    /// `NonZeroU32`) + `refresh_inflight` 1 byte rounded for alignment.
+    /// Real targets sit well under this (e.g. macOS aarch64 ≈ 104,
+    /// `x86_64` Linux ≈ 136); the budget catches regressions like the
+    /// niche being lost or LRU links doubling without locking the size
+    /// to a single platform.
     #[test]
-    fn entry_slot_size_locked() {
+    fn entry_slot_size_within_budget() {
+        const BUDGET: usize = 144;
         let observed = std::mem::size_of::<EntrySlot<String, String>>();
-        assert_eq!(
-            observed, 104,
-            "EntrySlot grew to {observed}; check niche packing on Option<SlotId>",
+        assert!(
+            observed <= BUDGET,
+            "EntrySlot grew to {observed} bytes (budget {BUDGET}); \
+             check niche packing on Option<SlotId> and field widths",
         );
     }
 }

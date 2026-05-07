@@ -33,7 +33,10 @@ where
     /// cache construction; minimum 1. With `shards > 1` the observed
     /// total weight may exceed `max_weight` by up to `shards - 1` units
     /// of rounding slack — set to 1 for a strict global cap.
-    pub shards: usize,
+    ///
+    /// Crate-private: callers set this via [`CacheBuilder::shards`],
+    /// which clamps to a positive value before this field is populated.
+    pub(crate) shards: usize,
     pub(crate) lifecycle_listener: Option<Arc<dyn LifecycleListener<K, V> + Send + Sync>>,
     pub(crate) _marker: PhantomData<(K, V)>,
 }
