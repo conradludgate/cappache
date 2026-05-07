@@ -741,12 +741,14 @@ dependencies = [
 name = "mokabench"
 version = "0.10.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "async-io",
  "async-trait",
  "clache",
  "clap 3.2.25",
  "crossbeam-channel",
+ "foldhash 0.1.5",
  "futures-util",
  "itertools 0.11.0",
  "moka",
