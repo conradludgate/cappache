@@ -210,6 +210,44 @@ pub(crate) struct State<K, V> {
     pub(crate) total_weight: u64,
 }
 
+impl<K, V> State<K, V> {
+    /// Routes `Fifo::unlink` through the queue picked by `EntrySlot::queue`,
+    /// hiding the disjoint `&mut self.{small|main}` + `&mut self.slab`
+    /// borrow under one method call.
+    pub(super) fn queue_unlink(&mut self, queue: Queue, id: SlotKey) {
+        match queue {
+            Queue::Small => self.small.unlink(&mut self.slab, id),
+            Queue::Main => self.main.unlink(&mut self.slab, id),
+        }
+    }
+
+    /// Push `id` at the head of the queue picked by `queue`.
+    pub(super) fn queue_push_head(&mut self, queue: Queue, id: SlotKey) {
+        match queue {
+            Queue::Small => self.small.push_head(&mut self.slab, id),
+            Queue::Main => self.main.push_head(&mut self.slab, id),
+        }
+    }
+
+    /// Promote `id` to the head of its current queue (used by reclaim's
+    /// skip-key short-circuit when the skip slot surfaces at the tail).
+    pub(super) fn queue_promote_to_head(&mut self, queue: Queue, id: SlotKey) {
+        match queue {
+            Queue::Small => self.small.promote_to_head(&mut self.slab, id),
+            Queue::Main => self.main.promote_to_head(&mut self.slab, id),
+        }
+    }
+
+    /// Pop the tail of the queue picked by `queue`. Used by `clear` to
+    /// drain Main and Small in turn.
+    pub(super) fn queue_pop_tail(&mut self, queue: Queue) -> Option<SlotKey> {
+        match queue {
+            Queue::Small => self.small.pop_tail(&mut self.slab),
+            Queue::Main => self.main.pop_tail(&mut self.slab),
+        }
+    }
+}
+
 /// Removes the slab slot at `id` and the matching `entries` map row, drops it
 /// from whichever S3-FIFO queue it currently belongs to (consulted via
 /// `EntrySlot::queue`), and returns the owned `(K, V)` plus the entry's
@@ -230,32 +268,19 @@ where
     K: Eq + Hash,
     H: BuildHasher,
 {
-    let State {
-        entries,
-        slab,
-        small,
-        main,
-        small_weight,
-        total_weight,
-        ..
-    } = st;
-    let queue = slab.get(id)?.queue;
-    let fifo = match queue {
-        Queue::Small => small,
-        Queue::Main => main,
-    };
-    fifo.unlink(slab, id);
+    let queue = st.slab.get(id)?.queue;
+    st.queue_unlink(queue, id);
     // Take the slot out first so the entries removal can compare against
     // a slab that no longer holds `id` — the probe predicate uses
     // `slab.get(id)`, which now returns `None`, so we hash by the taken
     // entry's key and match buckets by `SlotKey` directly.
-    let entry_slot = slab.remove(id)?;
-    *total_weight = total_weight.saturating_sub(entry_slot.weight);
+    let entry_slot = st.slab.remove(id)?;
+    st.total_weight = st.total_weight.saturating_sub(entry_slot.weight);
     if matches!(queue, Queue::Small) {
-        *small_weight = small_weight.saturating_sub(entry_slot.weight);
+        st.small_weight = st.small_weight.saturating_sub(entry_slot.weight);
     }
     let h = hasher.hash_one(&entry_slot.key);
-    if let Ok(occ) = entries.find_entry(h, |&other| other == id) {
+    if let Ok(occ) = st.entries.find_entry(h, |&other| other == id) {
         occ.remove();
     }
     Some((entry_slot.key, entry_slot.entry.value, entry_slot.weight))
@@ -279,24 +304,13 @@ where
     K: Eq + Hash,
     H: BuildHasher,
 {
-    let State {
-        entries,
-        slab,
-        small,
-        main,
-        ghost,
-        small_weight,
-        expiry,
-        total_weight,
-        ..
-    } = st;
     let deadline = entry.deadline;
     let key_hash = hasher.hash_one(&key);
     // Ghost membership is consume-on-hit: a true return removes the
     // fingerprint and routes the entry into Main with freq=0.
-    let to_main = ghost.remove(key_hash);
+    let to_main = st.ghost.remove(key_hash);
     let queue = if to_main { Queue::Main } else { Queue::Small };
-    let id = slab.insert(EntrySlot {
+    let id = st.slab.insert(EntrySlot {
         key,
         entry,
         weight,
@@ -306,16 +320,14 @@ where
         fifo_next: None,
         refresh_inflight: false,
     });
-    if to_main {
-        main.push_head(slab, id);
-    } else {
-        small.push_head(slab, id);
-        *small_weight = small_weight.saturating_add(weight);
+    st.queue_push_head(queue, id);
+    if !to_main {
+        st.small_weight = st.small_weight.saturating_add(weight);
     }
-    entries_insert(entries, hasher, slab, id, key_hash);
-    *total_weight = total_weight.saturating_add(weight);
+    entries_insert(&mut st.entries, hasher, &st.slab, id, key_hash);
+    st.total_weight = st.total_weight.saturating_add(weight);
     if let Some(dl) = deadline {
-        expiry.push(dl, id);
+        st.expiry.push(dl, id);
     }
     id
 }
@@ -546,46 +558,30 @@ where
     {
         for shard in &self.shards {
             let mut st = shard.write();
-            let State {
-                entries,
-                inflight,
-                slab,
-                small,
-                main,
-                ghost,
-                small_weight,
-                expiry,
-                stale_pushes,
-                total_weight,
-                ..
-            } = &mut *st;
-            let mut drained: Vec<(K, V)> = Vec::with_capacity(slab.len());
+            let mut drained: Vec<(K, V)> = Vec::with_capacity(st.slab.len());
             // Deterministic drain order: Main first (warm tail-to-head),
             // then Small (cold tail-to-head). The order does not carry
             // an "oldest-first" meaning (S3-FIFO has no global recency
             // axis); it is documented purely so observers see a stable
             // sequence of `Removed` lifecycle events across runs.
-            while let Some(tail) = main.pop_tail(slab) {
-                if let Some(entry_slot) = slab.remove(tail) {
-                    drained.push((entry_slot.key, entry_slot.entry.value));
+            for queue in [Queue::Main, Queue::Small] {
+                while let Some(tail) = st.queue_pop_tail(queue) {
+                    if let Some(entry_slot) = st.slab.remove(tail) {
+                        drained.push((entry_slot.key, entry_slot.entry.value));
+                    }
                 }
             }
-            while let Some(tail) = small.pop_tail(slab) {
-                if let Some(entry_slot) = slab.remove(tail) {
-                    drained.push((entry_slot.key, entry_slot.entry.value));
-                }
-            }
-            ghost.clear();
-            entries.clear();
-            expiry.clear();
-            *stale_pushes = 0;
-            *total_weight = 0;
-            *small_weight = 0;
+            st.ghost.clear();
+            st.entries.clear();
+            st.expiry.clear();
+            st.stale_pushes = 0;
+            st.total_weight = 0;
+            st.small_weight = 0;
 
             // Cancel pending miss lanes before releasing the lock so
             // followers see Cancelled instead of waiting on a sender we
             // are about to drop.
-            let cancelled: Vec<InflightLane> = inflight.drain().map(|(_, v)| v).collect();
+            let cancelled: Vec<InflightLane> = st.inflight.drain().map(|(_, v)| v).collect();
             drop(st);
 
             for lane in &cancelled {

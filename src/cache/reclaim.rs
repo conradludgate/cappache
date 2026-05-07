@@ -135,29 +135,22 @@ where
         if st.slab.len() <= 1 {
             return false;
         }
-        let State { slab, small, .. } = &mut *st;
-        small.promote_to_head(slab, tail_id);
+        st.queue_promote_to_head(Queue::Small, tail_id);
         return true;
     }
 
     if freq > 1 {
         // Warm slot: migrate Small → Main with freq reset to 0.
-        let State {
-            slab,
-            small,
-            main,
-            small_weight,
-            ..
-        } = &mut *st;
-        small.unlink(slab, tail_id);
-        let es = slab
+        st.queue_unlink(Queue::Small, tail_id);
+        let es = st
+            .slab
             .get_mut(tail_id)
             .expect("Small tail must be occupied");
         let w = es.weight;
         es.queue = Queue::Main;
         es.freq = 0;
-        *small_weight = small_weight.saturating_sub(w);
-        main.push_head(slab, tail_id);
+        st.small_weight = st.small_weight.saturating_sub(w);
+        st.queue_push_head(Queue::Main, tail_id);
         true
     } else {
         // Cold slot: evict and seed ghost so a quick re-insert
@@ -199,8 +192,7 @@ where
         if st.slab.len() <= 1 {
             return false;
         }
-        let State { slab, main, .. } = &mut *st;
-        main.promote_to_head(slab, tail_id);
+        st.queue_promote_to_head(Queue::Main, tail_id);
         return true;
     }
 
@@ -208,11 +200,13 @@ where
         // Recirculate: decrement freq and reinsert at Main head.
         // Each Main slot is touched at most FREQ_CAP+1 times before
         // being forced to freq=0 and dropped, bounding loop work.
-        let State { slab, main, .. } = &mut *st;
-        main.unlink(slab, tail_id);
-        let es = slab.get_mut(tail_id).expect("Main tail must be occupied");
+        st.queue_unlink(Queue::Main, tail_id);
+        let es = st
+            .slab
+            .get_mut(tail_id)
+            .expect("Main tail must be occupied");
         es.freq = es.freq.saturating_sub(1);
-        main.push_head(slab, tail_id);
+        st.queue_push_head(Queue::Main, tail_id);
         true
     } else {
         // No second-chance seed: only Small evictions populate ghost.
