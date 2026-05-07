@@ -21,10 +21,10 @@
 use std::env;
 use std::path::PathBuf;
 
+use mokabench::config::Config;
 use mokabench::{
-    Report, TraceFile,
-    config::Config,
-    run_multi_threads_clache, run_multi_threads_moka_sync, run_multi_threads_quick_cache,
+    Report, TraceFile, run_multi_threads_clache, run_multi_threads_moka_sync,
+    run_multi_threads_quick_cache,
 };
 
 const NUM_CLIENTS: u16 = 8;
@@ -40,10 +40,7 @@ fn main() -> anyhow::Result<()> {
     let mokabench_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third-party/mokabench");
     env::set_current_dir(&mokabench_dir)?;
 
-    println!(
-        "{}",
-        Report::cvs_header(/* eviction_listener */ false)
-    );
+    println!("{}", Report::cvs_header(/* eviction_listener */ false));
 
     for name in trace_names {
         let trace = TraceFile::try_from(name)?;

@@ -182,5 +182,10 @@ fn bench_insert_cold(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_get_hit, bench_insert_churn, bench_insert_cold);
+criterion_group!(
+    benches,
+    bench_get_hit,
+    bench_insert_churn,
+    bench_insert_cold
+);
 criterion_main!(benches);
