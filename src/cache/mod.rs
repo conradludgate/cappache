@@ -4,6 +4,7 @@
 mod expiry;
 mod flight;
 mod inner;
+mod miss;
 mod reclaim;
 mod slab;
 
