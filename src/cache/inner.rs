@@ -2,14 +2,13 @@ use std::any::{Any, TypeId};
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::hash::Hash;
-use std::marker::PhantomData;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use clashcore::CachePadded;
 use clashcore::lock::RwLock;
-use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+use hashbrown::{DefaultHashBuilder, Equivalent, HashMap, HashTable};
 use slotmap::{Key, SlotMap};
 
 /// One cache-padded shard. Aliased so the verbose `CachePadded<RwLock<...>>`
@@ -144,9 +143,9 @@ where
 /// Per-key Condvar-backed coalescing point for the sync
 /// `get_or_insert_with` path. Lives alongside the async
 /// [`MissFlight<V, E>`] entries in `State::inflight`, distinguished by the
-/// concrete `TypeId` of the flight type — sync followers downcast through
-/// [`InflightLane::downcast::<SyncMissFlight<V>>`] and so cannot
-/// accidentally join an async flight (and vice versa).
+/// concrete `TypeId` of the flight type carried in the map's `(K, TypeId)`
+/// key — a sync follower's `(key, TypeId<SyncMissFlight<V>>)` lookup can
+/// never collide with an async lane (and vice versa).
 pub(crate) struct SyncMissFlight<V>
 where
     V: Clone + Send + Sync + 'static,
@@ -209,22 +208,18 @@ where
     }
 }
 
-/// One in-flight miss for a key. Lanes are matched by `TypeId<F>` (the
-/// concrete flight type, e.g. `MissFlight<V, E>` or `SyncMissFlight<V>`),
-/// and `flight` is type-erased through [`Any`] so the per-key vec can mix
-/// sync and async lanes uniformly. The `Flight` vtable lets cancel-all
-/// paths fire `cancel()` without knowing the concrete type statically.
-///
-/// `_v` keeps `V` at the type level so `downcast::<F>` can reconstruct
-/// the typed flight without leaking `V` into `State`'s auto-trait set —
-/// `fn() -> V` is unconditionally `Send + Sync`.
-struct InflightLane<V> {
-    type_id: TypeId,
+/// One in-flight miss flight. Type-erased through [`Any`] so the
+/// per-shard `inflight` map can mix sync and async lanes uniformly; the
+/// concrete flight type lives in the map's `(K, TypeId)` key, so a
+/// follower's `downcast::<F>` is infallible by invariant (the `Option`
+/// return is preserved purely as defensive API ergonomics). The
+/// [`Flight`] vtable lets cancel-all paths fire `cancel()` without
+/// knowing the concrete type statically.
+struct InflightLane {
     flight: Arc<dyn Any + Send + Sync>,
-    /// Captured at construction so cancel goes through the `Flight` vtable
-    /// without the call site needing to name the concrete type.
+    /// Captured at construction so cancel goes through the [`Flight`]
+    /// vtable without the call site needing to name the concrete type.
     cancel_fn: fn(&Arc<dyn Any + Send + Sync>),
-    _v: PhantomData<fn() -> V>,
 }
 
 fn dispatch_cancel<F: Flight>(any: &Arc<dyn Any + Send + Sync>) {
@@ -233,32 +228,16 @@ fn dispatch_cancel<F: Flight>(any: &Arc<dyn Any + Send + Sync>) {
     }
 }
 
-impl<V> InflightLane<V>
-where
-    V: Clone + Send + Sync + 'static,
-{
+impl InflightLane {
     fn new<F: Flight>(flight: Arc<F>) -> Self {
         Self {
-            type_id: TypeId::of::<F>(),
             flight: flight as Arc<dyn Any + Send + Sync>,
             cancel_fn: dispatch_cancel::<F>,
-            _v: PhantomData,
         }
     }
 
     fn downcast<F: Flight>(&self) -> Option<Arc<F>> {
-        if self.type_id != TypeId::of::<F>() {
-            return None;
-        }
         Arc::clone(&self.flight).downcast::<F>().ok()
-    }
-
-    /// Identity-only comparison: two lanes match if they wrap the same
-    /// `Arc<F>` allocation. Used by [`LeaderGuard`] and the leader's
-    /// manual cleanup to avoid removing a fresh lane that replaced the
-    /// original.
-    fn ptr_eq_any(&self, other: &Arc<dyn Any + Send + Sync>) -> bool {
-        Arc::as_ptr(&self.flight).cast::<()>() == Arc::as_ptr(other).cast::<()>()
     }
 
     /// Used by `Cache::clear` (and any other cancel-all paths) to signal
@@ -266,6 +245,36 @@ where
     /// they re-enter the probe loop instead of blocking forever.
     fn cancel(&self) {
         (self.cancel_fn)(&self.flight);
+    }
+}
+
+/// Borrowed lookup adapter for [`State::inflight`]. Pairs `&K` with the
+/// concrete flight `TypeId` so `inflight.get` / `inflight.remove` probe
+/// the `(K, TypeId)` map without cloning the key. Tuple `Hash` is just
+/// `K::hash` then `TypeId::hash` with no length prefix, so the byte
+/// stream produced here is identical to what an owned `(K, TypeId)`
+/// would produce, satisfying the [`Equivalent`] hash invariant.
+struct LaneKeyRef<'a, K> {
+    key: &'a K,
+    type_id: TypeId,
+}
+
+impl<'a, K> LaneKeyRef<'a, K> {
+    fn new(key: &'a K, type_id: TypeId) -> Self {
+        Self { key, type_id }
+    }
+}
+
+impl<K: Hash> Hash for LaneKeyRef<'_, K> {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.key.hash(h);
+        self.type_id.hash(h);
+    }
+}
+
+impl<K: Eq> Equivalent<(K, TypeId)> for LaneKeyRef<'_, K> {
+    fn equivalent(&self, key: &(K, TypeId)) -> bool {
+        self.key == &key.0 && self.type_id == key.1
     }
 }
 
@@ -398,13 +407,17 @@ pub(crate) struct State<K, V> {
     /// stored hash matches what `find` recomputes.
     ///
     /// In-flight miss leaders live in [`Self::inflight`] under their own
-    /// `(K, TypeId<E>)` lane so a `try_get_with::<…, E1>` call cannot
+    /// `(K, TypeId<F>)` lane so a `try_get_with::<…, E1>` call cannot
     /// deadlock waiting on a leader that will publish an unrelated `E2`.
     pub(crate) entries: HashTable<SlotKey>,
-    /// Per-key vector of in-flight miss lanes, deduped by the leader's `E`
-    /// type. Single lane is the common case; multiple lanes appear only when
-    /// concurrent `try_get_with` calls disagree on `E`.
-    inflight: HashMap<K, Vec<InflightLane<V>>>,
+    /// In-flight miss lanes keyed by `(K, TypeId<F>)`. At most one
+    /// leader per `(key, F)` pair: concurrent `try_get_with` calls that
+    /// agree on both `K` and `F = MissFlight<V, E>` follow the same
+    /// leader, while a disagreeing `E` (or the sync
+    /// `SyncMissFlight<V>` lane for the same key) installs its own row.
+    /// Borrowed lookups go through [`LaneKeyRef`] so `&K` paths do not
+    /// clone the key.
+    inflight: HashMap<(K, TypeId), InflightLane>,
     /// Backing storage for `Ready` entries. The slab owns `CacheEntry`,
     /// the back-reference key, the cached weight, and the intrusive LRU links.
     /// `slotmap` carries a per-slot version on the key; recycled slots
@@ -674,46 +687,47 @@ where
     Leader { miss: Arc<F> },
 }
 
-/// Identity-only lane removal. Compares Arc pointer addresses; ignores any
-/// fresh lane installed for the same key by an unrelated leader (cancelled
-/// then re-entered). If the per-key vec becomes empty the entry is dropped to
-/// keep `inflight` from accumulating dead keys.
-fn remove_lane<K, V>(st: &mut State<K, V>, key: &K, flight: &Arc<dyn Any + Send + Sync>)
+/// Identity-aware lane removal. The `(K, TypeId)` key locates the row
+/// uniquely, but we still gate the actual removal on `Arc` pointer
+/// identity so a fresh lane installed for the same `(key, F)` between
+/// leader-takes-lock and leader-runs-cleanup (cancelled then
+/// re-entered) is not disturbed.
+fn remove_lane<K, V>(st: &mut State<K, V>, key: &K, type_id: TypeId, flight_ptr: *const ())
 where
     K: Eq + Hash,
-    V: Clone + Send + Sync + 'static,
 {
-    if let Some(lanes) = st.inflight.get_mut(key) {
-        lanes.retain(|lane| !lane.ptr_eq_any(flight));
-        if lanes.is_empty() {
-            st.inflight.remove(key);
-        }
+    let lookup = LaneKeyRef::new(key, type_id);
+    let stored_matches = st
+        .inflight
+        .get(&lookup)
+        .is_some_and(|lane| Arc::as_ptr(&lane.flight).cast::<()>() == flight_ptr);
+    if stored_matches {
+        st.inflight.remove(&lookup);
     }
 }
 
-/// Searches `inflight[key]` for a lane of concrete flight type `F`.
-/// Returns `Wait(lane)` if a follower can join the existing leader,
-/// otherwise installs a fresh `F` lane and returns `Leader { miss }`.
-/// Type discrimination is by `TypeId<F>`, so an async (`MissFlight<V, E>`)
-/// and sync (`SyncMissFlight<V>`) lane for the same key never join each
-/// other.
+/// Looks up the lane at `(key, TypeId<F>)`. Returns `Wait(lane)` if a
+/// follower can join the existing leader, otherwise installs a fresh
+/// `F` lane and returns `Leader { miss }`. Type discrimination is by
+/// `TypeId<F>` carried in the map key, so an async
+/// (`MissFlight<V, E>`) and sync (`SyncMissFlight<V>`) lane for the
+/// same key occupy distinct rows and never join each other.
 fn install_or_join_lane<K, V, F>(st: &mut State<K, V>, key: &K) -> MissStep<V, F>
 where
     K: Eq + Hash + Clone + 'static,
     V: Clone + Send + Sync + 'static,
     F: Flight + NewFlight,
 {
-    if let Some(lanes) = st.inflight.get(key)
-        && let Some(lane) = lanes.iter().find_map(InflightLane::downcast::<F>)
+    let type_id = TypeId::of::<F>();
+    if let Some(lane) = st.inflight.get(&LaneKeyRef::new(key, type_id))
+        && let Some(arc) = lane.downcast::<F>()
     {
-        return MissStep::Wait(lane);
+        return MissStep::Wait(arc);
     }
 
     let miss = Arc::new(F::fresh());
     st.inflight
-        .entry(key.clone())
-        .or_default()
-        .push(InflightLane::new(Arc::clone(&miss)));
+        .insert((key.clone(), type_id), InflightLane::new(Arc::clone(&miss)));
     MissStep::Leader { miss }
 }
 
@@ -737,9 +751,6 @@ where
     inner: &'a Inner<K, V, P>,
     key: &'a K,
     flight: Arc<F>,
-    /// Type-erased view of `flight`, kept alongside so identity comparison
-    /// against stored lanes does not need to know `F` at the call site.
-    flight_any: Arc<dyn Any + Send + Sync>,
     armed: bool,
 }
 
@@ -759,7 +770,8 @@ where
         // lock here and clean up without the std::sync::Mutex `into_inner`
         // dance.
         let mut st = self.inner.shard_for(self.key).write();
-        remove_lane(&mut st, self.key, &self.flight_any);
+        let flight_ptr = Arc::as_ptr(&self.flight).cast::<()>();
+        remove_lane(&mut st, self.key, TypeId::of::<F>(), flight_ptr);
         drop(st);
         self.flight.cancel();
     }
@@ -1061,13 +1073,11 @@ where
             // Cancel pending miss lanes before releasing the lock so
             // followers see Cancelled instead of waiting on a sender we
             // are about to drop.
-            let cancelled: Vec<Vec<InflightLane<V>>> = inflight.drain().map(|(_, v)| v).collect();
+            let cancelled: Vec<InflightLane> = inflight.drain().map(|(_, v)| v).collect();
             drop(st);
 
-            for lanes in &cancelled {
-                for lane in lanes {
-                    lane.cancel();
-                }
+            for lane in &cancelled {
+                lane.cancel();
             }
 
             for (k, v) in drained {
@@ -1385,19 +1395,21 @@ where
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
-                    let flight_any: Arc<dyn Any + Send + Sync> =
-                        Arc::clone(&miss) as Arc<dyn Any + Send + Sync>;
                     let mut guard = LeaderGuard::<MissFlight<V, E>, K, V, P> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
-                        flight_any,
                         armed: true,
                     };
                     let fut = init();
                     let res = fut.await;
                     let mut st = guard.inner.shard_for(&key).write();
-                    remove_lane(&mut st, &key, &guard.flight_any);
+                    remove_lane(
+                        &mut st,
+                        &key,
+                        TypeId::of::<MissFlight<V, E>>(),
+                        Arc::as_ptr(&guard.flight).cast::<()>(),
+                    );
 
                     let finish = if let Ok(v) = &res {
                         let now = Instant::now();
@@ -1461,18 +1473,20 @@ where
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
-                    let flight_any: Arc<dyn Any + Send + Sync> =
-                        Arc::clone(&miss) as Arc<dyn Any + Send + Sync>;
                     let mut guard = LeaderGuard::<SyncMissFlight<V>, K, V, P> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
-                        flight_any,
                         armed: true,
                     };
                     let value = init(&key);
                     let mut st = guard.inner.shard_for(&key).write();
-                    remove_lane(&mut st, &key, &guard.flight_any);
+                    remove_lane(
+                        &mut st,
+                        &key,
+                        TypeId::of::<SyncMissFlight<V>>(),
+                        Arc::as_ptr(&guard.flight).cast::<()>(),
+                    );
                     let now = Instant::now();
                     let (reclaimed, displaced) = self.finish_miss_ok(&mut st, &key, &value, now);
                     guard.flight.publish(value.clone());

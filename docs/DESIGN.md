@@ -63,12 +63,13 @@ unifies those `TypeId` keys.
 the same per-shard `inflight` map as `try_get_with`/`get_with`, but each lane carries a Condvar-backed
 `SyncMissFlight<V>` instead of a `tokio::sync::watch`. The shard `RwLock` is dropped before the user
 closure runs, so other keys remain responsive while one key's leader produces a value.
-- Sync and async lanes share the same `inflight: HashMap<K, Vec<InflightLane<V>>>` map. Lane
-discrimination is by the concrete `TypeId<F>` of the flight type, where `F` implements the internal
-`Flight` trait (`MissFlight<V, E>` for `try_get_with`, `SyncMissFlight<V>` for `get_or_insert_with`).
-A sync caller never joins an async leader (and vice versa); both kinds run their own `init` if no
-compatible follower is found. There is no sentinel marker type: the concrete `TypeId<F>` *is* the
-distinction.
+- Sync and async lanes share the same `inflight: HashMap<(K, TypeId), InflightLane>` map. Each
+`(key, TypeId<F>)` pair indexes at most one leader; the `TypeId<F>` half of the key carries the
+`Flight` discrimination (`MissFlight<V, E>` for `try_get_with`, `SyncMissFlight<V>` for
+`get_or_insert_with`). A sync caller never joins an async leader (and vice versa); both kinds run
+their own `init` if no compatible follower is found. There is no sentinel marker type: the concrete
+`TypeId<F>` *is* the distinction. Borrowed lookups go through a `LaneKeyRef<'a, K>` adapter that
+implements `Equivalent<(K, TypeId)>`, so `&K` probes do not clone the key.
 - Do not call `get_or_insert_with` from a Tokio worker thread if the closure would itself block on
 that runtime — the current-thread block is a hard wait; prefer the async miss helpers there.
 
