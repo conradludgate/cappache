@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -468,6 +468,417 @@ struct EntrySlot<K, V> {
     /// per-revalidate `K::clone()` + hash + insert; cleared by
     /// `refresh_inflight_remove` (or dropped with the slot on eviction).
     refresh_inflight: bool,
+}
+
+/// Intrusive FIFO link accessor. Implemented by any node held in a
+/// [`SlotMap<SlotKey, T>`] that wishes to thread itself through a
+/// [`Fifo`]. A node is in at most one [`Fifo`] at any time, so a single
+/// `(prev, next)` pair on the node is enough to support multiple FIFOs
+/// that this node may move between (`Small` ↔ `Main` in the S3-FIFO
+/// reclaim path).
+pub(crate) trait FifoNode {
+    fn fifo_prev(&self) -> Option<SlotKey>;
+    fn fifo_next(&self) -> Option<SlotKey>;
+    fn set_fifo_prev(&mut self, prev: Option<SlotKey>);
+    fn set_fifo_next(&mut self, next: Option<SlotKey>);
+}
+
+/// Intrusive FIFO over slotmap-backed nodes. `head` is the insertion
+/// end (newest), `tail` the eviction end (oldest); operations are
+/// `O(1)` and never allocate. Replaces the LRU-flavoured `EvictList`
+/// once the cutover lands; lives alongside it for the primitives commit
+/// so the new code can pass `cargo test` in isolation.
+#[derive(Default)]
+pub(crate) struct Fifo {
+    head: Option<SlotKey>,
+    tail: Option<SlotKey>,
+}
+
+#[allow(dead_code)] // wired into State by the next commit (refactor + scaffold)
+impl Fifo {
+    fn push_head<T: FifoNode>(&mut self, slab: &mut SlotMap<SlotKey, T>, id: SlotKey) {
+        let node = slab
+            .get_mut(id)
+            .expect("Fifo::push_head: slot must be occupied");
+        node.set_fifo_prev(None);
+        node.set_fifo_next(self.head);
+
+        if let Some(old_head) = self.head {
+            slab.get_mut(old_head)
+                .expect("Fifo head must be occupied")
+                .set_fifo_prev(Some(id));
+        } else {
+            self.tail = Some(id);
+        }
+        self.head = Some(id);
+    }
+
+    fn pop_tail<T: FifoNode>(&mut self, slab: &mut SlotMap<SlotKey, T>) -> Option<SlotKey> {
+        let id = self.tail?;
+        self.unlink(slab, id);
+        Some(id)
+    }
+
+    fn unlink<T: FifoNode>(&mut self, slab: &mut SlotMap<SlotKey, T>, id: SlotKey) {
+        let (prev, next) = {
+            let n = slab.get(id).expect("Fifo::unlink: slot must be occupied");
+            (n.fifo_prev(), n.fifo_next())
+        };
+
+        match prev {
+            Some(p) => {
+                slab.get_mut(p)
+                    .expect("Fifo prev node must be occupied")
+                    .set_fifo_next(next);
+            }
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => {
+                slab.get_mut(n)
+                    .expect("Fifo next node must be occupied")
+                    .set_fifo_prev(prev);
+            }
+            None => self.tail = prev,
+        }
+
+        let n = slab
+            .get_mut(id)
+            .expect("Fifo::unlink: slot must be occupied");
+        n.set_fifo_prev(None);
+        n.set_fifo_next(None);
+    }
+
+    fn promote_to_head<T: FifoNode>(&mut self, slab: &mut SlotMap<SlotKey, T>, id: SlotKey) {
+        if self.head == Some(id) {
+            return;
+        }
+        self.unlink(slab, id);
+        self.push_head(slab, id);
+    }
+
+    fn head(&self) -> Option<SlotKey> {
+        self.head
+    }
+
+    fn tail(&self) -> Option<SlotKey> {
+        self.tail
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    fn clear(&mut self) {
+        self.head = None;
+        self.tail = None;
+    }
+}
+
+/// Bounded FIFO of fingerprints (already-hashed key images) used by
+/// S3-FIFO as the second-chance signal: when an `evict_from_small`
+/// drop happens at `freq <= 1`, the key's fingerprint goes into
+/// [`GhostSet`]; if the key is reinserted before the fingerprint
+/// rotates out, the install path routes the entry directly into Main
+/// instead of Small.
+///
+/// Internally a `VecDeque<u64>` plus a `HashTable<u64>`: the deque
+/// gives FIFO order, the table gives O(1) membership for `remove`.
+/// `remove` is **tombstoning** — it deletes from the membership table
+/// only and leaves the deque entry to be popped lazily on the next
+/// `insert` overflow. That keeps `remove` O(1) at the cost of a
+/// tombstone entry occupying one ring slot until it ages out, which
+/// shrinks effective ghost capacity transiently under high promotion
+/// rates. The trade-off is deliberate: the alternative (linear scan
+/// on `remove`) is O(cap) and untenable for million-entry caches.
+pub(crate) struct GhostSet {
+    ring: VecDeque<u64>,
+    set: HashTable<u64>,
+    cap: usize,
+}
+
+#[allow(dead_code)] // wired into State by the next commit (refactor + scaffold)
+impl GhostSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            ring: VecDeque::with_capacity(cap),
+            set: HashTable::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// Records `fp` as recently-evicted-from-Small. No-op when `cap == 0`
+    /// (used in tests / degenerate configs) or when `fp` is already
+    /// tracked. On overflow, drops the oldest ring entry and best-effort
+    /// removes it from the membership table (no-op if it was already a
+    /// tombstone).
+    fn insert(&mut self, fp: u64) {
+        if self.cap == 0 || self.contains(fp) {
+            return;
+        }
+        if self.ring.len() >= self.cap
+            && let Some(oldest) = self.ring.pop_front()
+        {
+            self.table_remove(oldest);
+        }
+        self.ring.push_back(fp);
+        self.table_insert(fp);
+    }
+
+    /// Consumes the membership for `fp`. Returns `true` if the
+    /// fingerprint was tracked (the install path then routes the
+    /// reinserted entry into Main). The deque entry is left as a
+    /// tombstone, see the type-level docstring.
+    fn remove(&mut self, fp: u64) -> bool {
+        if !self.contains(fp) {
+            return false;
+        }
+        self.table_remove(fp);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.ring.clear();
+        self.set.clear();
+    }
+
+    #[cfg(test)]
+    fn ring_len(&self) -> usize {
+        self.ring.len()
+    }
+
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn contains(&self, fp: u64) -> bool {
+        self.set.find(fp, |&entry| entry == fp).is_some()
+    }
+
+    fn table_insert(&mut self, fp: u64) {
+        self.set.insert_unique(fp, fp, |&entry| entry);
+    }
+
+    fn table_remove(&mut self, fp: u64) {
+        if let Ok(occ) = self.set.find_entry(fp, |&entry| entry == fp) {
+            occ.remove();
+        }
+    }
+}
+
+#[cfg(test)]
+mod fifo_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestNode {
+        prev: Option<SlotKey>,
+        next: Option<SlotKey>,
+    }
+
+    impl FifoNode for TestNode {
+        fn fifo_prev(&self) -> Option<SlotKey> {
+            self.prev
+        }
+        fn fifo_next(&self) -> Option<SlotKey> {
+            self.next
+        }
+        fn set_fifo_prev(&mut self, p: Option<SlotKey>) {
+            self.prev = p;
+        }
+        fn set_fifo_next(&mut self, n: Option<SlotKey>) {
+            self.next = n;
+        }
+    }
+
+    fn collect_tail_to_head(fifo: &Fifo, slab: &SlotMap<SlotKey, TestNode>) -> Vec<SlotKey> {
+        let mut out = Vec::new();
+        let mut cur = fifo.tail();
+        while let Some(id) = cur {
+            out.push(id);
+            cur = slab.get(id).and_then(FifoNode::fifo_prev);
+        }
+        out
+    }
+
+    #[test]
+    fn pop_tail_returns_oldest_first() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
+        let mut fifo = Fifo::default();
+        let a = slab.insert(TestNode::default());
+        let b = slab.insert(TestNode::default());
+        let c = slab.insert(TestNode::default());
+        fifo.push_head(&mut slab, a);
+        fifo.push_head(&mut slab, b);
+        fifo.push_head(&mut slab, c);
+
+        assert_eq!(fifo.head(), Some(c));
+        assert_eq!(fifo.tail(), Some(a));
+        assert_eq!(fifo.pop_tail(&mut slab), Some(a));
+        assert_eq!(fifo.pop_tail(&mut slab), Some(b));
+        assert_eq!(fifo.pop_tail(&mut slab), Some(c));
+        assert_eq!(fifo.pop_tail(&mut slab), None);
+        assert!(fifo.is_empty());
+    }
+
+    #[test]
+    fn unlink_from_middle_preserves_neighbours() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
+        let mut fifo = Fifo::default();
+        let a = slab.insert(TestNode::default());
+        let b = slab.insert(TestNode::default());
+        let c = slab.insert(TestNode::default());
+        fifo.push_head(&mut slab, a);
+        fifo.push_head(&mut slab, b);
+        fifo.push_head(&mut slab, c);
+
+        fifo.unlink(&mut slab, b);
+        assert_eq!(collect_tail_to_head(&fifo, &slab), vec![a, c]);
+        assert_eq!(slab[b].prev, None);
+        assert_eq!(slab[b].next, None);
+    }
+
+    #[test]
+    fn unlink_head_and_tail_updates_endpoints() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
+        let mut fifo = Fifo::default();
+        let a = slab.insert(TestNode::default());
+        let b = slab.insert(TestNode::default());
+        fifo.push_head(&mut slab, a);
+        fifo.push_head(&mut slab, b);
+
+        fifo.unlink(&mut slab, b);
+        assert_eq!(fifo.head(), Some(a));
+        assert_eq!(fifo.tail(), Some(a));
+
+        fifo.unlink(&mut slab, a);
+        assert!(fifo.is_empty());
+    }
+
+    #[test]
+    fn promote_to_head_moves_existing_node() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
+        let mut fifo = Fifo::default();
+        let a = slab.insert(TestNode::default());
+        let b = slab.insert(TestNode::default());
+        let c = slab.insert(TestNode::default());
+        fifo.push_head(&mut slab, a);
+        fifo.push_head(&mut slab, b);
+        fifo.push_head(&mut slab, c);
+
+        fifo.promote_to_head(&mut slab, a);
+        assert_eq!(collect_tail_to_head(&fifo, &slab), vec![b, c, a]);
+        assert_eq!(fifo.head(), Some(a));
+        assert_eq!(fifo.tail(), Some(b));
+    }
+
+    #[test]
+    fn promote_to_head_on_existing_head_is_noop() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
+        let mut fifo = Fifo::default();
+        let a = slab.insert(TestNode::default());
+        let b = slab.insert(TestNode::default());
+        fifo.push_head(&mut slab, a);
+        fifo.push_head(&mut slab, b);
+
+        fifo.promote_to_head(&mut slab, b);
+        assert_eq!(fifo.head(), Some(b));
+        assert_eq!(fifo.tail(), Some(a));
+    }
+
+    #[test]
+    fn pop_tail_empty_is_none() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(0);
+        let mut fifo = Fifo::default();
+        assert_eq!(fifo.pop_tail(&mut slab), None);
+    }
+
+    #[test]
+    fn clear_resets_endpoints() {
+        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
+        let mut fifo = Fifo::default();
+        let a = slab.insert(TestNode::default());
+        fifo.push_head(&mut slab, a);
+        fifo.clear();
+        assert!(fifo.is_empty());
+        assert_eq!(fifo.head(), None);
+        assert_eq!(fifo.tail(), None);
+    }
+}
+
+#[cfg(test)]
+mod ghost_set_tests {
+    use super::*;
+
+    #[test]
+    fn insert_then_remove_returns_true_once() {
+        let mut g = GhostSet::new(4);
+        g.insert(42);
+        assert!(g.remove(42));
+        assert!(!g.remove(42));
+    }
+
+    #[test]
+    fn remove_absent_returns_false() {
+        let mut g = GhostSet::new(4);
+        assert!(!g.remove(42));
+    }
+
+    #[test]
+    fn double_insert_is_noop() {
+        let mut g = GhostSet::new(4);
+        g.insert(7);
+        g.insert(7);
+        assert_eq!(g.live_len(), 1);
+        assert_eq!(g.ring_len(), 1);
+    }
+
+    #[test]
+    fn overflow_drops_oldest() {
+        let mut g = GhostSet::new(2);
+        g.insert(1);
+        g.insert(2);
+        g.insert(3);
+        assert!(!g.remove(1), "oldest fingerprint should have aged out");
+        assert!(g.remove(2));
+        assert!(g.remove(3));
+    }
+
+    #[test]
+    fn tombstone_does_not_resurrect_on_overflow() {
+        let mut g = GhostSet::new(2);
+        g.insert(10);
+        g.insert(20);
+        assert!(g.remove(10));
+        // Ring still holds [10 (tombstone), 20]; live = {20}.
+        // Inserting 30 evicts the oldest ring entry (the tombstone) and
+        // the live set must remain consistent ({20, 30}).
+        g.insert(30);
+        assert!(!g.remove(10));
+        assert!(g.remove(20));
+        assert!(g.remove(30));
+    }
+
+    #[test]
+    fn zero_capacity_is_inert() {
+        let mut g = GhostSet::new(0);
+        g.insert(1);
+        assert!(!g.remove(1));
+        assert_eq!(g.live_len(), 0);
+        assert_eq!(g.ring_len(), 0);
+    }
+
+    #[test]
+    fn clear_empties_both_sides() {
+        let mut g = GhostSet::new(4);
+        g.insert(1);
+        g.insert(2);
+        g.clear();
+        assert_eq!(g.live_len(), 0);
+        assert_eq!(g.ring_len(), 0);
+        assert!(!g.remove(1));
+    }
 }
 
 #[derive(Default)]
