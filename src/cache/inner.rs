@@ -278,8 +278,8 @@ impl<K: Eq> Equivalent<(K, TypeId)> for LaneKeyRef<'_, K> {
     }
 }
 
-pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
-    pub(crate) config: CacheConfig<K, V, P>,
+pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = DefaultHashBuilder> {
+    pub(crate) config: CacheConfig<K, V, P, S>,
     /// Per-shard state, cache-padded to keep adjacent shards out of each
     /// other's cache lines. Single-key paths take exactly one shard's
     /// `RwLock` (mostly `.write()` because reads mutate the slot's
@@ -304,7 +304,12 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     /// entries. Stored at the `Inner` level so all shards share the same
     /// seed — that keeps a key's bucket position stable across `Cache`
     /// clones and across shard boundaries during `clear`/iteration.
-    pub(crate) hasher: DefaultHashBuilder,
+    ///
+    /// Type-parameterised so callers can opt into `ahash`, `foldhash`,
+    /// `xxh3`, or any other [`BuildHasher`] without us paying for a
+    /// vtable on the hot path. Defaults to [`DefaultHashBuilder`]
+    /// (foldhash via `hashbrown` 0.17).
+    pub(crate) hasher: S,
     /// Per-shard weight cap: `ceil(max_weight / shards.len())`. With more
     /// than one shard the observed total weight may exceed
     /// `config.max_weight` by up to `shards.len() - 1` units of rounding
@@ -364,15 +369,16 @@ const FREQ_CAP: u8 = 3;
 /// `None` when no slot matches (or when the matching bucket points at a
 /// slot whose `slotmap` version no longer matches, which is the
 /// self-cleaning behaviour we get for free from `slab.get`).
-fn entries_find<K, V, Q>(
+fn entries_find<K, V, Q, H>(
     entries: &HashTable<SlotKey>,
-    hasher: &DefaultHashBuilder,
+    hasher: &H,
     slab: &EntrySlab<K, V>,
     key: &Q,
 ) -> Option<SlotKey>
 where
     K: Hash + Eq + Borrow<Q>,
     Q: Hash + Eq + ?Sized,
+    H: BuildHasher,
 {
     let h = hash_key(hasher, key);
     entries
@@ -385,14 +391,15 @@ where
 /// `entries` insert. Caller has already pushed `id` into the slab and is
 /// responsible for the resize closure rehashing existing entries against
 /// the same `slab`. The slot must be occupied at `id`.
-fn entries_insert<K, V>(
+fn entries_insert<K, V, H>(
     entries: &mut HashTable<SlotKey>,
-    hasher: &DefaultHashBuilder,
+    hasher: &H,
     slab: &EntrySlab<K, V>,
     id: SlotKey,
     key_hash: u64,
 ) where
     K: Hash + Eq,
+    H: BuildHasher,
 {
     entries.insert_unique(key_hash, id, |&other| {
         hash_key(
@@ -1018,14 +1025,15 @@ fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
 /// tuple is dropped (the caller is about to replace this slot anyway and
 /// will push a fresh tuple), but the existing slot is left in place so the
 /// caller can read its old value or fire a different lifecycle reason.
-fn drain_expired<K, V>(
+fn drain_expired<K, V, H>(
     st: &mut State<K, V>,
-    hasher: &DefaultHashBuilder,
+    hasher: &H,
     now: Instant,
     skip_key: Option<&K>,
 ) -> Vec<(K, V)>
 where
     K: Eq + Hash,
+    H: BuildHasher,
 {
     let mut out = Vec::new();
     while let Some(top) = st.expiry.peek() {
@@ -1130,25 +1138,27 @@ where
 /// and `get_or_insert_with` (`F = SyncMissFlight<V>`); the only
 /// per-flight behaviour difference is the cancellation channel, which is
 /// already abstracted by `Flight::cancel`.
-struct LeaderGuard<'a, F, K, V, P>
+struct LeaderGuard<'a, F, K, V, P, S>
 where
     F: Flight,
     K: Eq + Hash + 'static,
     V: Clone + Send + Sync + 'static,
     P: 'static,
+    S: BuildHasher + 'static,
 {
-    inner: &'a Inner<K, V, P>,
+    inner: &'a Inner<K, V, P, S>,
     key: &'a K,
     flight: Arc<F>,
     armed: bool,
 }
 
-impl<F, K, V, P> Drop for LeaderGuard<'_, F, K, V, P>
+impl<F, K, V, P, S> Drop for LeaderGuard<'_, F, K, V, P, S>
 where
     F: Flight,
     K: Eq + Hash + 'static,
     V: Clone + Send + Sync + 'static,
     P: 'static,
+    S: BuildHasher + 'static,
 {
     fn drop(&mut self) {
         if !self.armed {
@@ -1177,13 +1187,14 @@ where
 /// likewise self-cleaned by the `slab.get(id).is_some_and(...)` filter
 /// inside [`entries_find`] — so even if a bucket walk misses the row
 /// to remove, no probe will ever return a value for a freed slot.
-fn evict_slot<K, V>(
+fn evict_slot<K, V, H>(
     st: &mut State<K, V>,
-    hasher: &DefaultHashBuilder,
+    hasher: &H,
     id: SlotKey,
 ) -> Option<(K, V, u64)>
 where
     K: Eq + Hash,
+    H: BuildHasher,
 {
     let State {
         entries,
@@ -1223,15 +1234,16 @@ where
 /// and (if applicable) push the deadline into `state.expiry`.
 /// Centralises every install site so the heap invariant cannot be
 /// silently dropped.
-fn install_ready<K, V>(
+fn install_ready<K, V, H>(
     st: &mut State<K, V>,
-    hasher: &DefaultHashBuilder,
+    hasher: &H,
     key: K,
     entry: CacheEntry<V>,
     weight: u64,
 ) -> SlotKey
 where
     K: Eq + Hash,
+    H: BuildHasher,
 {
     let State {
         entries,
@@ -1274,7 +1286,10 @@ where
     id
 }
 
-impl<K, V, P> Inner<K, V, P> {
+impl<K, V, P, S> Inner<K, V, P, S>
+where
+    S: BuildHasher,
+{
     /// Returns the shard responsible for `key`. Single-key paths funnel
     /// through here so the shard mapping is centralised; cross-shard
     /// work (`len`, `weight`, `clear`) iterates `self.shards` directly.
@@ -1323,13 +1338,14 @@ impl<K, V, P> Inner<K, V, P> {
     }
 }
 
-impl<K, V, P> Inner<K, V, P>
+impl<K, V, P, S> Inner<K, V, P, S>
 where
     K: Eq + Hash + Clone + Send + Sync,
     V: Clone + Send + Sync,
     P: Policy<K, V>,
+    S: BuildHasher + Clone,
 {
-    pub(crate) fn new(config: CacheConfig<K, V, P>) -> Self {
+    pub(crate) fn new(config: CacheConfig<K, V, P, S>) -> Self {
         let shard_count = config.shards.max(1).next_power_of_two();
         let max_weight = config.max_weight.get();
         // Round up so the per-shard sum is at least `max_weight`. With more
@@ -1372,11 +1388,12 @@ where
         } else {
             usize::BITS - shard_count.trailing_zeros()
         };
+        let hasher = config.hasher.clone();
         Self {
             config,
             shards,
             shard_shift,
-            hasher: DefaultHashBuilder::default(),
+            hasher,
             shard_max_weight,
         }
     }
@@ -1956,7 +1973,7 @@ where
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
-                    let mut guard = LeaderGuard::<MissFlight<V, E>, K, V, P> {
+                    let mut guard = LeaderGuard::<MissFlight<V, E>, K, V, P, S> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
@@ -2034,7 +2051,7 @@ where
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
-                    let mut guard = LeaderGuard::<SyncMissFlight<V>, K, V, P> {
+                    let mut guard = LeaderGuard::<SyncMissFlight<V>, K, V, P, S> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,

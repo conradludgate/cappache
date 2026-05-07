@@ -6,11 +6,12 @@ mod inner;
 use std::borrow::Borrow;
 use std::convert::Infallible;
 use std::future::Future;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+use hashbrown::DefaultHashBuilder;
 use pin_project_lite::pin_project;
 
 use crate::Weight;
@@ -48,22 +49,24 @@ impl<Fut: Future> Future for OkIntoResult<Fut> {
 /// panicking `Executor::execute`) before ownership of the flag is handed to
 /// the spawned [`RefreshWork`]. Disarmed on the success path; from there
 /// `RefreshWork::Drop` takes over.
-struct RefreshGuard<'a, K, V, P>
+struct RefreshGuard<'a, K, V, P, S>
 where
     K: Eq + Hash + 'static,
     V: 'static,
     P: 'static,
+    S: BuildHasher + 'static,
 {
-    inner: &'a Arc<inner::Inner<K, V, P>>,
+    inner: &'a Arc<inner::Inner<K, V, P, S>>,
     key: &'a K,
     armed: bool,
 }
 
-impl<K, V, P> Drop for RefreshGuard<'_, K, V, P>
+impl<K, V, P, S> Drop for RefreshGuard<'_, K, V, P, S>
 where
     K: Eq + Hash + 'static,
     V: 'static,
     P: 'static,
+    S: BuildHasher + 'static,
 {
     fn drop(&mut self) {
         if self.armed {
@@ -78,20 +81,27 @@ where
 /// are in scope) and invoked from [`Drop`] to clear `refresh_inflight` if
 /// the executor drops the job without polling it to completion. `cleaned`
 /// short-circuits that path once `poll` reaches `Ready`.
-pub struct RefreshWork<K: 'static, V: 'static, E: 'static, P: 'static = DynPolicy<K, V>> {
-    pub(crate) inner: Arc<inner::Inner<K, V, P>>,
+pub struct RefreshWork<
+    K: 'static,
+    V: 'static,
+    E: 'static,
+    P: 'static = DynPolicy<K, V>,
+    S: 'static = DefaultHashBuilder,
+> {
+    pub(crate) inner: Arc<inner::Inner<K, V, P, S>>,
     pub(crate) key: K,
     pub(crate) fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>>,
-    pub(crate) cleanup: fn(&inner::Inner<K, V, P>, &K),
+    pub(crate) cleanup: fn(&inner::Inner<K, V, P, S>, &K),
     pub(crate) cleaned: bool,
 }
 
-impl<K, V, E, P> Future for RefreshWork<K, V, E, P>
+impl<K, V, E, P, S> Future for RefreshWork<K, V, E, P, S>
 where
     K: Eq + Hash + Clone + Send + Sync + Unpin + 'static,
     V: Clone + Send + Sync + 'static,
     E: Send + 'static,
     P: Policy<K, V> + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
 {
     type Output = ();
 
@@ -114,12 +124,13 @@ where
     }
 }
 
-impl<K, V, E, P> Drop for RefreshWork<K, V, E, P>
+impl<K, V, E, P, S> Drop for RefreshWork<K, V, E, P, S>
 where
     K: 'static,
     V: 'static,
     E: 'static,
     P: 'static,
+    S: 'static,
 {
     fn drop(&mut self) {
         if !self.cleaned {
@@ -138,11 +149,16 @@ where
 /// `P` is the policy type. The default ([`DynPolicy`]) keeps the cache
 /// generic-erased; pass a concrete `P: Policy<K, V>` to inline policy
 /// hooks and skip the vtable on every cache operation.
-pub struct Cache<K: 'static, V: 'static, P: 'static = DynPolicy<K, V>> {
-    inner: Arc<inner::Inner<K, V, P>>,
+pub struct Cache<
+    K: 'static,
+    V: 'static,
+    P: 'static = DynPolicy<K, V>,
+    S: 'static = DefaultHashBuilder,
+> {
+    inner: Arc<inner::Inner<K, V, P, S>>,
 }
 
-impl<K: 'static, V: 'static, P: 'static> Clone for Cache<K, V, P> {
+impl<K: 'static, V: 'static, P: 'static, S: 'static> Clone for Cache<K, V, P, S> {
     /// Cloning a `Cache` is `Arc`-cheap: both handles refer to the same
     /// shared state. Mutations from one are visible from the other.
     fn clone(&self) -> Self {
@@ -152,14 +168,15 @@ impl<K: 'static, V: 'static, P: 'static> Clone for Cache<K, V, P> {
     }
 }
 
-impl<K, V, P> Cache<K, V, P>
+impl<K, V, P, S> Cache<K, V, P, S>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     P: Policy<K, V> + Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
 {
     #[must_use]
-    pub fn new(config: CacheConfig<K, V, P>) -> Self {
+    pub fn new(config: CacheConfig<K, V, P, S>) -> Self {
         Self {
             inner: Arc::new(inner::Inner::new(config)),
         }
@@ -339,7 +356,7 @@ where
     ) -> Result<RevalidateScheduled, E>
     where
         E: Clone + Send + Sync + 'static,
-        Ex: Executor<RefreshWork<K, V, E, P>> + ?Sized,
+        Ex: Executor<RefreshWork<K, V, E, P, S>> + ?Sized,
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = Result<V, E>> + Send + 'static,
         K: Unpin,
@@ -410,7 +427,7 @@ where
     /// is ever produced (unreachable for this API).
     pub fn revalidate<Ex, F, Fut>(&self, key: K, executor: &Ex, init: F) -> RevalidateScheduled
     where
-        Ex: Executor<RefreshWork<K, V, Infallible, P>> + ?Sized,
+        Ex: Executor<RefreshWork<K, V, Infallible, P, S>> + ?Sized,
         F: FnOnce(&K) -> Fut,
         Fut: Future<Output = V> + Send + 'static,
         K: Unpin,

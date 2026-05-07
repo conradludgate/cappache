@@ -1,8 +1,10 @@
 //! Builder-time configuration: capacity budget and optional listeners.
 
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+use hashbrown::DefaultHashBuilder;
 
 use crate::lifecycle::LifecycleListener;
 use crate::policy::{DefaultPolicy, Policy, Weight};
@@ -21,14 +23,20 @@ pub type DynPolicy<K, V> = Arc<dyn Policy<K, V> + Send + Sync>;
 /// stays object-safe; pass any concrete `Policy<K, V>` impl to
 /// [`CacheBuilder::policy`] to monomorphise the hot path and skip the
 /// vtable.
+///
+/// `S` is the [`BuildHasher`]. The default ([`DefaultHashBuilder`] from
+/// `hashbrown`, currently `foldhash::fast::RandomState`) is fast and
+/// DoS-resistant. Pass `ahash::RandomState`, `xxhash_rust::xxh3::Xxh3Builder`,
+/// or any custom `BuildHasher` via [`CacheBuilder::hasher`] to swap.
 #[derive(Clone)]
-pub struct CacheConfig<K, V, P = DynPolicy<K, V>>
+pub struct CacheConfig<K, V, P = DynPolicy<K, V>, S = DefaultHashBuilder>
 where
     K: 'static,
     V: 'static,
 {
     pub max_weight: Weight,
     pub policy: P,
+    pub hasher: S,
     /// Requested shard count. Rounded up to the next power of two at
     /// cache construction; minimum 1. With `shards > 1` the observed
     /// total weight may exceed `max_weight` by up to `shards - 1` units
@@ -43,24 +51,26 @@ where
 
 /// Constructs a [`crate::Cache`].
 ///
-/// `K` and `V` bounds match [`crate::Cache`]; `P` follows
-/// [`CacheConfig`]. [`Self::policy`] is generic so a `.policy(MyPolicy)`
-/// chain switches the builder's `P` to the concrete type, allowing the
-/// downstream cache to inline policy hooks.
+/// `K` and `V` bounds match [`crate::Cache`]; `P` and `S` follow
+/// [`CacheConfig`]. [`Self::policy`] and [`Self::hasher`] are generic so
+/// a `.policy(MyPolicy)` or `.hasher(MyHasher)` chain switches the
+/// builder's `P` / `S` to the concrete type, allowing the downstream
+/// cache to inline both the policy hooks and the `BuildHasher` calls.
 #[derive(Clone)]
-pub struct CacheBuilder<K, V, P = DynPolicy<K, V>>
+pub struct CacheBuilder<K, V, P = DynPolicy<K, V>, S = DefaultHashBuilder>
 where
     K: 'static,
     V: 'static,
 {
     max_weight: Weight,
     policy: P,
+    hasher: S,
     shards: usize,
     lifecycle_listener: Option<Arc<dyn LifecycleListener<K, V> + Send + Sync>>,
     _marker: PhantomData<(K, V)>,
 }
 
-impl<K, V> Default for CacheBuilder<K, V, DynPolicy<K, V>>
+impl<K, V> Default for CacheBuilder<K, V, DynPolicy<K, V>, DefaultHashBuilder>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
@@ -69,6 +79,7 @@ where
         Self {
             max_weight: Weight::ZERO,
             policy: Arc::new(DefaultPolicy),
+            hasher: DefaultHashBuilder::default(),
             shards: default_shard_count(),
             lifecycle_listener: None,
             _marker: PhantomData,
@@ -89,25 +100,27 @@ fn default_shard_count() -> usize {
         .max(1)
 }
 
-impl<K, V> CacheBuilder<K, V, DynPolicy<K, V>>
+impl<K, V> CacheBuilder<K, V, DynPolicy<K, V>, DefaultHashBuilder>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
     /// Returns a builder seeded with [`DefaultPolicy`] erased through
-    /// [`DynPolicy`]. Switch to a monomorphic policy by chaining
-    /// [`Self::policy`] with a concrete value.
+    /// [`DynPolicy`] and [`DefaultHashBuilder`] (foldhash). Switch to a
+    /// monomorphic policy by chaining [`Self::policy`] with a concrete
+    /// value, or to a different hasher with [`Self::hasher`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl<K, V, P> CacheBuilder<K, V, P>
+impl<K, V, P, S> CacheBuilder<K, V, P, S>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
     P: Policy<K, V> + Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
 {
     #[must_use]
     pub fn max_weight(mut self, weight: Weight) -> Self {
@@ -120,13 +133,35 @@ where
     /// `MyPolicy` for vtable-free hot paths, or an
     /// `Arc<dyn Policy<K, V> + Send + Sync>` to keep type erasure.
     #[must_use]
-    pub fn policy<P2>(self, policy: P2) -> CacheBuilder<K, V, P2>
+    pub fn policy<P2>(self, policy: P2) -> CacheBuilder<K, V, P2, S>
     where
         P2: Policy<K, V> + Clone + Send + Sync + 'static,
     {
         CacheBuilder {
             max_weight: self.max_weight,
             policy,
+            hasher: self.hasher,
+            shards: self.shards,
+            lifecycle_listener: self.lifecycle_listener,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Replaces the [`BuildHasher`] used for shard selection and entry
+    /// lookup. Switching the hasher changes the builder's `S` so the
+    /// downstream cache calls the new `BuildHasher` directly without a
+    /// vtable. Common choices: `ahash::RandomState`,
+    /// `xxhash_rust::xxh3::Xxh3Builder`, `foldhash::fast::RandomState`
+    /// (the default).
+    #[must_use]
+    pub fn hasher<S2>(self, hasher: S2) -> CacheBuilder<K, V, P, S2>
+    where
+        S2: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        CacheBuilder {
+            max_weight: self.max_weight,
+            policy: self.policy,
+            hasher,
             shards: self.shards,
             lifecycle_listener: self.lifecycle_listener,
             _marker: PhantomData,
@@ -164,7 +199,7 @@ where
     /// indicates a forgotten `.max_weight(...)` call. Surface it loudly at
     /// build time rather than silently producing a useless cache.
     #[must_use]
-    pub fn build(self) -> CacheConfig<K, V, P> {
+    pub fn build(self) -> CacheConfig<K, V, P, S> {
         assert!(
             self.max_weight.get() > 0,
             "CacheBuilder::build: max_weight must be > 0; call .max_weight(Weight::new(...)) before .build()"
@@ -172,6 +207,7 @@ where
         CacheConfig {
             max_weight: self.max_weight,
             policy: self.policy,
+            hasher: self.hasher,
             shards: self.shards,
             lifecycle_listener: self.lifecycle_listener,
             _marker: PhantomData,

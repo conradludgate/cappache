@@ -123,4 +123,36 @@ mod compile_tests {
         assert_send::<std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'static>>>(
         );
     }
+
+    /// Custom-hasher path: building a `Cache` with `.hasher(...)` should
+    /// produce a fully usable cache whose `S` type parameter reflects
+    /// the supplied `BuildHasher`. The hasher choice is observable on
+    /// the type, so this also serves as a compile-time check that the
+    /// `S` parameter threads through `CacheBuilder` -> `CacheConfig`
+    /// -> `Cache` without erasure.
+    #[test]
+    fn cache_accepts_custom_hasher() {
+        use std::hash::{BuildHasherDefault, Hasher};
+
+        // Constant zero hasher: pathological for distribution but useful
+        // here — it's `Clone + Default + Send + Sync` with no deps.
+        #[derive(Default)]
+        struct ZeroHasher(u64);
+        impl Hasher for ZeroHasher {
+            fn write(&mut self, _: &[u8]) {}
+            fn finish(&self) -> u64 {
+                self.0
+            }
+        }
+        type Zero = BuildHasherDefault<ZeroHasher>;
+
+        let cache: Cache<String, String, _, Zero> = Cache::new(
+            CacheBuilder::<String, String>::new()
+                .max_weight(Weight::new(8))
+                .hasher(Zero::default())
+                .build(),
+        );
+        cache.insert("k".into(), "v".into());
+        assert_eq!(cache.get("k"), Some("v".into()));
+    }
 }
