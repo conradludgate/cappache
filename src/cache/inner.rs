@@ -1379,13 +1379,20 @@ where
         }
     }
 
+    /// Installs a fresh `Ready` slot for a leader's miss outcome.
+    ///
+    /// Returns the post-install reclaim victims plus the prior value (if a
+    /// concurrent `Cache::insert` for the same key landed while the leader
+    /// was running its `init`); callers fire `Updated` for that prior
+    /// value once the shard lock is released, mirroring [`Self::insert`]
+    /// and [`Self::apply_refresh_ok`].
     fn finish_miss_ok(
         &self,
         st: &mut State<K, V>,
         key: &K,
         v: &V,
         now: Instant,
-    ) -> Reclaimed<K, V>
+    ) -> (Reclaimed<K, V>, Option<V>)
     where
         K: 'static,
         V: 'static,
@@ -1393,6 +1400,8 @@ where
         let deadline = deadline_after_write(&self.config.policy, key, v, now);
         let nw = self.config.policy.weight(key, v).get();
         let reclaimed = self.reclaim(st, nw, key, now);
+        let displaced = entries_find(&st.entries, &self.hasher, &st.slab, key)
+            .and_then(|id| evict_slot(st, &self.hasher, id).map(|(_, prev, _)| prev));
         install_ready(
             st,
             &self.hasher,
@@ -1404,7 +1413,7 @@ where
             },
             nw,
         );
-        reclaimed
+        (reclaimed, displaced)
     }
 
     /// Single critical section for one `try_get_with` iteration: served hit, in-flight miss wait, or
@@ -1514,7 +1523,7 @@ where
                     let mut st = guard.inner.shard_for(&key).write();
                     remove_lane(&mut st, &key, &guard.flight_any);
 
-                    let reclaimed = if let Ok(v) = &res {
+                    let finish = if let Ok(v) = &res {
                         let now = Instant::now();
                         Some(self.finish_miss_ok(&mut st, &key, v, now))
                     } else {
@@ -1530,7 +1539,14 @@ where
                     drop(guard);
                     drop(st);
 
-                    if let Some(rec) = reclaimed {
+                    if let Some((rec, displaced)) = finish {
+                        if let Some(prev) = displaced {
+                            self.notify_lifecycle(
+                                LifecycleReason::Updated,
+                                key.clone(),
+                                Some(prev),
+                            );
+                        }
                         self.fire_reclaim(rec);
                     }
                     return res;
@@ -1652,11 +1668,14 @@ where
                     let mut st = guard.inner.shard_for(&key).write();
                     remove_lane(&mut st, &key, &guard.flight_any);
                     let now = Instant::now();
-                    let reclaimed = self.finish_miss_ok(&mut st, &key, &value, now);
+                    let (reclaimed, displaced) = self.finish_miss_ok(&mut st, &key, &value, now);
                     guard.flight.publish(value.clone());
                     guard.armed = false;
                     drop(guard);
                     drop(st);
+                    if let Some(prev) = displaced {
+                        self.notify_lifecycle(LifecycleReason::Updated, key.clone(), Some(prev));
+                    }
                     self.fire_reclaim(reclaimed);
                     return value;
                 }
