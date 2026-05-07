@@ -22,13 +22,86 @@ collect must go.
 Map sizing: `State.entries` is constructed with `HashMap::with_capacity(min(max_weight, 1 << 20))` so a cache that stays inside its weight budget never sees a rehash. Past that cap (or with `Weight::ZERO` policies) the standard amortised-doubling growth applies. A `papaya::HashMap` with `ResizeMode::Incremental` was considered for hard worst-case bounds; under the current `Mutex<State>` it would force a clone on every `update_read_deadline` for no reader-concurrency benefit, so it is deferred until Phase 3 lifts the outer mutex.
 
 **Capacity flow on writes:** drain entries already past their materialised
-deadline first (via the expiry index), then evict live entries via the slab
-(LRU or S3-FIFO) until projected weight fits. The expiry index is **only** for
-past-deadline reclaim — it is **not** consulted to pick capacity victims by
-soonest *future* expiry.
+deadline first (via the expiry index), then evict live entries via the
+S3-FIFO size loop (see **Eviction: S3-FIFO** below) until projected weight
+fits. The expiry index is **only** for past-deadline reclaim — it is **not**
+consulted to pick capacity victims by soonest *future* expiry.
 
 Time-based eviction is otherwise opportunistic (lazy on access plus the drain
 above on writes). It is **not** guaranteed to fire immediately at deadline.
+
+## Eviction: S3-FIFO
+
+Each shard keeps two intrusive FIFOs and a bounded fingerprint set instead
+of a single LRU list (Yang et al., *FIFO queues are all you need for cache
+eviction*, SOSP'23):
+
+- **`small: Fifo`** — newly inserted entries land at the head and age toward
+  the tail. Sized at `shard_max_weight / SMALL_DENOMINATOR` (V1: `S = 10`).
+  Overflow drains via `evict_from_small`.
+- **`main: Fifo`** — slots that survived a Small-tail promotion or were
+  reinstalled while their fingerprint sat in `ghost`. Drains via
+  `evict_from_main` only when Small is at or under its share of the budget.
+- **`ghost: GhostSet`** — bounded `VecDeque<u64>` + `HashTable<u64>` ring of
+  fingerprints (`hash_key` outputs) recently evicted from Small with
+  `freq <= 1`. The install path consumes membership (`ghost.remove(fp)`)
+  to route a returning key directly into Main. Capacity is an entry-count
+  proxy: `capacity_hint_from_max_weight(shard_max_weight)` (one `u64` per
+  ghost slot, bounded to `min(2^20, shard_max_weight)` per shard).
+- **`small_weight: u64`** — running sum of `Policy::weight` over slots
+  currently in Small. The reclaim outer loop drains Small first when
+  `small_weight > shard_max_weight / SMALL_DENOMINATOR`, otherwise Main.
+
+Each [`EntrySlot`](../src/cache/inner.rs) carries a `queue: Queue` discriminant
+(`Small` or `Main`), a saturating `freq: u8` (capped at `FREQ_CAP = 3`),
+and a single `(fifo_prev, fifo_next)` pair — a slot is in exactly one
+queue at a time, so one link pair is enough to thread it through whichever
+queue currently owns it.
+
+**Read paths.** `get_served` and the hit branch of `with_probe_for_hit`
+bump the slot's `freq` (saturating at `FREQ_CAP`) and **do not** touch
+queue order. Read paths still take the shard's `.write()` lock: `freq` is
+a plain `u8` (not atomic), and read-extending policies (`IdleTimeout`,
+custom `expire_after_read`) still mutate `entry.deadline` and push a fresh
+expiry tuple. Lifting the read path to a `.read()` lock would require
+both an atomic `freq` and a lock-free expiry-heap push, which V1 does not
+deliver — pure read-only views (`contains_key`, `len`, `is_empty`,
+`weight`) already take `.read()`.
+
+**Reclaim loop.** With `displaced_weight` for the slot being replaced
+already hoisted, each iteration tries the prescribed queue and falls back
+to the other when the prescribed one is empty:
+
+```text
+while total_weight - displaced + add_w > shard_max_weight:
+    if small_weight > shard_max_weight / SMALL_DENOMINATOR:
+        evict_from_small()    # promote (freq>1) | evict + ghost.insert(fp) (freq<=1)
+    else:
+        evict_from_main()     # recirculate (freq>0, dec freq) | evict (freq=0)
+```
+
+Termination: every `evict_from_main` recirculation decrements `freq`, so
+each Main slot is touched at most `FREQ_CAP + 1` times before being forced
+to `freq = 0` and dropped. `evict_from_small` either promotes one slot
+(after which it lives in Main and never reappears in Small) or evicts.
+Both bounds are `O(small.len() + (FREQ_CAP + 1) * main.len())` per outer
+iteration.
+
+**Skip-key invariant.** Both `evict_from_small` and `evict_from_main`
+short-circuit when the queue's tail key equals `skip_key` (the entry the
+caller is currently installing or replacing): the would-be victim is
+rotated to its current queue's head and the outer loop iterates with a
+different victim. The `slab.len() <= 1` guard breaks the loop when only
+the skip slot remains, allowing oversized solo replacements to complete
+even if they leave the cache temporarily over budget.
+
+**Ghost population, narrowed.** Only `evict_from_small` low-`freq`
+evictions seed `ghost`. `evict_from_main` evictions and every other
+`evict_slot` caller (`drain_expired` for TTL, user-driven
+`Inner::insert` / `apply_refresh_ok` / `finish_miss_ok` replacements,
+`Inner::remove`) deliberately do **not** add to ghost — only "recently
+popular but evicted from Small under capacity pressure" is the signal
+that justifies a second-chance Main install on reinsert.
 
 ## Capacity and time semantics
 
@@ -87,7 +160,7 @@ Miss coalescing splits flights by `(K, TypeId<F>)` where `F` is the concrete in-
   do not need to know which kind of flight they are tearing down.
 
 Lane install / follower-join is centralised in `install_or_join_lane::<F>(state, key)`; the
-read-side hit-detection (drain expired, MRU promote, push read-side expiry) is centralised in
+read-side hit-detection (drain expired, freq bump, push read-side expiry) is centralised in
 `Inner::with_probe_for_hit`. `Inner::miss_probe::<F>` glues both together inside one shard
 critical section so there is no TOCTOU window between hit detection and lane install.
 
@@ -97,19 +170,25 @@ critical section so there is no TOCTOU window between hit detection and lane ins
 Per shard:
 
 1. Take the shard's write lock.
-2. Drain the slab via the LRU tail walk into a `Vec<(K, V)>` (oldest-first inside the shard).
-3. Reset entries map, expiry heap, stale-push counter, total weight.
+2. Drain `main` tail-to-head into a `Vec<(K, V)>`, then drain `small`
+   tail-to-head into the same vec.
+3. Reset entries map, expiry heap, stale-push counter, total weight,
+   `small_weight`, and clear the ghost set.
 4. Drain the in-flight lanes into a side vec.
 5. Release the shard lock.
 6. Cancel every drained `InflightLane` so any waiting follower returns `None` from `wait` /
    `await_settled` and re-enters its probe loop.
-7. Fire `LifecycleReason::Removed` for each drained entry, in LRU-tail order.
+7. Fire `LifecycleReason::Removed` for each drained entry, in step 2's
+   order (Main tail-to-head, then Small tail-to-head).
 
 Implications callers can rely on:
 
 - `Removed` callbacks for keys in shard *i* fire before any callback for keys in shard *j > i*.
-- Within a shard, callback order is "LRU oldest first" — an implementation detail today, but the
-  cross-shard ordering above is the load-bearing invariant for tests and observers.
+- Within a shard, callback order is "Main before Small, both tail-to-head"
+  — an implementation detail today (S3-FIFO has no global recency axis,
+  so it deliberately does not promise an LRU-style "oldest first"), but
+  the cross-shard ordering above is the load-bearing invariant for tests
+  and observers.
 - `clear` does not block follower threads waiting on cancelled lanes — they see the cancel signal
   and re-probe, so a `clear` that races a `try_get_with` is safe even when the cleared key is the
   one being initialised. The same shape is what makes
