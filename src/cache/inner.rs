@@ -419,13 +419,33 @@ pub(crate) struct State<K, V> {
     /// clone the key.
     inflight: HashMap<(K, TypeId), InflightLane>,
     /// Backing storage for `Ready` entries. The slab owns `CacheEntry`,
-    /// the back-reference key, the cached weight, and the intrusive LRU links.
-    /// `slotmap` carries a per-slot version on the key; recycled slots
-    /// produce a fresh [`SlotKey`] that no stale heap tuple or `entries`
-    /// row will validate against.
+    /// the back-reference key, the cached weight, and the intrusive
+    /// FIFO links. `slotmap` carries a per-slot version on the key;
+    /// recycled slots produce a fresh [`SlotKey`] that no stale heap
+    /// tuple or `entries` row will validate against.
     slab: EntrySlab<K, V>,
-    /// Intrusive LRU over slab slots. `head` is MRU, `tail` is LRU.
-    evict_list: EvictList,
+    /// S3-FIFO Small queue. New inserts land here at the head and age
+    /// toward the tail. The reclaim path's `evict_from_small` decides
+    /// per slot whether to promote into `main` (warm) or evict +
+    /// fingerprint into `ghost` (cold).
+    small: Fifo,
+    /// S3-FIFO Main queue. Holds slots that survived a Small-tail
+    /// promotion or were re-inserted while their fingerprint sat in
+    /// `ghost`. Stage 2 keeps this empty; the cutover commit wires
+    /// admission and the recirculation loop.
+    main: Fifo,
+    /// Bounded set of fingerprints recently evicted from `small`. The
+    /// install path consumes membership to route a returning key
+    /// straight to `main`. Stage 2 keeps this empty; the cutover commit
+    /// wires population and consumption.
+    ghost: GhostSet,
+    /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over
+    /// slots currently in `small`. Cutover uses
+    /// `small_weight > shard_max_weight / SMALL_DENOMINATOR` to decide
+    /// whether to drain Small first vs Main. Maintained eagerly on
+    /// install / evict so the cutover does not have to retrofit the
+    /// invariant onto existing call sites.
+    small_weight: u64,
     /// Min-heap of `(deadline, slot)` tuples used to find past-deadline
     /// entries in `O(log n)`. Validated lazily on pop: a tuple is
     /// honoured only if `slab.get(slot)` returns `Some` (slotmap version
@@ -452,22 +472,60 @@ pub(crate) struct CacheEntry<V> {
     pub(crate) deadline: Option<Instant>,
 }
 
+/// Which S3-FIFO queue a slot currently lives on. A slot is in exactly
+/// one queue at a time, which is why `EntrySlot` only carries one
+/// `(fifo_prev, fifo_next)` pair to thread it through whichever queue
+/// owns it.
+#[allow(dead_code)] // Main constructed by the cutover commit (evict_from_small promotion)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Queue {
+    Small,
+    Main,
+}
+
 /// Owned cache entry held inside the slab. The `key` back-reference lets
 /// eviction find and remove the corresponding `entries` map slot in O(1).
 /// Slot identity / freshness lives on [`SlotKey`] (slotmap version), not
 /// on a per-entry generation field.
+#[allow(dead_code)] // queue/freq read by the cutover commit (evict_from_small / read paths)
 struct EntrySlot<K, V> {
     key: K,
     entry: CacheEntry<V>,
     /// Cached `Policy::weight` so eviction does not need to re-call the user policy.
     weight: u64,
-    lru_prev: Option<SlotKey>,
-    lru_next: Option<SlotKey>,
+    /// Which FIFO (`Small` or `Main`) this slot is currently linked into.
+    /// Read by `evict_slot` to pick which queue to unlink from and
+    /// whether to debit `State::small_weight`. Set on install, mutated
+    /// when `evict_from_small` promotes to Main.
+    queue: Queue,
+    /// Saturating frequency counter (0..=`FREQ_CAP`) consumed by
+    /// `evict_from_small` (promote vs evict) and `evict_from_main`
+    /// (recirculate vs evict). Read paths bump it without touching FIFO
+    /// order. Stays as a plain `u8` (not atomic) because the read path
+    /// already takes the shard write lock for deadline updates.
+    freq: u8,
+    fifo_prev: Option<SlotKey>,
+    fifo_next: Option<SlotKey>,
     /// `true` while a `try_revalidate` job for this key is in flight.
     /// Held on the slot rather than a side `HashSet<K>` to skip the
     /// per-revalidate `K::clone()` + hash + insert; cleared by
     /// `refresh_inflight_remove` (or dropped with the slot on eviction).
     refresh_inflight: bool,
+}
+
+impl<K, V> FifoNode for EntrySlot<K, V> {
+    fn fifo_prev(&self) -> Option<SlotKey> {
+        self.fifo_prev
+    }
+    fn fifo_next(&self) -> Option<SlotKey> {
+        self.fifo_next
+    }
+    fn set_fifo_prev(&mut self, prev: Option<SlotKey>) {
+        self.fifo_prev = prev;
+    }
+    fn set_fifo_next(&mut self, next: Option<SlotKey>) {
+        self.fifo_next = next;
+    }
 }
 
 /// Intrusive FIFO link accessor. Implemented by any node held in a
@@ -494,7 +552,7 @@ pub(crate) struct Fifo {
     tail: Option<SlotKey>,
 }
 
-#[allow(dead_code)] // wired into State by the next commit (refactor + scaffold)
+#[allow(dead_code)] // pop_tail / head / is_empty / clear used by the cutover commit
 impl Fifo {
     fn push_head<T: FifoNode>(&mut self, slab: &mut SlotMap<SlotKey, T>, id: SlotKey) {
         let node = slab
@@ -591,13 +649,14 @@ impl Fifo {
 /// shrinks effective ghost capacity transiently under high promotion
 /// rates. The trade-off is deliberate: the alternative (linear scan
 /// on `remove`) is O(cap) and untenable for million-entry caches.
+#[allow(dead_code)] // ring/set/cap consumed by insert/remove (wired in cutover commit)
 pub(crate) struct GhostSet {
     ring: VecDeque<u64>,
     set: HashTable<u64>,
     cap: usize,
 }
 
-#[allow(dead_code)] // wired into State by the next commit (refactor + scaffold)
+#[allow(dead_code)] // insert / remove / contains used by the cutover commit
 impl GhostSet {
     fn new(cap: usize) -> Self {
         Self {
@@ -881,71 +940,6 @@ mod ghost_set_tests {
     }
 }
 
-#[derive(Default)]
-struct EvictList {
-    head: Option<SlotKey>,
-    tail: Option<SlotKey>,
-}
-
-impl EvictList {
-    fn push_mru<K, V>(&mut self, slab: &mut EntrySlab<K, V>, id: SlotKey) {
-        let new_node = slab
-            .get_mut(id)
-            .expect("evict_list.push_mru: slot must be occupied");
-        new_node.lru_prev = None;
-        new_node.lru_next = self.head;
-
-        if let Some(old_head) = self.head {
-            slab.get_mut(old_head)
-                .expect("evict_list head must be occupied")
-                .lru_prev = Some(id);
-        } else {
-            self.tail = Some(id);
-        }
-        self.head = Some(id);
-    }
-
-    fn unlink<K, V>(&mut self, slab: &mut EntrySlab<K, V>, id: SlotKey) {
-        let (prev, next) = {
-            let s = slab
-                .get(id)
-                .expect("evict_list.unlink: slot must be occupied");
-            (s.lru_prev, s.lru_next)
-        };
-
-        match prev {
-            Some(p) => {
-                slab.get_mut(p)
-                    .expect("prev LRU node must be occupied")
-                    .lru_next = next;
-            }
-            None => self.head = next,
-        }
-        match next {
-            Some(n) => {
-                slab.get_mut(n)
-                    .expect("next LRU node must be occupied")
-                    .lru_prev = prev;
-            }
-            None => self.tail = prev,
-        }
-
-        let s = slab
-            .get_mut(id)
-            .expect("evict_list.unlink: slot must be occupied");
-        s.lru_prev = None;
-        s.lru_next = None;
-    }
-
-    fn promote_to_mru<K, V>(&mut self, slab: &mut EntrySlab<K, V>, id: SlotKey) {
-        if self.head == Some(id) {
-            return;
-        }
-        self.unlink(slab, id);
-        self.push_mru(slab, id);
-    }
-}
-
 /// `(deadline, slot)` tuple stored in [`ExpiryHeap`]. Ordered by
 /// `deadline` so a `BinaryHeap<Reverse<HeapKey>>` yields earliest
 /// deadlines first; the slot's packed FFI form is a tiebreaker for
@@ -1208,17 +1202,19 @@ where
     let State {
         entries,
         slab,
-        evict_list,
+        small,
+        small_weight,
         total_weight,
         ..
     } = st;
-    evict_list.unlink(slab, id);
+    small.unlink(slab, id);
     // Take the slot out first so the entries removal can compare against
     // a slab that no longer holds `id` — the probe predicate uses
     // `slab.get(id)`, which now returns `None`, so we hash by the taken
     // entry's key and match buckets by `SlotKey` directly.
     let entry_slot = slab.remove(id)?;
     *total_weight = total_weight.saturating_sub(entry_slot.weight);
+    *small_weight = small_weight.saturating_sub(entry_slot.weight);
     let h = hash_key(hasher, &entry_slot.key);
     if let Ok(occ) = entries.find_entry(h, |&other| other == id) {
         occ.remove();
@@ -1243,7 +1239,8 @@ where
     let State {
         entries,
         slab,
-        evict_list,
+        small,
+        small_weight,
         expiry,
         total_weight,
         ..
@@ -1253,13 +1250,16 @@ where
         key,
         entry,
         weight,
-        lru_prev: None,
-        lru_next: None,
+        queue: Queue::Small,
+        freq: 0,
+        fifo_prev: None,
+        fifo_next: None,
         refresh_inflight: false,
     });
-    evict_list.push_mru(slab, id);
+    small.push_head(slab, id);
     entries_insert(entries, hasher, slab, id);
     *total_weight = total_weight.saturating_add(weight);
+    *small_weight = small_weight.saturating_add(weight);
     if let Some(dl) = deadline {
         expiry.push(dl, id);
     }
@@ -1333,13 +1333,21 @@ where
         // is the working assumption that bounds per-shard entry count by
         // `shard_max_weight`.
         let initial_capacity = capacity_hint_from_max_weight(shard_max_weight);
+        // Ghost capacity is an entry-count proxy, not a weight figure;
+        // the same conservative `min(2^20, shard_max_weight)` estimate
+        // that pre-sizes `entries` and `slab` keeps the ghost table's
+        // memory bounded to one `u64` fingerprint per slot.
+        let ghost_cap = initial_capacity;
         let shards = (0..shard_count)
             .map(|_| {
                 CachePadded::new(RwLock::new(State {
                     entries: HashTable::with_capacity(initial_capacity),
                     inflight: HashMap::new(),
                     slab: SlotMap::with_capacity_and_key(initial_capacity),
-                    evict_list: EvictList::default(),
+                    small: Fifo::default(),
+                    main: Fifo::default(),
+                    ghost: GhostSet::new(ghost_cap),
+                    small_weight: 0,
                     expiry: ExpiryHeap::default(),
                     stale_pushes: 0,
                     total_weight: 0,
@@ -1392,10 +1400,8 @@ where
         }
 
         let (value, update) = {
-            let State {
-                slab, evict_list, ..
-            } = &mut *st;
-            evict_list.promote_to_mru(slab, id);
+            let State { slab, small, .. } = &mut *st;
+            small.promote_to_head(slab, id);
             let es = slab.get_mut(id)?;
             let value = es.entry.value.clone();
             // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
@@ -1463,23 +1469,34 @@ where
                 entries,
                 inflight,
                 slab,
-                evict_list,
+                small,
+                main,
+                ghost,
+                small_weight,
                 expiry,
                 stale_pushes,
                 total_weight,
                 ..
             } = &mut *st;
             let mut drained: Vec<(K, V)> = Vec::with_capacity(slab.len());
-            while let Some(tail) = evict_list.tail {
-                evict_list.unlink(slab, tail);
+            while let Some(tail) = small.pop_tail(slab) {
                 if let Some(entry_slot) = slab.remove(tail) {
                     drained.push((entry_slot.key, entry_slot.entry.value));
                 }
             }
+            // `main` stays empty until the cutover commit, but draining
+            // it explicitly keeps `Cache::clear` honest for Stage 3.
+            while let Some(tail) = main.pop_tail(slab) {
+                if let Some(entry_slot) = slab.remove(tail) {
+                    drained.push((entry_slot.key, entry_slot.entry.value));
+                }
+            }
+            ghost.clear();
             entries.clear();
             expiry.clear();
             *stale_pushes = 0;
             *total_weight = 0;
+            *small_weight = 0;
 
             // Cancel pending miss lanes before releasing the lock so
             // followers see Cancelled instead of waiting on a sender we
@@ -1600,7 +1617,7 @@ where
             if !Self::projected_weight_over_capacity(st, displaced_weight, add_w, max) {
                 break;
             }
-            let Some(tail_id) = st.evict_list.tail else {
+            let Some(tail_id) = st.small.tail() else {
                 break;
             };
             let Some(tail_slot) = st.slab.get(tail_id) else {
@@ -1610,10 +1627,8 @@ where
                 if st.slab.len() <= 1 {
                     break;
                 }
-                let State {
-                    slab, evict_list, ..
-                } = &mut *st;
-                evict_list.promote_to_mru(slab, tail_id);
+                let State { slab, small, .. } = &mut *st;
+                small.promote_to_head(slab, tail_id);
                 continue;
             }
             let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
@@ -1742,10 +1757,8 @@ where
                 .is_some_and(|es| entry_is_served(&es.entry, now));
             if still_served {
                 let (value, update) = {
-                    let State {
-                        slab, evict_list, ..
-                    } = &mut *st;
-                    evict_list.promote_to_mru(slab, id);
+                    let State { slab, small, .. } = &mut *st;
+                    small.promote_to_head(slab, id);
                     let es = slab
                         .get_mut(id)
                         .expect("just confirmed Occupied above under our mutex");
@@ -2083,9 +2096,11 @@ mod size_regressions {
     fn entry_slot_size_within_budget() {
         // Two `String`s (48) + `CacheEntry<String>` worst-case 64 +
         // `weight` 8 + two `Option<SlotKey>` 16 (niche) +
-        // `refresh_inflight` 1 byte (rounded to alignment) gives a
-        // platform-portable upper bound.
-        const BUDGET: usize = 144;
+        // `queue` 1 + `freq` 1 + `refresh_inflight` 1 (rounded to
+        // alignment) gives a platform-portable upper bound. The +8 vs
+        // the pre-S3-FIFO 144 is the tail padding around the three new
+        // small fields.
+        const BUDGET: usize = 152;
         let observed = std::mem::size_of::<EntrySlot<String, String>>();
         assert!(
             observed <= BUDGET,
