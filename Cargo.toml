@@ -8,6 +8,7 @@ rust-version = "1.95"
 clashcore = { git = "https://github.com/conradludgate/clashmap.git", branch = "phase-2/hashbrown-0.17" }
 hashbrown = "0.17"
 pin-project-lite = "0.2"
+slotmap = "1"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]

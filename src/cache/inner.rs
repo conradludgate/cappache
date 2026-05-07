@@ -4,13 +4,13 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use clashcore::CachePadded;
 use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+use slotmap::{Key, SlotMap};
 
 /// One cache-padded shard. Aliased so the verbose `CachePadded<RwLock<...>>`
 /// stack does not need to spell itself out at every use site (and so
@@ -302,30 +302,27 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) shard_max_weight: u64,
 }
 
-/// Stable handle into [`Slab`]. `NonZeroU32` caps slab population at 2^32-2,
-/// which far exceeds any practical cache bounded by RAM, and lets
-/// `Option<SlotId>` niche-pack into 4 bytes (matters for [`EntrySlot`]'s
-/// LRU links and the slab free-list pointer that store one per ready
-/// entry).
-///
-/// Encoding: `idx + 1`. Index 0 is represented as `NonZeroU32::new(1)`;
-/// `to_index` reverses the offset. The offset is centralised in
-/// [`SlotId::from_index`] / [`SlotId::to_index`] so callers never see it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SlotId(NonZeroU32);
-
-impl SlotId {
-    fn from_index(idx: u32) -> Self {
-        let raw = idx
-            .checked_add(1)
-            .expect("slab index + 1 overflows u32 (slab capacity exceeds u32::MAX - 1)");
-        SlotId(NonZeroU32::new(raw).expect("idx + 1 is non-zero by construction"))
-    }
-
-    fn to_index(self) -> usize {
-        (self.0.get() - 1) as usize
-    }
+slotmap::new_key_type! {
+    /// Stable handle into [`EntrySlab`]. Wraps `slotmap::KeyData`
+    /// (`u32` index + non-zero `u32` version), so:
+    ///
+    /// - the slab caps at 2^32-2 occupants, far past any RAM-bounded cache;
+    /// - `Option<SlotKey>` niche-packs to 8 bytes (one machine word) via
+    ///   the version field;
+    /// - every `slab.get(key)` / `slab.remove(key)` validates the version
+    ///   automatically, so a recycled slot never aliases a stale key.
+    ///
+    /// The version is what gates stale heap tuples in [`drain_expired`]
+    /// (slot recycled → `slab.get` returns `None` → tuple is silently
+    /// dropped); the deadline-equality check still gates *deadline-shifted*
+    /// tuples for the same live slot.
+    pub(crate) struct SlotKey;
 }
+
+/// Backing storage for every `Ready` entry in one shard. Versioned slot
+/// handles let stale heap tuples self-discard without an explicit
+/// generation field on `EntrySlot`.
+type EntrySlab<K, V> = SlotMap<SlotKey, EntrySlot<K, V>>;
 
 /// Hash a key using the table's `BuildHasher`. Centralising the hash
 /// derivation guarantees insert and lookup hash the same bytes the same
@@ -336,15 +333,16 @@ fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
 }
 
 /// `entries` lookup that compares keys through the slab — the table only
-/// holds `SlotId` so equality lives on `EntrySlot::key`. Returns `None`
-/// when no slot matches; an unmatched probe walks at most one bucket
-/// chain on average.
+/// holds [`SlotKey`] so equality lives on `EntrySlot::key`. Returns
+/// `None` when no slot matches (or when the matching bucket points at a
+/// slot whose `slotmap` version no longer matches, which is the
+/// self-cleaning behaviour we get for free from `slab.get`).
 fn entries_find<K, V, Q>(
-    entries: &HashTable<SlotId>,
+    entries: &HashTable<SlotKey>,
     hasher: &DefaultHashBuilder,
-    slab: &Slab<K, V>,
+    slab: &EntrySlab<K, V>,
     key: &Q,
-) -> Option<SlotId>
+) -> Option<SlotKey>
 where
     K: Hash + Eq + Borrow<Q>,
     Q: Hash + Eq + ?Sized,
@@ -361,10 +359,10 @@ where
 /// responsible for the resize closure rehashing existing entries against
 /// the same `slab`. The slot must be occupied at `id`.
 fn entries_insert<K, V>(
-    entries: &mut HashTable<SlotId>,
+    entries: &mut HashTable<SlotKey>,
     hasher: &DefaultHashBuilder,
-    slab: &Slab<K, V>,
-    id: SlotId,
+    slab: &EntrySlab<K, V>,
+    id: SlotKey,
 ) where
     K: Hash + Eq,
 {
@@ -387,38 +385,42 @@ fn entries_insert<K, V>(
 }
 
 pub(crate) struct State<K, V> {
-    /// Lookup table for `Ready` entries. Stores only `SlotId`; the key
+    /// Lookup table for `Ready` entries. Stores only [`SlotKey`]; the key
     /// itself lives once on the slab as `EntrySlot::key`. Migrating from
-    /// `HashMap<K, SlotId>` to `HashTable<SlotId>` removes one `K`
+    /// `HashMap<K, SlotKey>` to `HashTable<SlotKey>` removes one `K`
     /// allocation per ready entry (notable for `String`-keyed caches) and
     /// collapses the previous "find then remove" two-probe pattern into a
     /// single probe via `find_entry`.
     ///
-    /// Equality during probes goes through [`Slab::get`] so the table can
-    /// stay key-free; the `hasher` field below is the matching
+    /// Equality during probes goes through [`SlotMap::get`] so the table
+    /// can stay key-free; the `hasher` field below is the matching
     /// `BuildHasher` used both at insert time and at probe time so the
     /// stored hash matches what `find` recomputes.
     ///
     /// In-flight miss leaders live in [`Self::inflight`] under their own
     /// `(K, TypeId<E>)` lane so a `try_get_with::<…, E1>` call cannot
     /// deadlock waiting on a leader that will publish an unrelated `E2`.
-    pub(crate) entries: HashTable<SlotId>,
+    pub(crate) entries: HashTable<SlotKey>,
     /// Per-key vector of in-flight miss lanes, deduped by the leader's `E`
     /// type. Single lane is the common case; multiple lanes appear only when
     /// concurrent `try_get_with` calls disagree on `E`.
     inflight: HashMap<K, Vec<InflightLane<V>>>,
     /// Backing storage for `Ready` entries. The slab owns `CacheEntry`,
     /// the back-reference key, the cached weight, and the intrusive LRU links.
-    slab: Slab<K, V>,
+    /// `slotmap` carries a per-slot version on the key; recycled slots
+    /// produce a fresh [`SlotKey`] that no stale heap tuple or `entries`
+    /// row will validate against.
+    slab: EntrySlab<K, V>,
     /// Intrusive LRU over slab slots. `head` is MRU, `tail` is LRU.
     evict_list: EvictList,
-    /// Min-heap of (deadline, slot, generation) tuples used to find past-deadline
-    /// entries in `O(log n)`. Validated lazily: a popped tuple is honoured
-    /// only if the slab still holds an `Occupied` slot at `slot` whose `generation`
-    /// matches and whose deadline is exactly `Some(deadline)`. Stale tuples
-    /// (slot reused, deadline shifted by a read hook, or slot evicted) are
-    /// dropped on pop. Read-deadline updates push a new tuple instead of
-    /// removing the old one.
+    /// Min-heap of `(deadline, slot)` tuples used to find past-deadline
+    /// entries in `O(log n)`. Validated lazily on pop: a tuple is
+    /// honoured only if `slab.get(slot)` returns `Some` (slotmap version
+    /// still matches) **and** the slot's deadline equals the tuple's. The
+    /// version check covers slot recycling and outright eviction; the
+    /// deadline check covers read hooks that pushed a fresh tuple for the
+    /// same live slot. Read-deadline updates always push a new tuple
+    /// rather than mutating the old one.
     expiry: ExpiryHeap,
     /// Number of heap pushes that superseded a still-finite prior deadline
     /// for the same slot (i.e. left a stale tuple behind). Read-extending
@@ -437,20 +439,17 @@ pub(crate) struct CacheEntry<V> {
     pub(crate) deadline: Option<Instant>,
 }
 
-/// Owned cache entry held inside [`Slab`]. The `key` back-reference lets eviction
-/// find and remove the corresponding `entries` map slot in O(1).
+/// Owned cache entry held inside the slab. The `key` back-reference lets
+/// eviction find and remove the corresponding `entries` map slot in O(1).
+/// Slot identity / freshness lives on [`SlotKey`] (slotmap version), not
+/// on a per-entry generation field.
 struct EntrySlot<K, V> {
     key: K,
     entry: CacheEntry<V>,
     /// Cached `Policy::weight` so eviction does not need to re-call the user policy.
     weight: u64,
-    /// Bumped on every slot reuse. Heap tuples carry the generation at push time and
-    /// fail validation on pop after the slot has been recycled. `u64` so the
-    /// counter cannot wrap inside any practical process lifetime; a wrapped
-    /// counter could revalidate a stale heap tuple that aliases the new slot.
-    generation: u64,
-    lru_prev: Option<SlotId>,
-    lru_next: Option<SlotId>,
+    lru_prev: Option<SlotKey>,
+    lru_next: Option<SlotKey>,
     /// `true` while a `try_revalidate` job for this key is in flight.
     /// Held on the slot rather than a side `HashSet<K>` to skip the
     /// per-revalidate `K::clone()` + hash + insert; cleared by
@@ -458,147 +457,14 @@ struct EntrySlot<K, V> {
     refresh_inflight: bool,
 }
 
-enum SlabEntry<K, V> {
-    Occupied(EntrySlot<K, V>),
-    /// `generation` is the generation of the **last** occupant; the next insert into
-    /// this slot uses `generation.wrapping_add(1)`. `u64` matches the live
-    /// `EntrySlot::generation`.
-    Free {
-        next_free: Option<SlotId>,
-        generation: u64,
-    },
-}
-
-/// Vector-backed slab with a free-list. Pure-safe (no `unsafe`).
-struct Slab<K, V> {
-    slots: Vec<SlabEntry<K, V>>,
-    free_head: Option<SlotId>,
-    len: usize,
-}
-
-impl<K, V> Slab<K, V> {
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            slots: Vec::with_capacity(cap),
-            free_head: None,
-            len: 0,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Iterate `(SlotId, &EntrySlot)` over occupied slots only. Used by
-    /// the expiry-heap rebuild path; ordering matches insertion index but
-    /// callers don't depend on it.
-    fn iter_occupied(&self) -> impl Iterator<Item = (SlotId, &EntrySlot<K, V>)> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, slot)| match slot {
-                SlabEntry::Occupied(es) => {
-                    let id = SlotId::from_index(
-                        u32::try_from(idx).expect("slab capacity exceeds u32::MAX"),
-                    );
-                    Some((id, es))
-                }
-                SlabEntry::Free { .. } => None,
-            })
-    }
-
-    /// Install `entry` and return its slot id. Callers must set `entry.generation`
-    /// to whatever this method returns from [`Self::next_generation_for`] beforehand
-    /// — the slab does not mutate `entry` in place to keep the borrow simple.
-    fn insert(&mut self, entry: EntrySlot<K, V>) -> SlotId {
-        if let Some(id) = self.free_head {
-            let slot = &mut self.slots[id.to_index()];
-            let next_free = match slot {
-                SlabEntry::Free { next_free, .. } => *next_free,
-                SlabEntry::Occupied(_) => unreachable!("free list points at occupied slot"),
-            };
-            self.free_head = next_free;
-            *slot = SlabEntry::Occupied(entry);
-            self.len += 1;
-            id
-        } else {
-            let idx = u32::try_from(self.slots.len()).expect("slab capacity exceeds u32::MAX");
-            self.slots.push(SlabEntry::Occupied(entry));
-            self.len += 1;
-            SlotId::from_index(idx)
-        }
-    }
-
-    /// Generation an `EntrySlot` should claim if installed at `idx` next.
-    /// Returns `0` for a fresh tail-extension slot, or `prev_generation.wrapping_add(1)`
-    /// for an existing slot on the free list. The generation tag is the
-    /// first half of the stale-tuple gate in [`drain_expired`]; the
-    /// deadline equality check is the second.
-    fn next_generation_for(&self, idx: u32) -> u64 {
-        match self.slots.get(idx as usize) {
-            Some(SlabEntry::Free { generation, .. }) => generation.wrapping_add(1),
-            Some(SlabEntry::Occupied(_)) | None => 0,
-        }
-    }
-
-    /// Index of the next slot `insert` will populate, used to look up
-    /// [`Self::next_generation_for`] before the new `EntrySlot` is constructed.
-    fn next_slot_index(&self) -> u32 {
-        match self.free_head {
-            Some(id) => u32::try_from(id.to_index()).expect("slab capacity exceeds u32::MAX"),
-            None => u32::try_from(self.slots.len()).expect("slab capacity exceeds u32::MAX"),
-        }
-    }
-
-    fn remove(&mut self, id: SlotId) -> Option<EntrySlot<K, V>> {
-        let slot = self.slots.get_mut(id.to_index())?;
-        if !matches!(slot, SlabEntry::Occupied(_)) {
-            return None;
-        }
-        let prev_free = self.free_head;
-        let taken = std::mem::replace(
-            slot,
-            SlabEntry::Free {
-                next_free: prev_free,
-                generation: 0, // overwritten below from the taken EntrySlot.
-            },
-        );
-        let SlabEntry::Occupied(entry) = taken else {
-            unreachable!("checked Occupied above")
-        };
-        // Re-stamp the Free's `generation` to the removed entry's generation so the next
-        // occupant computes its `generation + 1` cleanly.
-        if let SlabEntry::Free { generation, .. } = slot {
-            *generation = entry.generation;
-        }
-        self.free_head = Some(id);
-        self.len -= 1;
-        Some(entry)
-    }
-
-    fn get(&self, id: SlotId) -> Option<&EntrySlot<K, V>> {
-        match self.slots.get(id.to_index())? {
-            SlabEntry::Occupied(e) => Some(e),
-            SlabEntry::Free { .. } => None,
-        }
-    }
-
-    fn get_mut(&mut self, id: SlotId) -> Option<&mut EntrySlot<K, V>> {
-        match self.slots.get_mut(id.to_index())? {
-            SlabEntry::Occupied(e) => Some(e),
-            SlabEntry::Free { .. } => None,
-        }
-    }
-}
-
 #[derive(Default)]
 struct EvictList {
-    head: Option<SlotId>,
-    tail: Option<SlotId>,
+    head: Option<SlotKey>,
+    tail: Option<SlotKey>,
 }
 
 impl EvictList {
-    fn push_mru<K, V>(&mut self, slab: &mut Slab<K, V>, id: SlotId) {
+    fn push_mru<K, V>(&mut self, slab: &mut EntrySlab<K, V>, id: SlotKey) {
         let new_node = slab
             .get_mut(id)
             .expect("evict_list.push_mru: slot must be occupied");
@@ -615,7 +481,7 @@ impl EvictList {
         self.head = Some(id);
     }
 
-    fn unlink<K, V>(&mut self, slab: &mut Slab<K, V>, id: SlotId) {
+    fn unlink<K, V>(&mut self, slab: &mut EntrySlab<K, V>, id: SlotKey) {
         let (prev, next) = {
             let s = slab
                 .get(id)
@@ -647,7 +513,7 @@ impl EvictList {
         s.lru_next = None;
     }
 
-    fn promote_to_mru<K, V>(&mut self, slab: &mut Slab<K, V>, id: SlotId) {
+    fn promote_to_mru<K, V>(&mut self, slab: &mut EntrySlab<K, V>, id: SlotKey) {
         if self.head == Some(id) {
             return;
         }
@@ -656,23 +522,22 @@ impl EvictList {
     }
 }
 
-/// `(deadline, slot, generation)` tuple stored in [`ExpiryHeap`]. Ordered by
-/// `deadline` so a `BinaryHeap<Reverse<HeapKey>>` yields earliest deadlines
-/// first. `slot` and `generation` are tiebreakers for total ordering; only `deadline`
-/// matters semantically.
+/// `(deadline, slot)` tuple stored in [`ExpiryHeap`]. Ordered by
+/// `deadline` so a `BinaryHeap<Reverse<HeapKey>>` yields earliest
+/// deadlines first; the slot's packed FFI form is a tiebreaker for
+/// total ordering only — the slotmap version inside [`SlotKey`] is what
+/// gates stale tuples on pop, not anything in the heap ordering.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct HeapKey {
     deadline: Instant,
-    slot: SlotId,
-    generation: u64,
+    slot: SlotKey,
 }
 
 impl Ord for HeapKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.deadline
             .cmp(&other.deadline)
-            .then_with(|| self.slot.0.get().cmp(&other.slot.0.get()))
-            .then_with(|| self.generation.cmp(&other.generation))
+            .then_with(|| self.slot.data().as_ffi().cmp(&other.slot.data().as_ffi()))
     }
 }
 
@@ -688,12 +553,8 @@ impl PartialOrd for HeapKey {
 struct ExpiryHeap(BinaryHeap<Reverse<HeapKey>>);
 
 impl ExpiryHeap {
-    fn push(&mut self, deadline: Instant, slot: SlotId, generation: u64) {
-        self.0.push(Reverse(HeapKey {
-            deadline,
-            slot,
-            generation,
-        }));
+    fn push(&mut self, deadline: Instant, slot: SlotKey) {
+        self.0.push(Reverse(HeapKey { deadline, slot }));
     }
 
     fn peek(&self) -> Option<HeapKey> {
@@ -717,11 +578,10 @@ impl ExpiryHeap {
 fn expiry_push_extend<K, V>(
     st: &mut State<K, V>,
     deadline: Instant,
-    slot: SlotId,
-    generation: u64,
+    slot: SlotKey,
     superseded_finite: bool,
 ) {
-    st.expiry.push(deadline, slot, generation);
+    st.expiry.push(deadline, slot);
     if superseded_finite {
         st.stale_pushes = st.stale_pushes.saturating_add(1);
         // Rebuilding under the same lock keeps the invariant simple
@@ -738,9 +598,9 @@ fn expiry_push_extend<K, V>(
 /// most one tuple per live entry.
 fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
     st.expiry.clear();
-    for (id, es) in st.slab.iter_occupied() {
+    for (id, es) in &st.slab {
         if let Some(dl) = es.entry.deadline {
-            st.expiry.push(dl, id, es.generation);
+            st.expiry.push(dl, id);
         }
     }
     st.stale_pushes = 0;
@@ -771,10 +631,14 @@ where
             break;
         }
         st.expiry.pop();
+        // `slab.get` returns `None` if the slot was evicted or recycled;
+        // the slotmap version on `top.slot` is the gate, no separate
+        // generation field needed. The deadline check still discards
+        // tuples that a read hook superseded for the same live slot.
         let Some(es) = st.slab.get(top.slot) else {
             continue;
         };
-        if es.generation != top.generation || es.entry.deadline != Some(top.deadline) {
+        if es.entry.deadline != Some(top.deadline) {
             continue;
         }
         if let Some(skip) = skip_key
@@ -913,7 +777,7 @@ where
 fn evict_slot<K, V>(
     st: &mut State<K, V>,
     hasher: &DefaultHashBuilder,
-    id: SlotId,
+    id: SlotKey,
 ) -> Option<(K, V, u64)>
 where
     K: Eq + Hash,
@@ -929,7 +793,7 @@ where
     // Take the slot out first so the entries removal can compare against
     // a slab that no longer holds `id` — the probe predicate uses
     // `slab.get(id)`, which now returns `None`, so we hash by the taken
-    // entry's key and match buckets by `SlotId` directly.
+    // entry's key and match buckets by `SlotKey` directly.
     let entry_slot = slab.remove(id)?;
     *total_weight = total_weight.saturating_sub(entry_slot.weight);
     let h = hash_key(hasher, &entry_slot.key);
@@ -949,7 +813,7 @@ fn install_ready<K, V>(
     key: K,
     entry: CacheEntry<V>,
     weight: u64,
-) -> SlotId
+) -> SlotKey
 where
     K: Eq + Hash,
 {
@@ -961,28 +825,20 @@ where
         total_weight,
         ..
     } = st;
-    let idx = slab.next_slot_index();
-    let generation = slab.next_generation_for(idx);
     let deadline = entry.deadline;
     let id = slab.insert(EntrySlot {
         key,
         entry,
         weight,
-        generation,
         lru_prev: None,
         lru_next: None,
         refresh_inflight: false,
     });
-    debug_assert_eq!(
-        id.to_index(),
-        idx as usize,
-        "slab.insert is expected to use the slot index it advertised"
-    );
     evict_list.push_mru(slab, id);
     entries_insert(entries, hasher, slab, id);
     *total_weight = total_weight.saturating_add(weight);
     if let Some(dl) = deadline {
-        expiry.push(dl, id, generation);
+        expiry.push(dl, id);
     }
     id
 }
@@ -1059,7 +915,7 @@ where
                 CachePadded::new(RwLock::new(State {
                     entries: HashTable::with_capacity(initial_capacity),
                     inflight: HashMap::new(),
-                    slab: Slab::with_capacity(initial_capacity),
+                    slab: SlotMap::with_capacity_and_key(initial_capacity),
                     evict_list: EvictList::default(),
                     expiry: ExpiryHeap::default(),
                     stale_pushes: 0,
@@ -1112,21 +968,20 @@ where
             return None;
         }
 
-        let (value, generation, update) = {
+        let (value, update) = {
             let State {
                 slab, evict_list, ..
             } = &mut *st;
             evict_list.promote_to_mru(slab, id);
             let es = slab.get_mut(id)?;
             let value = es.entry.value.clone();
-            let generation = es.generation;
             // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
             // (mutable) don't overlap, so the borrow checker accepts both.
             let update = update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
-            (value, generation, update)
+            (value, update)
         };
         if let Some(dl) = update.new_deadline {
-            expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
+            expiry_push_extend(&mut st, dl, id, update.superseded_finite);
         }
         Some(value)
     }
@@ -1465,7 +1320,7 @@ where
                 .get(id)
                 .is_some_and(|es| entry_is_served(&es.entry, now));
             if still_served {
-                let (value, generation, update) = {
+                let (value, update) = {
                     let State {
                         slab, evict_list, ..
                     } = &mut *st;
@@ -1474,12 +1329,11 @@ where
                         .get_mut(id)
                         .expect("just confirmed Occupied above under our mutex");
                     let value = es.entry.value.clone();
-                    let generation = es.generation;
                     let update = update_read_deadline(key, &mut es.entry, &self.config.policy, now);
-                    (value, generation, update)
+                    (value, update)
                 };
                 if let Some(dl) = update.new_deadline {
-                    expiry_push_extend(&mut st, dl, id, generation, update.superseded_finite);
+                    expiry_push_extend(&mut st, dl, id, update.superseded_finite);
                 }
                 hit = Some(value);
             }
@@ -1783,36 +1637,35 @@ where
 mod size_regressions {
     use super::*;
 
-    /// Lock the niche-packed `Option<SlotId>` size. If this assertion ever
-    /// fires, either the niche optimisation was lost (`SlotId` stopped
-    /// using `NonZeroU32`) or the host pointer width changed in a way that
-    /// invalidates the budget. Either case warrants a deliberate update —
-    /// not an accidental regression that doubles every LRU link.
+    /// Lock the niche-packed [`SlotKey`] size. `slotmap::KeyData` packs an
+    /// index `u32` plus a non-zero version `u32`, so `SlotKey` is one
+    /// machine word and `Option<SlotKey>` is the same size (the version's
+    /// niche absorbs the discriminant). If this fires, either `slotmap`
+    /// changed its key layout or a custom key wrapper lost the niche.
     #[test]
-    fn option_slot_id_is_four_bytes() {
-        assert_eq!(std::mem::size_of::<Option<SlotId>>(), 4);
-        assert_eq!(std::mem::size_of::<SlotId>(), 4);
+    fn option_slot_key_is_eight_bytes() {
+        assert_eq!(std::mem::size_of::<SlotKey>(), 8);
+        assert_eq!(std::mem::size_of::<Option<SlotKey>>(), 8);
     }
 
     /// Lock the `EntrySlot` shape for a representative `<String, String>`
     /// cache against an upper bound rather than an exact byte count, so
     /// the test stays useful across platforms (`Instant` differs in size
     /// between macOS arm64 and `x86_64` / Linux). The load-bearing claim
-    /// is "the LRU links cost 8 bytes total, not 16, because
-    /// `Option<SlotId>` is niche-packed" plus "we did not accidentally
-    /// double-bump a field width".
+    /// is "we did not accidentally double-bump a field width or lose the
+    /// niche on `Option<SlotKey>`".
     #[test]
     fn entry_slot_size_within_budget() {
         // Two `String`s (48) + `CacheEntry<String>` worst-case 64 +
-        // `weight` 8 + `generation` 8 + two `Option<SlotId>` 8 (niche)
-        // + `refresh_inflight` 1 byte (rounded to alignment) gives a
+        // `weight` 8 + two `Option<SlotKey>` 16 (niche) +
+        // `refresh_inflight` 1 byte (rounded to alignment) gives a
         // platform-portable upper bound.
         const BUDGET: usize = 144;
         let observed = std::mem::size_of::<EntrySlot<String, String>>();
         assert!(
             observed <= BUDGET,
             "EntrySlot grew to {observed} bytes (budget {BUDGET}); \
-             check niche packing on Option<SlotId> and field widths",
+             check field widths and Option<SlotKey> niche packing",
         );
     }
 }
