@@ -1062,7 +1062,7 @@ mod borrow_lookup {
     }
 
     #[test]
-    fn contains_key_does_not_promote_lru() {
+    fn contains_key_does_not_bump_freq() {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
         let cache = Cache::<K, V>::new(
             CacheBuilder::new()
@@ -1073,48 +1073,60 @@ mod borrow_lookup {
         );
         cache.insert("a".into(), "va".into());
         cache.insert("b".into(), "vb".into());
-        // `a` is currently LRU. If contains_key promoted it to MRU, the next
-        // insert would evict `b`; otherwise it evicts `a`.
+        // `a` is the Small-tail. If `contains_key` had bumped its
+        // S3-FIFO freq counter the next over-budget insert might still
+        // evict it (a single bump is not enough to hit the freq>1
+        // promotion threshold), but at the very least the cold-tail
+        // eviction below would not be guaranteed under heavier reads.
+        // The point of this test is the asymmetry vs `get`: containment
+        // probes leave the freq counter untouched.
         assert!(cache.contains_key("a"));
         cache.insert("c".into(), "vc".into());
         assert_eq!(
             cache.get("a"),
             None,
-            "contains_key must not have promoted a"
+            "contains_key must not have bumped a's freq counter"
         );
     }
 
-    /// `get` *does* promote the touched entry to MRU. Pair with
-    /// `contains_key_does_not_promote_lru`: together they pin down
-    /// the asymmetry — only value-returning reads count as a "touch"
-    /// for LRU ordering.
+    /// `get` bumps the touched slot's S3-FIFO freq counter without
+    /// reordering it. Pair with `contains_key_does_not_bump_freq`:
+    /// together they pin down the asymmetry — only value-returning
+    /// reads count as a "touch" for the freq-driven promotion path.
+    /// Two reads are needed to clear the `freq > 1` promotion bar so a
+    /// Small-tail slot survives the next over-budget reclaim by being
+    /// migrated into Main rather than evicted.
     #[test]
-    fn get_promotes_touched_entry_to_mru() {
+    fn repeated_get_promotes_warm_entry_into_main() {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
         let cache = Cache::<K, V>::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(2))
+                .max_weight(Weight::new(4))
                 .shards(1)
                 .policy(policy)
                 .build(),
         );
         cache.insert("a".into(), "va".into());
         cache.insert("b".into(), "vb".into());
-        // Touching `a` promotes it; the next over-budget insert must
-        // now evict `b` (the new LRU) rather than `a`.
-        assert_eq!(cache.get("a"), Some("va".into()));
         cache.insert("c".into(), "vc".into());
-        assert_eq!(
-            cache.get("a"),
-            Some("va".into()),
-            "get failed to promote a to MRU"
-        );
-        assert_eq!(
-            cache.get("b"),
-            None,
-            "b should have been evicted as the new LRU"
-        );
-        assert_eq!(cache.get("c"), Some("vc".into()));
+        cache.insert("d".into(), "vd".into());
+        // Two reads each lifts `a` and `b` to freq=2, above the
+        // `freq > 1` Small-tail promotion threshold. `c` and `d` stay
+        // at freq=0 (cold).
+        for _ in 0..2 {
+            assert_eq!(cache.get("a"), Some("va".into()));
+            assert_eq!(cache.get("b"), Some("vb".into()));
+        }
+        cache.insert("e".into(), "ve".into());
+        cache.insert("f".into(), "vf".into());
+        // `a` and `b` migrated to Main on Small-tail processing; the
+        // cold tails `c` and `d` were evicted to make room.
+        assert_eq!(cache.get("a"), Some("va".into()), "warm a survived in Main");
+        assert_eq!(cache.get("b"), Some("vb".into()), "warm b survived in Main");
+        assert_eq!(cache.get("c"), None, "cold c was evicted from Small");
+        assert_eq!(cache.get("d"), None, "cold d was evicted from Small");
+        assert_eq!(cache.get("e"), Some("ve".into()));
+        assert_eq!(cache.get("f"), Some("vf".into()));
     }
 }
 
@@ -1746,8 +1758,9 @@ mod mutation_guards {
     /// path is allowed to leave the cache temporarily over-budget
     /// (otherwise callers could never replace an oversized entry).
     /// Regression guard for the `slab.len() <= 1` short-circuit in
-    /// `Inner::reclaim` — without it the eviction loop would try to
-    /// promote the entry being replaced back to MRU and never break.
+    /// `evict_from_small` / `evict_from_main` — without it the
+    /// reclaim loop would keep promoting the entry being replaced back
+    /// to its current queue's head and never terminate.
     #[test]
     fn oversized_entry_can_be_replaced_when_it_alone_exceeds_budget() {
         let cache = Cache::new(
@@ -1906,7 +1919,7 @@ mod insert_vs_leader {
     //! the shard lock, removes its lane, and installs its value. Without
     //! a dedup at install time, both rows survive in `entries` (and both
     //! slots in the slab); `len` / `weight` then double-count and the
-    //! "ghost" slot leaks until LRU eviction removes it.
+    //! "ghost" slot leaks until S3-FIFO reclaim removes it.
 
     use super::*;
 

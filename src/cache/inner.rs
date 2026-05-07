@@ -282,9 +282,10 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static> {
     pub(crate) config: CacheConfig<K, V, P>,
     /// Per-shard state, cache-padded to keep adjacent shards out of each
     /// other's cache lines. Single-key paths take exactly one shard's
-    /// `RwLock` (mostly `.write()` because reads mutate LRU and expiry
-    /// state; pure read-only views — `contains_key`, `len`, `is_empty`,
-    /// `weight` — take `.read()`). Multi-key paths fold across all shards.
+    /// `RwLock` (mostly `.write()` because reads mutate the slot's
+    /// S3-FIFO `freq` counter and read-deadline state; pure read-only
+    /// views — `contains_key`, `len`, `is_empty`, `weight` — take
+    /// `.read()`). Multi-key paths fold across all shards.
     ///
     /// `clashcore::lock::RwLock` is `lock_api::RwLock<RawRwLock, T>`: a
     /// single-CAS uncontended fast path with no poisoning. Releasing
@@ -341,6 +342,23 @@ fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
     hasher.hash_one(key)
 }
 
+/// Inverse-fraction sizing for the S3-FIFO Small queue: per shard,
+/// `small_max_weight = shard_max_weight / SMALL_DENOMINATOR`. Yang et
+/// al. (SOSP'23) §4 default to S = 10%; the V1 mokabench validation
+/// pass on the same trace set we baseline against (DS1, S2/S3, P-series,
+/// OLTP) preferred a smaller Small (~3%) — closer to `quick_cache`'s
+/// `hot_allocation = 0.97` — across nearly every operating point. Held
+/// as a module-level constant rather than a builder knob so the tuning
+/// surface stays narrow for V1; revisit if a workload demands per-cache
+/// override.
+const SMALL_DENOMINATOR: u64 = 33;
+
+/// Per-slot frequency-counter saturation cap. The cutoff at 3 mirrors
+/// Yang et al.'s reference: enough resolution for `evict_from_small` to
+/// distinguish "single-touch" from "warm" without growing the counter
+/// past a single byte.
+const FREQ_CAP: u8 = 3;
+
 /// `entries` lookup that compares keys through the slab — the table only
 /// holds [`SlotKey`] so equality lives on `EntrySlot::key`. Returns
 /// `None` when no slot matches (or when the matching bucket points at a
@@ -372,16 +390,10 @@ fn entries_insert<K, V>(
     hasher: &DefaultHashBuilder,
     slab: &EntrySlab<K, V>,
     id: SlotKey,
+    key_hash: u64,
 ) where
     K: Hash + Eq,
 {
-    let key_hash = hash_key(
-        hasher,
-        &slab
-            .get(id)
-            .expect("entries_insert: slot must be occupied")
-            .key,
-    );
     entries.insert_unique(key_hash, id, |&other| {
         hash_key(
             hasher,
@@ -476,7 +488,6 @@ pub(crate) struct CacheEntry<V> {
 /// one queue at a time, which is why `EntrySlot` only carries one
 /// `(fifo_prev, fifo_next)` pair to thread it through whichever queue
 /// owns it.
-#[allow(dead_code)] // Main constructed by the cutover commit (evict_from_small promotion)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Queue {
     Small,
@@ -487,7 +498,6 @@ enum Queue {
 /// eviction find and remove the corresponding `entries` map slot in O(1).
 /// Slot identity / freshness lives on [`SlotKey`] (slotmap version), not
 /// on a per-entry generation field.
-#[allow(dead_code)] // queue/freq read by the cutover commit (evict_from_small / read paths)
 struct EntrySlot<K, V> {
     key: K,
     entry: CacheEntry<V>,
@@ -552,7 +562,6 @@ pub(crate) struct Fifo {
     tail: Option<SlotKey>,
 }
 
-#[allow(dead_code)] // pop_tail / head / is_empty / clear used by the cutover commit
 impl Fifo {
     fn push_head<T: FifoNode>(&mut self, slab: &mut SlotMap<SlotKey, T>, id: SlotKey) {
         let node = slab
@@ -615,21 +624,8 @@ impl Fifo {
         self.push_head(slab, id);
     }
 
-    fn head(&self) -> Option<SlotKey> {
-        self.head
-    }
-
     fn tail(&self) -> Option<SlotKey> {
         self.tail
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head.is_none()
-    }
-
-    fn clear(&mut self) {
-        self.head = None;
-        self.tail = None;
     }
 }
 
@@ -649,14 +645,12 @@ impl Fifo {
 /// shrinks effective ghost capacity transiently under high promotion
 /// rates. The trade-off is deliberate: the alternative (linear scan
 /// on `remove`) is O(cap) and untenable for million-entry caches.
-#[allow(dead_code)] // ring/set/cap consumed by insert/remove (wired in cutover commit)
 pub(crate) struct GhostSet {
     ring: VecDeque<u64>,
     set: HashTable<u64>,
     cap: usize,
 }
 
-#[allow(dead_code)] // insert / remove / contains used by the cutover commit
 impl GhostSet {
     fn new(cap: usize) -> Self {
         Self {
@@ -753,7 +747,7 @@ mod fifo_tests {
 
     fn collect_tail_to_head(fifo: &Fifo, slab: &SlotMap<SlotKey, TestNode>) -> Vec<SlotKey> {
         let mut out = Vec::new();
-        let mut cur = fifo.tail();
+        let mut cur = fifo.tail;
         while let Some(id) = cur {
             out.push(id);
             cur = slab.get(id).and_then(FifoNode::fifo_prev);
@@ -772,13 +766,14 @@ mod fifo_tests {
         fifo.push_head(&mut slab, b);
         fifo.push_head(&mut slab, c);
 
-        assert_eq!(fifo.head(), Some(c));
-        assert_eq!(fifo.tail(), Some(a));
+        assert_eq!(fifo.head, Some(c));
+        assert_eq!(fifo.tail, Some(a));
         assert_eq!(fifo.pop_tail(&mut slab), Some(a));
         assert_eq!(fifo.pop_tail(&mut slab), Some(b));
         assert_eq!(fifo.pop_tail(&mut slab), Some(c));
         assert_eq!(fifo.pop_tail(&mut slab), None);
-        assert!(fifo.is_empty());
+        assert_eq!(fifo.head, None);
+        assert_eq!(fifo.tail, None);
     }
 
     #[test]
@@ -808,11 +803,12 @@ mod fifo_tests {
         fifo.push_head(&mut slab, b);
 
         fifo.unlink(&mut slab, b);
-        assert_eq!(fifo.head(), Some(a));
-        assert_eq!(fifo.tail(), Some(a));
+        assert_eq!(fifo.head, Some(a));
+        assert_eq!(fifo.tail, Some(a));
 
         fifo.unlink(&mut slab, a);
-        assert!(fifo.is_empty());
+        assert_eq!(fifo.head, None);
+        assert_eq!(fifo.tail, None);
     }
 
     #[test]
@@ -828,8 +824,8 @@ mod fifo_tests {
 
         fifo.promote_to_head(&mut slab, a);
         assert_eq!(collect_tail_to_head(&fifo, &slab), vec![b, c, a]);
-        assert_eq!(fifo.head(), Some(a));
-        assert_eq!(fifo.tail(), Some(b));
+        assert_eq!(fifo.head, Some(a));
+        assert_eq!(fifo.tail, Some(b));
     }
 
     #[test]
@@ -842,8 +838,8 @@ mod fifo_tests {
         fifo.push_head(&mut slab, b);
 
         fifo.promote_to_head(&mut slab, b);
-        assert_eq!(fifo.head(), Some(b));
-        assert_eq!(fifo.tail(), Some(a));
+        assert_eq!(fifo.head, Some(b));
+        assert_eq!(fifo.tail, Some(a));
     }
 
     #[test]
@@ -851,18 +847,6 @@ mod fifo_tests {
         let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(0);
         let mut fifo = Fifo::default();
         assert_eq!(fifo.pop_tail(&mut slab), None);
-    }
-
-    #[test]
-    fn clear_resets_endpoints() {
-        let mut slab: SlotMap<SlotKey, TestNode> = SlotMap::with_capacity_and_key(8);
-        let mut fifo = Fifo::default();
-        let a = slab.insert(TestNode::default());
-        fifo.push_head(&mut slab, a);
-        fifo.clear();
-        assert!(fifo.is_empty());
-        assert_eq!(fifo.head(), None);
-        assert_eq!(fifo.tail(), None);
     }
 }
 
@@ -1073,7 +1057,7 @@ where
 
 /// Result of a single [`Inner::reclaim`] pass. Split per lifecycle reason so
 /// the caller fires `TimeExpired` for the deadline drain and `EvictedSize`
-/// for the LRU drain that brought weight back under capacity.
+/// for the S3-FIFO size drain that brought weight back under capacity.
 struct Reclaimed<K, V> {
     expired: Vec<(K, V)>,
     evicted: Vec<(K, V)>,
@@ -1183,8 +1167,10 @@ where
 }
 
 /// Removes the slab slot at `id` and the matching `entries` map row, drops it
-/// from the LRU list, and returns the owned `(K, V)` plus the entry's cached
-/// weight (already subtracted from `total_weight`). Returns `None` if the
+/// from whichever S3-FIFO queue it currently belongs to (consulted via
+/// `EntrySlot::queue`), and returns the owned `(K, V)` plus the entry's
+/// cached weight (already subtracted from `total_weight`, and from
+/// `small_weight` when the slot lived in Small). Returns `None` if the
 /// slot was already free (defensive — should not happen under our invariants).
 /// Stale tuples in `state.expiry` are not removed here; lazy validation on
 /// pop discards them once the slot is recycled. Stale `entries` rows are
@@ -1203,18 +1189,26 @@ where
         entries,
         slab,
         small,
+        main,
         small_weight,
         total_weight,
         ..
     } = st;
-    small.unlink(slab, id);
+    let queue = slab.get(id)?.queue;
+    let fifo = match queue {
+        Queue::Small => small,
+        Queue::Main => main,
+    };
+    fifo.unlink(slab, id);
     // Take the slot out first so the entries removal can compare against
     // a slab that no longer holds `id` — the probe predicate uses
     // `slab.get(id)`, which now returns `None`, so we hash by the taken
     // entry's key and match buckets by `SlotKey` directly.
     let entry_slot = slab.remove(id)?;
     *total_weight = total_weight.saturating_sub(entry_slot.weight);
-    *small_weight = small_weight.saturating_sub(entry_slot.weight);
+    if matches!(queue, Queue::Small) {
+        *small_weight = small_weight.saturating_sub(entry_slot.weight);
+    }
     let h = hash_key(hasher, &entry_slot.key);
     if let Ok(occ) = entries.find_entry(h, |&other| other == id) {
         occ.remove();
@@ -1222,10 +1216,13 @@ where
     Some((entry_slot.key, entry_slot.entry.value, entry_slot.weight))
 }
 
-/// Allocate a slab slot for `key`/`entry`/`weight`, push it to MRU, register
-/// it in `state.entries`, bump `total_weight`, and (if applicable) push the
-/// deadline into `state.expiry`. Centralises every install site so the heap
-/// invariant cannot be silently dropped.
+/// Allocate a slab slot for `key`/`entry`/`weight`, route it to the
+/// right S3-FIFO queue (Main when its fingerprint sits in `ghost`,
+/// otherwise Small), register it in `state.entries`, bump
+/// `total_weight` (and `small_weight` when the entry lands in Small),
+/// and (if applicable) push the deadline into `state.expiry`.
+/// Centralises every install site so the heap invariant cannot be
+/// silently dropped.
 fn install_ready<K, V>(
     st: &mut State<K, V>,
     hasher: &DefaultHashBuilder,
@@ -1240,26 +1237,37 @@ where
         entries,
         slab,
         small,
+        main,
+        ghost,
         small_weight,
         expiry,
         total_weight,
         ..
     } = st;
     let deadline = entry.deadline;
+    let key_hash = hash_key(hasher, &key);
+    // Ghost membership is consume-on-hit: a true return removes the
+    // fingerprint and routes the entry into Main with freq=0.
+    let to_main = ghost.remove(key_hash);
+    let queue = if to_main { Queue::Main } else { Queue::Small };
     let id = slab.insert(EntrySlot {
         key,
         entry,
         weight,
-        queue: Queue::Small,
+        queue,
         freq: 0,
         fifo_prev: None,
         fifo_next: None,
         refresh_inflight: false,
     });
-    small.push_head(slab, id);
-    entries_insert(entries, hasher, slab, id);
+    if to_main {
+        main.push_head(slab, id);
+    } else {
+        small.push_head(slab, id);
+        *small_weight = small_weight.saturating_add(weight);
+    }
+    entries_insert(entries, hasher, slab, id, key_hash);
     *total_weight = total_weight.saturating_add(weight);
-    *small_weight = small_weight.saturating_add(weight);
     if let Some(dl) = deadline {
         expiry.push(dl, id);
     }
@@ -1400,9 +1408,8 @@ where
         }
 
         let (value, update) = {
-            let State { slab, small, .. } = &mut *st;
-            small.promote_to_head(slab, id);
-            let es = slab.get_mut(id)?;
+            let es = st.slab.get_mut(id)?;
+            es.freq = es.freq.saturating_add(1).min(FREQ_CAP);
             let value = es.entry.value.clone();
             // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
             // (mutable) don't overlap, so the borrow checker accepts both.
@@ -1479,14 +1486,17 @@ where
                 ..
             } = &mut *st;
             let mut drained: Vec<(K, V)> = Vec::with_capacity(slab.len());
-            while let Some(tail) = small.pop_tail(slab) {
+            // Deterministic drain order: Main first (warm tail-to-head),
+            // then Small (cold tail-to-head). The order does not carry
+            // an "oldest-first" meaning (S3-FIFO has no global recency
+            // axis); it is documented purely so observers see a stable
+            // sequence of `Removed` lifecycle events across runs.
+            while let Some(tail) = main.pop_tail(slab) {
                 if let Some(entry_slot) = slab.remove(tail) {
                     drained.push((entry_slot.key, entry_slot.entry.value));
                 }
             }
-            // `main` stays empty until the cutover commit, but draining
-            // it explicitly keeps `Cache::clear` honest for Stage 3.
-            while let Some(tail) = main.pop_tail(slab) {
+            while let Some(tail) = small.pop_tail(slab) {
                 if let Some(entry_slot) = slab.remove(tail) {
                     drained.push((entry_slot.key, entry_slot.entry.value));
                 }
@@ -1581,11 +1591,15 @@ where
     ///    the matching slots. Lazy validation discards stale tuples in O(1).
     ///    Cost: `O(d log n)` for `d` validated victims; `O(s log n)` for
     ///    `s` stale tuples observed.
-    /// 2. **Size drain** — while the projected post-install weight exceeds
-    ///    `max_weight`, drop the LRU tail. Each victim is O(1): tail lookup,
-    ///    `evict_slot`, repeat. The skip-key short-circuit (promote the
-    ///    skip slot to MRU when it surfaces at the tail) prevents evicting
-    ///    the entry the caller is about to install or replace.
+    /// 2. **S3-FIFO size drain** — while the projected post-install weight
+    ///    exceeds `max_weight`, drain Small first when it sits over its
+    ///    `shard_max_weight / SMALL_DENOMINATOR` budget, otherwise drain
+    ///    Main. Each `evict_from_small` either promotes the tail slot to
+    ///    Main (when its `freq > 1`) or evicts + records its fingerprint
+    ///    in `ghost`. Each `evict_from_main` either recirculates the
+    ///    tail (decrementing `freq`) or evicts. The skip-key short-circuit
+    ///    is preserved on both queues: the skip slot, when surfacing at
+    ///    the tail, is promoted back to its current queue's head.
     ///
     /// Returns the two victim lists separately so the caller can fire the
     /// correct lifecycle reason for each phase.
@@ -1612,31 +1626,154 @@ where
             .map_or(0, |es| es.weight);
 
         let max = self.shard_max_weight;
+        let small_max = max / SMALL_DENOMINATOR;
         let mut evicted = Vec::new();
         loop {
             if !Self::projected_weight_over_capacity(st, displaced_weight, add_w, max) {
                 break;
             }
-            let Some(tail_id) = st.small.tail() else {
-                break;
+            // Try the prescribed queue first; fall back to the other if
+            // the prescribed one had nothing actionable. This handles
+            // the transient cases where Small drained to empty mid-pass
+            // (we still need to reclaim from Main) and vice versa.
+            let small_first = st.small_weight > small_max;
+            let primary = if small_first {
+                self.evict_from_small(st, skip_key, &mut evicted)
+            } else {
+                self.evict_from_main(st, skip_key, &mut evicted)
             };
-            let Some(tail_slot) = st.slab.get(tail_id) else {
-                break;
-            };
-            if &tail_slot.key == skip_key {
-                if st.slab.len() <= 1 {
-                    break;
-                }
-                let State { slab, small, .. } = &mut *st;
-                small.promote_to_head(slab, tail_id);
+            if primary {
                 continue;
             }
-            let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
-                break;
+            let secondary = if small_first {
+                self.evict_from_main(st, skip_key, &mut evicted)
+            } else {
+                self.evict_from_small(st, skip_key, &mut evicted)
             };
-            evicted.push((k, v));
+            if !secondary {
+                break;
+            }
         }
         Reclaimed { expired, evicted }
+    }
+
+    /// One step against the Small queue's tail. Returns `true` when state
+    /// changed (promotion to Main, eviction, or skip-key rotation) so the
+    /// outer reclaim loop iterates; `false` when Small is empty.
+    fn evict_from_small(
+        &self,
+        st: &mut State<K, V>,
+        skip_key: &K,
+        evicted: &mut Vec<(K, V)>,
+    ) -> bool
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let Some(tail_id) = st.small.tail() else {
+            return false;
+        };
+        let (key_eq_skip, freq, fp) = {
+            let Some(tail_slot) = st.slab.get(tail_id) else {
+                return false;
+            };
+            (
+                &tail_slot.key == skip_key,
+                tail_slot.freq,
+                hash_key(&self.hasher, &tail_slot.key),
+            )
+        };
+
+        if key_eq_skip {
+            if st.slab.len() <= 1 {
+                return false;
+            }
+            let State { slab, small, .. } = &mut *st;
+            small.promote_to_head(slab, tail_id);
+            return true;
+        }
+
+        if freq > 1 {
+            // Warm slot: migrate Small → Main with freq reset to 0.
+            let State {
+                slab,
+                small,
+                main,
+                small_weight,
+                ..
+            } = &mut *st;
+            small.unlink(slab, tail_id);
+            let es = slab
+                .get_mut(tail_id)
+                .expect("Small tail must be occupied");
+            let w = es.weight;
+            es.queue = Queue::Main;
+            es.freq = 0;
+            *small_weight = small_weight.saturating_sub(w);
+            main.push_head(slab, tail_id);
+            true
+        } else {
+            // Cold slot: evict and seed ghost so a quick re-insert
+            // routes the returning entry straight to Main.
+            let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
+                return false;
+            };
+            st.ghost.insert(fp);
+            evicted.push((k, v));
+            true
+        }
+    }
+
+    /// One step against the Main queue's tail. Returns `true` when state
+    /// changed (recirculation, eviction, or skip-key rotation) so the
+    /// outer reclaim loop iterates; `false` when Main is empty.
+    fn evict_from_main(
+        &self,
+        st: &mut State<K, V>,
+        skip_key: &K,
+        evicted: &mut Vec<(K, V)>,
+    ) -> bool
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let Some(tail_id) = st.main.tail() else {
+            return false;
+        };
+        let (key_eq_skip, freq) = {
+            let Some(tail_slot) = st.slab.get(tail_id) else {
+                return false;
+            };
+            (&tail_slot.key == skip_key, tail_slot.freq)
+        };
+
+        if key_eq_skip {
+            if st.slab.len() <= 1 {
+                return false;
+            }
+            let State { slab, main, .. } = &mut *st;
+            main.promote_to_head(slab, tail_id);
+            return true;
+        }
+
+        if freq > 0 {
+            // Recirculate: decrement freq and reinsert at Main head.
+            // Each Main slot is touched at most FREQ_CAP+1 times before
+            // being forced to freq=0 and dropped, bounding loop work.
+            let State { slab, main, .. } = &mut *st;
+            main.unlink(slab, tail_id);
+            let es = slab.get_mut(tail_id).expect("Main tail must be occupied");
+            es.freq = es.freq.saturating_sub(1);
+            main.push_head(slab, tail_id);
+            true
+        } else {
+            // No second-chance seed: only Small evictions populate ghost.
+            let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
+                return false;
+            };
+            evicted.push((k, v));
+            true
+        }
     }
 
     fn fire_reclaim(&self, r: Reclaimed<K, V>)
@@ -1713,11 +1850,11 @@ where
     }
 
     /// Acquires the shard write lock, drains an expired entry (if any),
-    /// promotes a still-live entry to MRU + pushes a refreshed read-side
-    /// expiry, then hands control to `then` with the held lock and the
-    /// hit (if any). The closure runs in the same critical section so
-    /// the install/join-lane decision sees no TOCTOU window between hit
-    /// detection and lane install.
+    /// bumps the freq counter on a still-live entry + pushes a
+    /// refreshed read-side expiry, then hands control to `then` with
+    /// the held lock and the hit (if any). The closure runs in the
+    /// same critical section so the install/join-lane decision sees no
+    /// TOCTOU window between hit detection and lane install.
     ///
     /// Releases and retakes the shard lock around the `TimeExpired`
     /// lifecycle callback so observers may re-enter the cache. The
@@ -1757,11 +1894,11 @@ where
                 .is_some_and(|es| entry_is_served(&es.entry, now));
             if still_served {
                 let (value, update) = {
-                    let State { slab, small, .. } = &mut *st;
-                    small.promote_to_head(slab, id);
-                    let es = slab
+                    let es = st
+                        .slab
                         .get_mut(id)
                         .expect("just confirmed Occupied above under our mutex");
+                    es.freq = es.freq.saturating_add(1).min(FREQ_CAP);
                     let value = es.entry.value.clone();
                     let update = update_read_deadline(key, &mut es.entry, &self.config.policy, now);
                     (value, update)
