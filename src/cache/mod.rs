@@ -4,6 +4,7 @@
 mod expiry;
 mod flight;
 mod inner;
+mod reclaim;
 mod slab;
 
 use std::borrow::Borrow;

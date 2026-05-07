@@ -8,11 +8,12 @@ use clashcore::CachePadded;
 use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 
-use super::expiry::{ExpiryHeap, drain_expired, expiry_push_extend};
+use super::expiry::{ExpiryHeap, expiry_push_extend};
 use super::flight::{
     Flight, InflightLane, LeaderGuard, MissFlight, MissStep, NewFlight, SyncMissFlight,
     install_or_join_lane, remove_lane,
 };
+use super::reclaim::{Reclaimed, reclaim};
 use super::slab::{CacheEntry, EntrySlab, EntrySlot, Fifo, GhostSet, Queue, SlotKey};
 use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
@@ -80,7 +81,7 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = Default
 /// derivation guarantees insert and lookup hash the same bytes the same
 /// way; otherwise a `Borrow`-related mismatch would silently produce
 /// missed lookups.
-fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
+pub(super) fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
     hasher.hash_one(key)
 }
 
@@ -93,7 +94,7 @@ fn hash_key<H: BuildHasher, Q: Hash + ?Sized>(hasher: &H, key: &Q) -> u64 {
 /// as a module-level constant rather than a builder knob so the tuning
 /// surface stays narrow for V1; revisit if a workload demands per-cache
 /// override.
-const SMALL_DENOMINATOR: u64 = 33;
+pub(super) const SMALL_DENOMINATOR: u64 = 33;
 
 /// Per-slot frequency-counter saturation cap. The cutoff at 3 mirrors
 /// Yang et al.'s reference: enough resolution for `evict_from_small` to
@@ -106,7 +107,7 @@ const FREQ_CAP: u8 = 3;
 /// `None` when no slot matches (or when the matching bucket points at a
 /// slot whose `slotmap` version no longer matches, which is the
 /// self-cleaning behaviour we get for free from `slab.get`).
-fn entries_find<K, V, Q, H>(
+pub(super) fn entries_find<K, V, Q, H>(
     entries: &HashTable<SlotKey>,
     hasher: &H,
     slab: &EntrySlab<K, V>,
@@ -184,24 +185,24 @@ pub(crate) struct State<K, V> {
     /// toward the tail. The reclaim path's `evict_from_small` decides
     /// per slot whether to promote into `main` (warm) or evict +
     /// fingerprint into `ghost` (cold).
-    small: Fifo,
+    pub(super) small: Fifo,
     /// S3-FIFO Main queue. Holds slots that survived a Small-tail
     /// promotion or were re-inserted while their fingerprint sat in
     /// `ghost`. Stage 2 keeps this empty; the cutover commit wires
     /// admission and the recirculation loop.
-    main: Fifo,
+    pub(super) main: Fifo,
     /// Bounded set of fingerprints recently evicted from `small`. The
     /// install path consumes membership to route a returning key
     /// straight to `main`. Stage 2 keeps this empty; the cutover commit
     /// wires population and consumption.
-    ghost: GhostSet,
+    pub(super) ghost: GhostSet,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over
     /// slots currently in `small`. Cutover uses
     /// `small_weight > shard_max_weight / SMALL_DENOMINATOR` to decide
     /// whether to drain Small first vs Main. Maintained eagerly on
     /// install / evict so the cutover does not have to retrofit the
     /// invariant onto existing call sites.
-    small_weight: u64,
+    pub(super) small_weight: u64,
     /// Min-heap of `(deadline, slot)` tuples used to find past-deadline
     /// entries in `O(log n)`. Validated lazily on pop: a tuple is
     /// honoured only if `slab.get(slot)` returns `Some` (slotmap version
@@ -220,14 +221,6 @@ pub(crate) struct State<K, V> {
     pub(super) stale_pushes: u64,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
-}
-
-/// Result of a single [`Inner::reclaim`] pass. Split per lifecycle reason so
-/// the caller fires `TimeExpired` for the deadline drain and `EvictedSize`
-/// for the S3-FIFO size drain that brought weight back under capacity.
-struct Reclaimed<K, V> {
-    expired: Vec<(K, V)>,
-    evicted: Vec<(K, V)>,
 }
 
 /// Removes the slab slot at `id` and the matching `entries` map row, drops it
@@ -611,7 +604,7 @@ where
         let existing_id = entries_find(&st.entries, &self.hasher, &st.slab, &key);
         let prev = existing_id.and_then(|id| st.slab.get(id).map(|es| es.entry.value.clone()));
 
-        let reclaimed = self.reclaim(&mut st, new_w, &key, now);
+        let reclaimed = reclaim(self, &mut st, new_w, &key, now);
 
         // `reclaim` never evicts `skip_key`, so `existing_id` is still valid
         // here if it was valid before the call.
@@ -655,198 +648,6 @@ where
         Some(v)
     }
 
-    /// Two-phase capacity reclaim, called before installing a new entry of
-    /// weight `add_w` for `skip_key`:
-    ///
-    /// 1. **Expiry drain** — pop heap tuples with `deadline ≤ now` and evict
-    ///    the matching slots. Lazy validation discards stale tuples in O(1).
-    ///    Cost: `O(d log n)` for `d` validated victims; `O(s log n)` for
-    ///    `s` stale tuples observed.
-    /// 2. **S3-FIFO size drain** — while the projected post-install weight
-    ///    exceeds `max_weight`, drain Small first when it sits over its
-    ///    `shard_max_weight / SMALL_DENOMINATOR` budget, otherwise drain
-    ///    Main. Each `evict_from_small` either promotes the tail slot to
-    ///    Main (when its `freq > 1`) or evicts + records its fingerprint
-    ///    in `ghost`. Each `evict_from_main` either recirculates the
-    ///    tail (decrementing `freq`) or evicts. The skip-key short-circuit
-    ///    is preserved on both queues: the skip slot, when surfacing at
-    ///    the tail, is promoted back to its current queue's head.
-    ///
-    /// Returns the two victim lists separately so the caller can fire the
-    /// correct lifecycle reason for each phase.
-    fn reclaim(
-        &self,
-        st: &mut State<K, V>,
-        add_w: u64,
-        skip_key: &K,
-        now: Instant,
-    ) -> Reclaimed<K, V>
-    where
-        K: 'static,
-        V: 'static,
-    {
-        let expired = drain_expired(st, &self.hasher, now, Some(skip_key));
-
-        // Hoist the existing-slot weight lookup out of the loop: the
-        // skip_key short-circuit means its slot is never reclaimed in this
-        // pass, so its weight is invariant across iterations. Only
-        // `state.total_weight` changes per iteration; the projection then
-        // becomes a couple of arithmetic ops instead of a HashTable probe.
-        let displaced_weight = entries_find(&st.entries, &self.hasher, &st.slab, skip_key)
-            .and_then(|id| st.slab.get(id))
-            .map_or(0, |es| es.weight);
-
-        let max = self.shard_max_weight;
-        let small_max = max / SMALL_DENOMINATOR;
-        let mut evicted = Vec::new();
-        loop {
-            if !Self::projected_weight_over_capacity(st, displaced_weight, add_w, max) {
-                break;
-            }
-            // Try the prescribed queue first; fall back to the other if
-            // the prescribed one had nothing actionable. This handles
-            // the transient cases where Small drained to empty mid-pass
-            // (we still need to reclaim from Main) and vice versa.
-            let small_first = st.small_weight > small_max;
-            let primary = if small_first {
-                self.evict_from_small(st, skip_key, &mut evicted)
-            } else {
-                self.evict_from_main(st, skip_key, &mut evicted)
-            };
-            if primary {
-                continue;
-            }
-            let secondary = if small_first {
-                self.evict_from_main(st, skip_key, &mut evicted)
-            } else {
-                self.evict_from_small(st, skip_key, &mut evicted)
-            };
-            if !secondary {
-                break;
-            }
-        }
-        Reclaimed { expired, evicted }
-    }
-
-    /// One step against the Small queue's tail. Returns `true` when state
-    /// changed (promotion to Main, eviction, or skip-key rotation) so the
-    /// outer reclaim loop iterates; `false` when Small is empty.
-    fn evict_from_small(
-        &self,
-        st: &mut State<K, V>,
-        skip_key: &K,
-        evicted: &mut Vec<(K, V)>,
-    ) -> bool
-    where
-        K: 'static,
-        V: 'static,
-    {
-        let Some(tail_id) = st.small.tail() else {
-            return false;
-        };
-        let (key_eq_skip, freq, fp) = {
-            let Some(tail_slot) = st.slab.get(tail_id) else {
-                return false;
-            };
-            (
-                &tail_slot.key == skip_key,
-                tail_slot.freq,
-                hash_key(&self.hasher, &tail_slot.key),
-            )
-        };
-
-        if key_eq_skip {
-            if st.slab.len() <= 1 {
-                return false;
-            }
-            let State { slab, small, .. } = &mut *st;
-            small.promote_to_head(slab, tail_id);
-            return true;
-        }
-
-        if freq > 1 {
-            // Warm slot: migrate Small → Main with freq reset to 0.
-            let State {
-                slab,
-                small,
-                main,
-                small_weight,
-                ..
-            } = &mut *st;
-            small.unlink(slab, tail_id);
-            let es = slab
-                .get_mut(tail_id)
-                .expect("Small tail must be occupied");
-            let w = es.weight;
-            es.queue = Queue::Main;
-            es.freq = 0;
-            *small_weight = small_weight.saturating_sub(w);
-            main.push_head(slab, tail_id);
-            true
-        } else {
-            // Cold slot: evict and seed ghost so a quick re-insert
-            // routes the returning entry straight to Main.
-            let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
-                return false;
-            };
-            st.ghost.insert(fp);
-            evicted.push((k, v));
-            true
-        }
-    }
-
-    /// One step against the Main queue's tail. Returns `true` when state
-    /// changed (recirculation, eviction, or skip-key rotation) so the
-    /// outer reclaim loop iterates; `false` when Main is empty.
-    fn evict_from_main(
-        &self,
-        st: &mut State<K, V>,
-        skip_key: &K,
-        evicted: &mut Vec<(K, V)>,
-    ) -> bool
-    where
-        K: 'static,
-        V: 'static,
-    {
-        let Some(tail_id) = st.main.tail() else {
-            return false;
-        };
-        let (key_eq_skip, freq) = {
-            let Some(tail_slot) = st.slab.get(tail_id) else {
-                return false;
-            };
-            (&tail_slot.key == skip_key, tail_slot.freq)
-        };
-
-        if key_eq_skip {
-            if st.slab.len() <= 1 {
-                return false;
-            }
-            let State { slab, main, .. } = &mut *st;
-            main.promote_to_head(slab, tail_id);
-            return true;
-        }
-
-        if freq > 0 {
-            // Recirculate: decrement freq and reinsert at Main head.
-            // Each Main slot is touched at most FREQ_CAP+1 times before
-            // being forced to freq=0 and dropped, bounding loop work.
-            let State { slab, main, .. } = &mut *st;
-            main.unlink(slab, tail_id);
-            let es = slab.get_mut(tail_id).expect("Main tail must be occupied");
-            es.freq = es.freq.saturating_sub(1);
-            main.push_head(slab, tail_id);
-            true
-        } else {
-            // No second-chance seed: only Small evictions populate ghost.
-            let Some((k, v, _)) = evict_slot(st, &self.hasher, tail_id) else {
-                return false;
-            };
-            evicted.push((k, v));
-            true
-        }
-    }
-
     fn fire_reclaim(&self, r: Reclaimed<K, V>)
     where
         K: 'static,
@@ -858,19 +659,6 @@ where
         for (k, v) in r.evicted {
             self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
         }
-    }
-
-    fn projected_weight_over_capacity(
-        st: &State<K, V>,
-        displaced_weight: u64,
-        new_entry_weight: u64,
-        max: u64,
-    ) -> bool {
-        let projected = st
-            .total_weight
-            .saturating_sub(displaced_weight)
-            .saturating_add(new_entry_weight);
-        projected > max
     }
 
     fn notify_lifecycle(&self, reason: LifecycleReason, key: K, value: Option<V>)
@@ -903,7 +691,7 @@ where
     {
         let deadline = deadline_after_write(&self.config.policy, key, v, now);
         let nw = self.config.policy.weight(key, v).get();
-        let reclaimed = self.reclaim(st, nw, key, now);
+        let reclaimed = reclaim(self, st, nw, key, now);
         let displaced = entries_find(&st.entries, &self.hasher, &st.slab, key)
             .and_then(|id| evict_slot(st, &self.hasher, id).map(|(_, prev, _)| prev));
         install_ready(
@@ -1167,7 +955,7 @@ where
         let mut st = self.shard_for(key).write();
         let now = Instant::now();
         let nw = self.config.policy.weight(key, &v).get();
-        let reclaimed = self.reclaim(&mut st, nw, key, now);
+        let reclaimed = reclaim(self, &mut st, nw, key, now);
         let displaced = match entries_find(&st.entries, &self.hasher, &st.slab, key) {
             Some(id) => evict_slot(&mut st, &self.hasher, id).map(|(_, v, _)| v),
             None => None,
