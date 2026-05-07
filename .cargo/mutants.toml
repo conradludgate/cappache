@@ -1,0 +1,12 @@
+# cargo-mutants configuration.
+#
+# Mutants flips operators / drops calls / replaces returns to find tests
+# that pass when the implementation is silently broken; survivors point
+# at coverage gaps worth filling.
+#
+# Run with: `cargo mutants -j 8` (eight workers fits a 16-core dev box;
+# tune to your machine). Survivors live in `mutants.out/missed.txt`;
+# triage them by hand — a handful are pure-perf knobs and dead-code
+# trait impls that are not worth a dedicated test.
+
+exclude_globs = ["benches/**"]

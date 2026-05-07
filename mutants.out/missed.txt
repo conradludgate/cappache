@@ -1,0 +1,17 @@
+src/config.rs:83:5: replace default_shard_count -> usize with 0
+src/config.rs:83:5: replace default_shard_count -> usize with 1
+src/cache/inner.rs:152:9: replace SyncMissFlight<V>::wait -> Option<V> with None
+src/cache/inner.rs:257:9: replace InflightLane<V>::ptr_eq_any -> bool with true
+src/cache/inner.rs:531:9: replace Slab<K, V>::next_generation_for -> u32 with 0
+src/cache/inner.rs:531:9: replace Slab<K, V>::next_generation_for -> u32 with 1
+src/cache/inner.rs:676:9: replace <impl PartialOrd for HeapKey>::partial_cmp -> Option<Ordering> with None
+src/cache/inner.rs:723:28: replace > with == in expiry_push_extend
+src/cache/inner.rs:723:28: replace > with < in expiry_push_extend
+src/cache/inner.rs:723:28: replace > with >= in expiry_push_extend
+src/cache/inner.rs:763:25: replace > with >= in drain_expired
+src/cache/inner.rs:938:59: replace == with != in evict_slot
+src/cache/inner.rs:1753:34: replace << with >>
+src/cache/inner.rs:1756:5: replace capacity_hint_from_max_weight -> usize with 0
+src/cache/inner.rs:1756:5: replace capacity_hint_from_max_weight -> usize with 1
+src/cache/inner.rs:1797:21: replace match guard Some(dl) != prev with true in update_read_deadline
+src/cache/inner.rs:1802:51: replace && with || in update_read_deadline
