@@ -1795,3 +1795,96 @@ mod clear {
         leader.join().expect("leader thread");
     }
 }
+
+mod insert_vs_leader {
+    //! `Cache::insert` runs while a `try_get_with` / `get_or_insert_with`
+    //! leader's initialiser is still awaiting. The leader resumes, takes
+    //! the shard lock, removes its lane, and installs its value. Without
+    //! a dedup at install time, both rows survive in `entries` (and both
+    //! slots in the slab); `len` / `weight` then double-count and the
+    //! "ghost" slot leaks until LRU eviction removes it.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn try_get_with_leader_install_after_concurrent_insert_keeps_one_row() {
+        with_timeout(Duration::from_secs(30), async {
+            let cache = Arc::new(test_cache());
+            let key = "k".to_string();
+
+            let (leader_in_init_tx, leader_in_init_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_leader_tx, release_leader_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let c_leader = Arc::clone(&cache);
+            let k_leader = key.clone();
+            let leader = tokio::spawn(async move {
+                c_leader
+                    .try_get_with(k_leader, move || async move {
+                        let _ = leader_in_init_tx.send(());
+                        release_leader_rx.await.expect("released");
+                        Ok::<_, ()>("v2".to_string())
+                    })
+                    .await
+            });
+
+            leader_in_init_rx.await.expect("leader entered init");
+
+            assert_eq!(cache.insert(key.clone(), "v1".into()), None);
+
+            release_leader_tx.send(()).expect("released");
+            let leader_out = leader.await.expect("leader join").expect("leader ok");
+            assert_eq!(leader_out, "v2");
+
+            assert_eq!(cache.get(&key), Some("v2".to_string()));
+            assert_eq!(
+                cache.len(),
+                1,
+                "leader's install must not duplicate the entry produced by the racing insert",
+            );
+            assert_eq!(
+                cache.weight(),
+                1,
+                "weight must reflect a single live entry, not two",
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn get_or_insert_with_leader_install_after_concurrent_insert_keeps_one_row() {
+        use std::sync::{Barrier, mpsc};
+        use std::thread;
+
+        let cache: Arc<Cache<K, V>> = Arc::new(test_cache());
+        let key = "sk".to_string();
+        let leader_started = Arc::new(Barrier::new(2));
+        let release_leader = Arc::new(Barrier::new(2));
+
+        let c_leader = Arc::clone(&cache);
+        let k_leader = key.clone();
+        let started = Arc::clone(&leader_started);
+        let release = Arc::clone(&release_leader);
+        let (tx, rx) = mpsc::channel();
+        let leader = thread::spawn(move || {
+            let v = c_leader.get_or_insert_with(k_leader, |_| {
+                started.wait();
+                release.wait();
+                "v2".to_string()
+            });
+            let _ = tx.send(v);
+        });
+
+        leader_started.wait();
+        assert_eq!(cache.insert(key.clone(), "v1".into()), None);
+        release_leader.wait();
+
+        let leader_out = rx.recv_timeout(Duration::from_secs(5)).expect("leader v");
+        assert_eq!(leader_out, "v2");
+        leader.join().expect("leader thread");
+
+        assert_eq!(cache.get(&key), Some("v2".to_string()));
+        assert_eq!(cache.len(), 1, "sync leader must not duplicate the row");
+        assert_eq!(cache.weight(), 1);
+    }
+}
+
