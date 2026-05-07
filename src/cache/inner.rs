@@ -2424,3 +2424,108 @@ mod shard_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod s3_fifo_tests {
+    //! White-box S3-FIFO invariants that need to peek at internal
+    //! state (`EntrySlot::queue`, `State::small_weight`,
+    //! `State::ghost`). The black-box behaviours observable through
+    //! the public `Cache` API live in `tests/cache_ops.rs::s3_fifo`.
+
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::{CacheBuilder, DynPolicy};
+    use crate::policy::{DefaultPolicy, Weight};
+
+    type K = String;
+    type V = String;
+
+    fn build(shards: usize, max_weight: u64) -> Arc<Inner<K, V, DynPolicy<K, V>>> {
+        let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
+        let cfg = CacheBuilder::<K, V>::new()
+            .max_weight(Weight::new(max_weight))
+            .shards(shards)
+            .policy(policy)
+            .build();
+        Arc::new(Inner::new(cfg))
+    }
+
+    fn queue_of<P>(inner: &Inner<K, V, P>, key: &K) -> Option<Queue>
+    where
+        P: Policy<K, V>,
+    {
+        let st = inner.shard_for(key).read();
+        let id = entries_find(&st.entries, &inner.hasher, &st.slab, key)?;
+        st.slab.get(id).map(|es| es.queue)
+    }
+
+    /// A key evicted from Small with `freq <= 1` lands in the ghost
+    /// set; reinserting it before its fingerprint ages out routes the
+    /// new slot directly into Main.
+    #[test]
+    fn ghost_hit_lands_in_main() {
+        let inner = build(1, 2);
+        // Fill Small to capacity with two cold (freq=0) keys.
+        inner.insert("a".into(), "va".into());
+        inner.insert("b".into(), "vb".into());
+        // Push `a` out: small_max=0 means the next over-budget insert
+        // drains Small first; tail=a (freq=0) → evict + ghost.insert(fp_a).
+        inner.insert("c".into(), "vc".into());
+        assert!(
+            inner.get_served("a").is_none(),
+            "a should have been evicted to seed ghost",
+        );
+        assert_eq!(
+            queue_of(&inner, &"b".to_string()),
+            Some(Queue::Small),
+            "b stays in Small (it was the head, not the evicted tail)",
+        );
+        // Reinsert `a` while its fingerprint is still in ghost. The
+        // install path consumes ghost membership and routes a into Main.
+        inner.insert("a".into(), "va2".into());
+        assert_eq!(
+            queue_of(&inner, &"a".to_string()),
+            Some(Queue::Main),
+            "ghost-hit on insert must route the entry into Main",
+        );
+    }
+
+    /// `Cache::clear` empties the slab, the FIFOs, the ghost set, and
+    /// resets `small_weight` so the next install starts from a pristine
+    /// Small-budget accounting baseline. Without the ghost reset, a
+    /// fingerprint that survived clear would mis-route a new key into
+    /// Main on the next reinsert; without the `small_weight` reset, the
+    /// next reclaim would mis-balance Small vs Main.
+    #[test]
+    fn clear_resets_ghost_and_small_weight() {
+        let inner = build(1, 2);
+        inner.insert("a".into(), "v".into());
+        inner.insert("b".into(), "v".into());
+        // Force a Small eviction so `a`'s fingerprint enters ghost and
+        // `small_weight` advances.
+        inner.insert("c".into(), "v".into());
+        {
+            let st = inner.shards[0].read();
+            assert!(st.small_weight > 0);
+        }
+
+        inner.clear();
+
+        {
+            let st = inner.shards[0].read();
+            assert_eq!(st.small_weight, 0, "small_weight must reset on clear");
+            assert!(st.small.tail().is_none(), "small must be empty after clear");
+            assert!(st.main.tail().is_none(), "main must be empty after clear");
+        }
+        // Ghost-cleared sanity: reinserting `a` must land it in Small,
+        // not Main (which would happen if its fingerprint had survived
+        // clear).
+        inner.insert("a".into(), "v".into());
+        assert_eq!(
+            queue_of(&inner, &"a".to_string()),
+            Some(Queue::Small),
+            "ghost must have been cleared so reinsert routes to Small",
+        );
+    }
+}

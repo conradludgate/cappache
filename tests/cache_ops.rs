@@ -2100,3 +2100,193 @@ mod clear_during_revalidate {
         );
     }
 }
+
+mod s3_fifo {
+    //! Black-box behaviours unique to the S3-FIFO eviction policy. The
+    //! white-box invariants that need to peek at `EntrySlot::queue` /
+    //! `State::small_weight` / `State::ghost` live in
+    //! `src/cache/inner.rs::s3_fifo_tests` instead — `pub(crate)` test
+    //! hooks are not visible from this integration-test crate.
+
+    use std::time::Instant;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LenWeightPolicy;
+
+    impl Policy<K, V> for LenWeightPolicy {
+        fn weight(&self, _k: &K, v: &V) -> Weight {
+            Weight::new(v.len() as u64)
+        }
+        fn expire_after_read(
+            &self,
+            _k: &K,
+            _v: &V,
+            _read_at: Instant,
+            _written_at: Instant,
+            _time_remaining: Duration,
+        ) -> Duration {
+            TIME_UNBOUNDED
+        }
+        fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
+            TIME_UNBOUNDED
+        }
+    }
+
+    fn small_cache(max: u64) -> Cache<K, V> {
+        let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
+        Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(max))
+                .shards(1)
+                .policy(policy)
+                .build(),
+        )
+    }
+
+    /// A warm key (freq pushed past the `freq > 1` Small-tail promotion
+    /// bar) survives a long burst of cold inserts. The headline
+    /// regression test for the DS1/S2/S3 trace hit-ratio gap that
+    /// motivated S3-FIFO in the first place.
+    #[test]
+    fn scan_does_not_evict_hot_key() {
+        let cache = small_cache(20);
+        let hot = "hot".to_string();
+        cache.insert(hot.clone(), "v".into());
+        // Three reads bumps freq to FREQ_CAP=3, well past the
+        // `freq > 1` promotion bar.
+        for _ in 0..3 {
+            let _ = cache.get(&hot);
+        }
+        for i in 0..200 {
+            cache.insert(format!("cold-{i}"), "v".into());
+        }
+        assert_eq!(
+            cache.get(&hot),
+            Some("v".into()),
+            "warm key (freq=3) must survive a 200-entry cold scan",
+        );
+    }
+
+    /// Two slots in Small, one read twice (warm) and one untouched
+    /// (cold). The next over-budget insert promotes the warm one into
+    /// Main and evicts the cold one.
+    #[test]
+    fn low_freq_evicted_first() {
+        let cache = small_cache(2);
+        cache.insert("warm".into(), "vw".into());
+        cache.insert("cold".into(), "vc".into());
+        for _ in 0..2 {
+            let _ = cache.get("warm");
+        }
+        cache.insert("new".into(), "vn".into());
+        assert_eq!(cache.get("warm"), Some("vw".into()));
+        assert_eq!(
+            cache.get("cold"),
+            None,
+            "cold (freq=0) must lose the eviction race against warm (freq=2)",
+        );
+        assert_eq!(cache.get("new"), Some("vn".into()));
+    }
+
+    /// `evict_from_main`'s recirculation loop decrements `freq` each
+    /// pass, so each Main slot is touched at most `FREQ_CAP + 1` times
+    /// before forced eviction. This bound makes the loop terminate even
+    /// when every Main entry sits at saturated `freq`. If termination
+    /// were broken, every pressure insert would hang and `cargo test`
+    /// would time out; the explicit `weight()` assertion adds a
+    /// non-hang failure mode.
+    #[test]
+    fn m_recirculation_terminates() {
+        let cache = small_cache(8);
+        for i in 0..8 {
+            cache.insert(format!("warm{i}"), "v".into());
+        }
+        // Four read passes saturates every slot's `freq` at FREQ_CAP=3.
+        // The first over-budget insert promotes them all into Main with
+        // freq reset to 0; subsequent inserts drive the Main
+        // recirculation path.
+        for _ in 0..4 {
+            for i in 0..8 {
+                let _ = cache.get(&format!("warm{i}"));
+            }
+        }
+        for i in 0..32 {
+            cache.insert(format!("p{i}"), "v".into());
+            assert!(
+                cache.weight() <= 8,
+                "weight {} exceeded max=8 after pressure insert {i}; recirculation loop did not drop anything",
+                cache.weight(),
+            );
+        }
+    }
+
+    /// Replacing the Small-tail entry with a heavier value triggers
+    /// reclaim that immediately surfaces the skip key. The skip-key
+    /// short-circuit must rotate it back to Small head and proceed
+    /// with another victim instead of evicting the entry the caller is
+    /// in the middle of installing.
+    #[test]
+    fn skip_key_short_circuit_in_small() {
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(8))
+                .shards(1)
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        cache.insert("tail".into(), "x".into());
+        cache.insert("middle".into(), "x".into());
+        cache.insert("head".into(), "x".repeat(6));
+
+        cache.insert("tail".into(), "x".repeat(5));
+
+        assert_eq!(
+            cache.get("tail"),
+            Some("x".repeat(5)),
+            "tail key must survive its own replacement reclaim",
+        );
+    }
+
+    /// Replacing a key that lives in Main (because reads promoted it)
+    /// with a heavier value forces Main-tail reclaim. The same skip-key
+    /// short-circuit applies on Main as on Small.
+    #[test]
+    fn skip_key_short_circuit_in_main() {
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(12))
+                .shards(1)
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        // Phase 1: insert two keys, warm `victim` past the freq>1
+        // promotion bar.
+        cache.insert("victim".into(), "x".into());
+        cache.insert("filler".into(), "x".repeat(10));
+        for _ in 0..3 {
+            let _ = cache.get("victim");
+        }
+        // Phase 2: trigger reclaim that promotes `victim` into Main.
+        // (`filler` is the cold Small-tail; one over-budget insert is
+        // enough to push `victim` into Main.)
+        cache.insert("trigger".into(), "x".into());
+        // `victim` should now be in Main (we have no white-box hook
+        // here, but skip-key behaviour below is the load-bearing
+        // assertion either way).
+        assert_eq!(cache.get("victim"), Some("x".into()));
+
+        // Phase 3: replace `victim` with a heavier value. Reclaim sees
+        // the skip key in either queue first; in either case the
+        // short-circuit must keep `victim` alive in the cache with the
+        // new value.
+        cache.insert("victim".into(), "x".repeat(10));
+        assert_eq!(
+            cache.get("victim"),
+            Some("x".repeat(10)),
+            "victim must survive replacement regardless of whether the \
+             skip-key check fired in Small or Main",
+        );
+    }
+}
