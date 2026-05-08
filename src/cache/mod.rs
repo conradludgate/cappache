@@ -80,6 +80,12 @@ where
 /// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by
 /// [`Cache::try_revalidate`]. `cleanup` clears `refresh_inflight` if
 /// the executor drops the job without polling it to `Ready`.
+///
+/// On `Ready(Ok)` the refreshed value is installed only when the slot
+/// the job was scheduled against still has its `refresh_inflight` flag
+/// set. If the user has removed or replaced the entry in the meantime
+/// the result is dropped, matching the `RevalidateScheduled::AbsentKey`
+/// "no promote-to-install" contract.
 pub struct RefreshWork<
     K: 'static,
     V: 'static,
