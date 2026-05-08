@@ -115,3 +115,89 @@ pub(crate) fn drive_to_completion(mut fut: BoxFuture) {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitError(u32);
+
+mod bug1 {
+    use std::thread;
+
+    use clache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
+
+    use super::{
+        Arc, BlockingListener, CapturingExecutor, InitError, LifecycleListener,
+        drive_to_completion,
+    };
+
+    /// Bug #1: between `apply_refresh_ok` releasing the shard lock and
+    /// `RefreshWork::poll`'s post-`apply_refresh_ok`
+    /// `refresh_inflight_remove`, a racing `try_revalidate` can mark
+    /// the freshly installed slot in-flight, only to have its flag
+    /// wiped by the redundant remove. A subsequent submission then
+    /// sees a clear slot and schedules a duplicate refresh.
+    ///
+    /// Fixed in: `fix: drop redundant refresh_inflight_remove on Ok`.
+    #[test]
+    fn refresh_completion_does_not_clear_inflight_on_freshly_installed_slot() {
+        let (listener, entered, release) = BlockingListener::pair();
+        let listener: Arc<dyn LifecycleListener<String, String> + Send + Sync> = listener;
+        let cache: Cache<String, String> = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(10_000))
+                .lifecycle_listener(listener)
+                .build(),
+        );
+        let ex = CapturingExecutor::new();
+        let k = "k".to_string();
+        cache.insert(k.clone(), "old".into());
+
+        assert_eq!(
+            cache
+                .try_revalidate(k.clone(), &*ex, |_| async move {
+                    Ok::<_, InitError>("new".to_string())
+                })
+                .expect("submit ok"),
+            RevalidateScheduled::Submitted,
+        );
+
+        let work = ex.take_latest();
+        let driver = thread::spawn(move || drive_to_completion(work));
+
+        // Wait until `apply_refresh_ok` has released the shard lock and
+        // entered the lifecycle callback. The freshly installed slot
+        // is now visible with `refresh_inflight=false`, but the
+        // post-`apply_refresh_ok` `refresh_inflight_remove` has not
+        // run yet.
+        entered.wait();
+
+        // Race a fresh `try_revalidate` into that window. It marks the
+        // new slot in-flight (true) and parks another `RefreshWork`.
+        assert_eq!(
+            cache
+                .try_revalidate(k.clone(), &*ex, |_| async move {
+                    Ok::<_, InitError>("racing".to_string())
+                })
+                .expect("submit ok"),
+            RevalidateScheduled::Submitted,
+        );
+
+        // Release the listener; the driver runs the (pre-fix) redundant
+        // `refresh_inflight_remove`, wiping the racing flag.
+        release.wait();
+        driver.join().expect("driver panicked");
+
+        // A third submission must observe the racing job still in
+        // flight. Pre-fix the flag was cleared, so this returns
+        // `Submitted` (duplicate refresh). Post-fix it returns
+        // `SkippedInFlight`.
+        assert_eq!(
+            cache
+                .try_revalidate(k.clone(), &*ex, |_| async move {
+                    Ok::<_, InitError>("third".to_string())
+                })
+                .expect("submit ok"),
+            RevalidateScheduled::SkippedInFlight,
+            "racing refresh's in-flight flag was wiped by the redundant remove",
+        );
+    }
+}
