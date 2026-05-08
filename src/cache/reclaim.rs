@@ -60,7 +60,8 @@ where
     V: 'static,
     S: BuildHasher,
 {
-    let expired = drain_expired(st, &inner.hasher, now, Some(skip_key));
+    let now_tick = super::clock::floor_tick(inner.start, now);
+    let expired = drain_expired(st, &inner.hasher, now_tick, Some(skip_key));
 
     // Hoist the existing-slot weight lookup out of the loop: the
     // skip_key short-circuit means its slot is never reclaimed in this

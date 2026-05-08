@@ -376,3 +376,21 @@ where
         self.flight.cancel();
     }
 }
+
+#[cfg(feature = "typesize")]
+mod typesize_impls {
+    use typesize::TypeSize;
+
+    use super::InflightLane;
+
+    /// Shallow size only: the `Arc<dyn Any>` payload (`MissFlight` /
+    /// `SyncMissFlight`) is type-erased here so we can't deeply walk it
+    /// without reconstructing every concrete `(V, E)` flight specialisation.
+    /// The lane struct itself, plus the wide pointer, is captured by
+    /// `mem::size_of::<InflightLane>()`.
+    impl TypeSize for InflightLane {
+        fn extra_size(&self) -> usize {
+            0
+        }
+    }
+}

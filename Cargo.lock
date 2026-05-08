@@ -124,6 +124,7 @@ dependencies = [
  "quick_cache",
  "slotmap",
  "tokio",
+ "typesize",
 ]
 
 [[package]]
@@ -740,6 +741,26 @@ name = "tokio-macros"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "typesize"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da66c62c5b7017a2787e77373c03e6a5aafde77a73bff1ff96e91cd2e128179"
+dependencies = [
+ "typesize-derive",
+]
+
+[[package]]
+name = "typesize-derive"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "536b6812192bda8551cfa0e52524e328c6a951b48e66529ee4522d6c721243d6"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -13,10 +13,10 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::{BuildHasher, Hash};
-use std::time::Instant;
 
 use slotmap::Key;
 
+use super::clock::{NO_DEADLINE, Tick};
 use super::inner::{State, evict_slot};
 use super::slab::SlotKey;
 
@@ -25,9 +25,14 @@ use super::slab::SlotKey;
 /// deadlines first; the slot's packed FFI form is a tiebreaker for
 /// total ordering only — the slotmap version inside [`SlotKey`] is what
 /// gates stale tuples on pop, not anything in the heap ordering.
+///
+/// `deadline` is a [`Tick`] (250 ms unit) offset from `Inner::start`
+/// rather than an `Instant`, shrinking the per-tuple footprint relative
+/// to a full `Instant` and dropping the size of the entry-side store
+/// (see [`super::slab::CacheEntry::deadline`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct HeapKey {
-    pub(super) deadline: Instant,
+    pub(super) deadline: Tick,
     pub(super) slot: SlotKey,
 }
 
@@ -51,7 +56,7 @@ impl PartialOrd for HeapKey {
 pub(super) struct ExpiryHeap(BinaryHeap<Reverse<HeapKey>>);
 
 impl ExpiryHeap {
-    pub(super) fn push(&mut self, deadline: Instant, slot: SlotKey) {
+    pub(super) fn push(&mut self, deadline: Tick, slot: SlotKey) {
         self.0.push(Reverse(HeapKey { deadline, slot }));
     }
 
@@ -80,7 +85,7 @@ impl ExpiryHeap {
 /// helper so it's reachable from both the read and miss-probe paths.
 pub(super) fn expiry_push_extend<K, V>(
     st: &mut State<K, V>,
-    deadline: Instant,
+    deadline: Tick,
     slot: SlotKey,
     superseded_finite: bool,
 ) {
@@ -102,8 +107,8 @@ pub(super) fn expiry_push_extend<K, V>(
 fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
     st.expiry.clear();
     for (id, es) in &st.slab {
-        if let Some(dl) = es.entry.deadline {
-            st.expiry.push(dl, id);
+        if es.entry.deadline != NO_DEADLINE {
+            st.expiry.push(es.entry.deadline, id);
         }
     }
     st.stale_pushes = 0;
@@ -122,7 +127,7 @@ fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
 pub(super) fn drain_expired<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
-    now: Instant,
+    now_tick: Tick,
     skip_key: Option<&K>,
 ) -> Vec<(K, V)>
 where
@@ -131,7 +136,7 @@ where
 {
     let mut out = Vec::new();
     while let Some(top) = st.expiry.peek() {
-        if top.deadline > now {
+        if top.deadline > now_tick {
             break;
         }
         st.expiry.pop();
@@ -142,7 +147,7 @@ where
         let Some(es) = st.slab.get(top.slot) else {
             continue;
         };
-        if es.entry.deadline != Some(top.deadline) {
+        if es.entry.deadline != top.deadline {
             continue;
         }
         if let Some(skip) = skip_key
@@ -155,4 +160,19 @@ where
         }
     }
     out
+}
+
+#[cfg(feature = "typesize")]
+mod typesize_impls {
+    use core::mem;
+
+    use typesize::TypeSize;
+
+    use super::{ExpiryHeap, HeapKey, Reverse};
+
+    impl TypeSize for ExpiryHeap {
+        fn extra_size(&self) -> usize {
+            self.0.capacity() * mem::size_of::<Reverse<HeapKey>>()
+        }
+    }
 }

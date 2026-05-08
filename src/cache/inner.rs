@@ -7,6 +7,7 @@ use clashcore::CachePadded;
 use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 
+use super::clock;
 use super::expiry::{ExpiryHeap, expiry_push_extend};
 use super::flight::InflightLane;
 use super::reclaim::{Reclaimed, reclaim};
@@ -71,6 +72,13 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = Default
     /// `config.max_weight` by up to `shards.len() - 1` units of rounding
     /// slack; pass `.shards(1)` for a strict global cap.
     pub(crate) shard_max_weight: u64,
+    /// Monotonic anchor recorded at construction. All per-slot
+    /// timestamps (`written_at`, `deadline`) and heap keys are stored
+    /// as nanosecond offsets from this `Instant`, halving the bytes
+    /// each `CacheEntry` / `HeapKey` carries. Conversion back to
+    /// `Instant` happens only at the [`Policy`] hook boundary; see
+    /// [`super::clock`].
+    pub(crate) start: Instant,
 }
 
 /// Inverse-fraction sizing for the S3-FIFO Small queue: per shard,
@@ -326,8 +334,8 @@ where
     }
     entries_insert(&mut st.entries, hasher, &st.slab, id, key_hash);
     st.total_weight = st.total_weight.saturating_add(weight);
-    if let Some(dl) = deadline {
-        st.expiry.push(dl, id);
+    if deadline != crate::cache::clock::NO_DEADLINE {
+        st.expiry.push(deadline, id);
     }
     id
 }
@@ -422,24 +430,19 @@ where
         // up to `shard_count - 1` (rounding); callers wanting a strict
         // global cap pass `.shards(1)`.
         let shard_max_weight = max_weight.div_ceil(shard_count as u64).max(1);
-        // Pre-size each shard for its share of the budget. `weight >= 1`
-        // is the working assumption that bounds per-shard entry count by
-        // `shard_max_weight`.
-        let initial_capacity = capacity_hint_from_max_weight(shard_max_weight);
-        // Ghost capacity is an entry-count proxy, not a weight figure;
-        // the same conservative `min(2^20, shard_max_weight)` estimate
-        // that pre-sizes `entries` and `slab` keeps the ghost table's
-        // memory bounded to one `u64` fingerprint per slot.
-        let ghost_cap = initial_capacity;
         let shards = (0..shard_count)
             .map(|_| {
+                // Entries / slab grow on demand: pre-sizing them from
+                // `max_weight` over-allocates as soon as `Policy::weight`
+                // returns anything other than 1, so we eat a few rehashes
+                // on the first inserts instead of guessing wrong here.
                 CachePadded::new(RwLock::new(State {
-                    entries: HashTable::with_capacity(initial_capacity),
+                    entries: HashTable::new(),
                     inflight: HashMap::new(),
-                    slab: EntrySlab::with_capacity_and_key(initial_capacity),
+                    slab: EntrySlab::with_key(),
                     small: Fifo::default(),
                     main: Fifo::default(),
-                    ghost: GhostSet::new(ghost_cap),
+                    ghost: GhostSet::new(DEFAULT_GHOST_CAP_PER_SHARD),
                     small_weight: 0,
                     expiry: ExpiryHeap::default(),
                     stale_pushes: 0,
@@ -464,6 +467,7 @@ where
             shard_shift,
             hasher,
             shard_max_weight,
+            start: Instant::now(),
         }
     }
 
@@ -474,6 +478,7 @@ where
         V: 'static,
     {
         let now = Instant::now();
+        let now_tick = clock::floor_tick(self.start, now);
         let mut st = self.shard_for(key).write();
 
         let id = entries_find(&st.entries, &self.hasher, &st.slab, key)?;
@@ -483,7 +488,7 @@ where
         let expired = st
             .slab
             .get(id)
-            .is_some_and(|es| !entry_is_served(&es.entry, now));
+            .is_some_and(|es| !entry_is_served(&es.entry, now_tick));
         if expired {
             // Use the slot's owned key for the lifecycle event so callers
             // querying with a borrowed `Q` need not own a `K`.
@@ -499,7 +504,8 @@ where
             let value = es.entry.value.clone();
             // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
             // (mutable) don't overlap, so the borrow checker accepts both.
-            let update = update_read_deadline(&es.key, &mut es.entry, &self.config.policy, now);
+            let update =
+                update_read_deadline(&es.key, &mut es.entry, &self.config.policy, self.start, now);
             (value, update)
         };
         if let Some(dl) = update.new_deadline {
@@ -520,10 +526,10 @@ where
         // Read-only check: do not evict expired entries here; let the next
         // `get`/`insert` reclaim path do it so contains_key has no side
         // effects beyond taking the lock.
-        let now = Instant::now();
+        let now_tick = clock::floor_tick(self.start, Instant::now());
         st.slab
             .get(id)
-            .is_some_and(|es| entry_is_served(&es.entry, now))
+            .is_some_and(|es| entry_is_served(&es.entry, now_tick))
     }
 
     /// Sums per-shard `slab.len()`. Briefly takes each shard's read lock
@@ -618,14 +624,14 @@ where
             let _ = evict_slot(&mut st, &self.hasher, id);
         }
 
-        let deadline = deadline_after_write(&self.config.policy, &key, &value, now);
+        let deadline = deadline_after_write(&self.config.policy, &key, &value, self.start, now);
         install_ready(
             &mut st,
             &self.hasher,
             key,
             CacheEntry {
                 value,
-                written_at: now,
+                written_at: clock::floor_tick(self.start, now),
                 deadline,
             },
             new_w,
@@ -691,14 +697,14 @@ where
             Some(id) => evict_slot(&mut st, &self.hasher, id).map(|(_, v, _)| v),
             None => None,
         };
-        let deadline = deadline_after_write(&self.config.policy, key, &v, now);
+        let deadline = deadline_after_write(&self.config.policy, key, &v, self.start, now);
         install_ready(
             &mut st,
             &self.hasher,
             key.clone(),
             CacheEntry {
                 value: v,
-                written_at: now,
+                written_at: clock::floor_tick(self.start, now),
                 deadline,
             },
             nw,
@@ -719,8 +725,9 @@ pub(super) fn deadline_after_write<K, V, P>(
     policy: &P,
     key: &K,
     value: &V,
+    start: Instant,
     now: Instant,
-) -> Option<Instant>
+) -> clock::Tick
 where
     K: 'static,
     V: 'static,
@@ -728,34 +735,34 @@ where
 {
     let d = policy.expire_after_write(key, value, now);
     if d >= crate::policy::TIME_UNBOUNDED {
-        None
+        clock::NO_DEADLINE
     } else {
-        now.checked_add(d)
+        match now.checked_add(d) {
+            Some(t) => clock::ceil_tick(start, t),
+            None => clock::NO_DEADLINE,
+        }
     }
 }
 
-/// Whether the entry may be returned for a read at `now`, using only materialized [`CacheEntry::deadline`].
+/// Whether the entry may be returned for a read at `now_tick`. The
+/// `NO_DEADLINE` sentinel (= `Tick::MAX`) folds into "always served"
+/// because `now_tick < Tick::MAX` for any realistic clock.
 ///
 /// [`Policy::expire_after_read`](crate::policy::Policy::expire_after_read) runs only after a live hit
 /// in [`update_read_deadline`] to compute the next deadline.
-pub(super) fn entry_is_served<V>(e: &CacheEntry<V>, now: Instant) -> bool {
-    !matches!(e.deadline, Some(dl) if now >= dl)
+pub(super) fn entry_is_served<V>(e: &CacheEntry<V>, now_tick: clock::Tick) -> bool {
+    now_tick < e.deadline
 }
 
-/// Pre-sizing hint for `State::entries` and `State::slab`. Bounds the
-/// rare-resize tail without allocating absurdly large tables for callers who
-/// set huge weight budgets: once the per-entry `Policy::weight` is `≥ 1`,
-/// total entry count is bounded by `max_weight`, but we still cap the
-/// *allocation* here because the configured budget is a weight unit, not
-/// necessarily an entry count. Pure pre-allocation hint — both the
-/// hashtable and slab grow on demand, so the exact value only affects
-/// the cost of the first few inserts.
-const CAPACITY_HINT_CAP: u64 = 1 << 20;
-
-fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
-    let bounded = max_weight.min(CAPACITY_HINT_CAP);
-    usize::try_from(bounded).unwrap_or(usize::MAX)
-}
+/// Per-shard ghost-set bound for S3-FIFO's "warm-on-reinsert" path. Holds
+/// the fingerprints of recently evicted Small-tail entries so a returning
+/// key skips Small and goes straight to Main with `freq = 0`. Sized as a
+/// fixed constant rather than a function of `max_weight` because that
+/// translates between weight and entry count incorrectly the moment
+/// `Policy::weight` returns anything other than 1. Picked at "big enough
+/// to cover typical working sets, small enough not to bloat per-shard
+/// memory"; tune via a future builder knob if a workload demands it.
+const DEFAULT_GHOST_CAP_PER_SHARD: usize = 1024;
 
 /// Outcome of [`update_read_deadline`]. `new_deadline` is `Some` only when
 /// the deadline transitioned to a fresh finite value the caller still has
@@ -764,7 +771,7 @@ fn capacity_hint_from_max_weight(max_weight: u64) -> usize {
 /// this slot is now stale) — read-extending policies pile these up over
 /// time and are what trigger the periodic rebuild.
 pub(super) struct ReadDeadlineUpdate {
-    pub(super) new_deadline: Option<Instant>,
+    pub(super) new_deadline: Option<clock::Tick>,
     pub(super) superseded_finite: bool,
 }
 
@@ -775,6 +782,7 @@ pub(super) fn update_read_deadline<K, V, P>(
     key: &K,
     e: &mut CacheEntry<V>,
     policy: &P,
+    start: Instant,
     now: Instant,
 ) -> ReadDeadlineUpdate
 where
@@ -782,26 +790,186 @@ where
     V: 'static,
     P: Policy<K, V> + ?Sized,
 {
-    let prev = e.deadline;
-    let time_remaining = prev.map_or(crate::policy::TIME_UNBOUNDED, |dl| {
-        dl.saturating_duration_since(now)
-    });
-    let d = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
-    let new = if d >= crate::policy::TIME_UNBOUNDED {
-        None
+    let prev_tick = e.deadline;
+    let time_remaining = if prev_tick == clock::NO_DEADLINE {
+        crate::policy::TIME_UNBOUNDED
     } else {
-        now.checked_add(d)
+        clock::tick_to_instant(start, prev_tick).saturating_duration_since(now)
     };
-    e.deadline = new;
-    let new_deadline = match new {
-        Some(dl) if Some(dl) != prev => Some(dl),
-        _ => None,
+    let written_at = clock::tick_to_instant(start, e.written_at);
+    let d = policy.expire_after_read(key, &e.value, now, written_at, time_remaining);
+    let new_tick = if d >= crate::policy::TIME_UNBOUNDED {
+        clock::NO_DEADLINE
+    } else {
+        match now.checked_add(d) {
+            Some(t) => clock::ceil_tick(start, t),
+            None => clock::NO_DEADLINE,
+        }
+    };
+    e.deadline = new_tick;
+    let new_deadline = if new_tick != clock::NO_DEADLINE && new_tick != prev_tick {
+        Some(new_tick)
+    } else {
+        None
     };
     ReadDeadlineUpdate {
         new_deadline,
-        superseded_finite: new_deadline.is_some() && prev.is_some(),
+        superseded_finite: new_deadline.is_some() && prev_tick != clock::NO_DEADLINE,
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "typesize")]
+mod typesize_impls {
+    //! `TypeSize` impls for shard / cache state.
+    //!
+    //! Acquiring `Inner::extra_size` walks every shard under a read lock
+    //! and iterates every slab entry — fine for diagnostics but not a hot
+    //! path. Bounds are kept on the impl block so the rest of the crate
+    //! stays free of `TypeSize` requirements.
+    use core::mem;
+    use std::any::TypeId;
+    use std::sync::Arc;
+
+    use hashbrown::{HashMap, HashTable};
+    use typesize::TypeSize;
+
+    use super::super::slab::slot_storage_bytes;
+    use super::{CacheConfig, EntrySlab, EntrySlot, Inner, Shard, SlotKey, State};
+    use crate::cache::flight::InflightLane;
+
+    fn entries_extra(entries: &HashTable<SlotKey>) -> usize {
+        // SlotKey is plain (`u32`-pair); HashTable's allocation_size already
+        // accounts for buckets + control bytes + the inline `SlotKey`s, and
+        // SlotKey carries no heap of its own.
+        entries.allocation_size()
+    }
+
+    fn slab_extra<K, V>(slab: &EntrySlab<K, V>) -> usize
+    where
+        K: TypeSize,
+        V: TypeSize,
+    {
+        let storage = slot_storage_bytes::<EntrySlot<K, V>>(slab.capacity());
+        let per_entry: usize = slab.values().map(EntrySlot::extra_size).sum();
+        storage + per_entry
+    }
+
+    fn inflight_extra<K>(inflight: &HashMap<(K, TypeId), InflightLane>) -> usize
+    where
+        K: TypeSize + Eq + std::hash::Hash,
+    {
+        // hashbrown 0.17's HashMap covers buckets + inline `(K, TypeId, V)`
+        // bytes via `allocation_size`; iterate live entries for any extra
+        // they own beyond their stack footprint.
+        let buckets = inflight.allocation_size();
+        let per_entry: usize = inflight
+            .iter()
+            .map(|((k, _tid), lane)| k.extra_size() + lane.extra_size())
+            .sum();
+        buckets + per_entry
+    }
+
+    impl<K, V> TypeSize for State<K, V>
+    where
+        K: TypeSize + Eq + std::hash::Hash,
+        V: TypeSize,
+    {
+        fn extra_size(&self) -> usize {
+            // Exhaustive destructure (no `..`) so a new `State` field is a
+            // compile error here until it's wired in.
+            let Self {
+                entries,
+                inflight,
+                slab,
+                small,
+                main,
+                ghost,
+                expiry,
+                small_weight,
+                stale_pushes,
+                total_weight,
+            } = self;
+            entries_extra(entries)
+                + inflight_extra(inflight)
+                + slab_extra(slab)
+                + small.extra_size()
+                + main.extra_size()
+                + ghost.extra_size()
+                + expiry.extra_size()
+                + small_weight.extra_size()
+                + stale_pushes.extra_size()
+                + total_weight.extra_size()
+        }
+    }
+
+    /// Policy and hasher are deeply walked when their concrete types
+    /// provide `TypeSize`. The optional listener is `Arc<dyn …>` —
+    /// type-erased and beyond the orphan rule's reach, so it falls
+    /// through `_` like `Instant` and `SlotKey` elsewhere.
+    impl<K, V, P, S> TypeSize for CacheConfig<K, V, P, S>
+    where
+        P: TypeSize,
+        S: TypeSize,
+    {
+        fn extra_size(&self) -> usize {
+            let Self {
+                max_weight,
+                policy,
+                hasher,
+                shards,
+                lifecycle_listener: _,
+                _marker,
+            } = self;
+            max_weight.extra_size()
+                + policy.extra_size()
+                + hasher.extra_size()
+                + shards.extra_size()
+        }
+    }
+
+    impl<K, V, P, S> TypeSize for Inner<K, V, P, S>
+    where
+        K: TypeSize + Eq + std::hash::Hash,
+        V: TypeSize,
+        P: TypeSize,
+        S: TypeSize,
+    {
+        fn extra_size(&self) -> usize {
+            let Self {
+                config,
+                shards,
+                shard_shift,
+                hasher,
+                shard_max_weight,
+                // `Instant` is in std and not reachable through the
+                // orphan rule. Stack-only, already counted in
+                // `mem::size_of::<Self>()`.
+                start: _,
+            } = self;
+            // Box<[Shard]> heap: stride of one Shard times shard count.
+            let shards_storage = shards.len() * mem::size_of::<Shard<K, V>>();
+            let shards_inner: usize = shards.iter().map(|sh| sh.read().extra_size()).sum();
+            shards_storage
+                + shards_inner
+                + config.extra_size()
+                + hasher.extra_size()
+                + shard_shift.extra_size()
+                + shard_max_weight.extra_size()
+        }
+    }
+
+    /// Re-exported helper so `Cache`'s impl in `mod.rs` can size the inner
+    /// `Arc<Inner>` without importing `SizableArc`'s trait paths.
+    pub(crate) fn arc_inner_size<T: TypeSize>(arc: &Arc<T>) -> usize {
+        // `SizableArc<_, Owned>` reports: pointer (counted by mem::size_of)
+        // + 2 atomic counters (strong/weak) + size_of::<T>() + T::extra_size.
+        // We want only the heap portion (extra_size for `Arc<T>`):
+        2 * mem::size_of::<usize>() + mem::size_of::<T>() + arc.extra_size()
+    }
+}
+
+#[cfg(feature = "typesize")]
+pub(crate) use typesize_impls::arc_inner_size;

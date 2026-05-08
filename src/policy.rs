@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Weight(pub u64);
 
+#[cfg(feature = "typesize")]
+impl typesize::TypeSize for Weight {}
+
 impl Weight {
     pub const ZERO: Self = Self(0);
 
@@ -102,6 +105,9 @@ where
 /// Unit weight and no finite time limit from either hook.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultPolicy;
+
+#[cfg(feature = "typesize")]
+impl typesize::TypeSize for DefaultPolicy {}
 
 impl<K, V> Policy<K, V> for DefaultPolicy {
     fn weight(&self, _key: &K, _value: &V) -> Weight {

@@ -53,7 +53,7 @@ where
         K: Clone + 'static,
         V: Clone + 'static,
     {
-        let deadline = deadline_after_write(&self.config.policy, key, v, now);
+        let deadline = deadline_after_write(&self.config.policy, key, v, self.start, now);
         let nw = self.config.policy.weight(key, v).get();
         let reclaimed = reclaim(self, st, nw, key, now);
         let displaced = entries_find(&st.entries, &self.hasher, &st.slab, key)
@@ -64,7 +64,7 @@ where
             key.clone(),
             CacheEntry {
                 value: v.clone(),
-                written_at: now,
+                written_at: super::clock::floor_tick(self.start, now),
                 deadline,
             },
             nw,
@@ -96,11 +96,12 @@ where
         let mut st = shard.write();
 
         let now = Instant::now();
+        let now_tick = super::clock::floor_tick(self.start, now);
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let expired = st
                 .slab
                 .get(id)
-                .is_some_and(|es| !entry_is_served(&es.entry, now));
+                .is_some_and(|es| !entry_is_served(&es.entry, now_tick));
             if expired && let Some((_, v, _)) = evict_slot(&mut st, &self.hasher, id) {
                 drop(st);
                 self.notify_lifecycle(LifecycleReason::TimeExpired, key.clone(), Some(v));
@@ -109,12 +110,13 @@ where
         }
 
         let now = Instant::now();
+        let now_tick = super::clock::floor_tick(self.start, now);
         let mut hit = None;
         if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) {
             let still_served = st
                 .slab
                 .get(id)
-                .is_some_and(|es| entry_is_served(&es.entry, now));
+                .is_some_and(|es| entry_is_served(&es.entry, now_tick));
             if still_served {
                 let (value, update) = {
                     let es = st
@@ -123,7 +125,13 @@ where
                         .expect("just confirmed Occupied above under our mutex");
                     es.freq = es.freq.saturating_add(1).min(FREQ_CAP);
                     let value = es.entry.value.clone();
-                    let update = update_read_deadline(key, &mut es.entry, &self.config.policy, now);
+                    let update = update_read_deadline(
+                        key,
+                        &mut es.entry,
+                        &self.config.policy,
+                        self.start,
+                        now,
+                    );
                     (value, update)
                 };
                 if let Some(dl) = update.new_deadline {

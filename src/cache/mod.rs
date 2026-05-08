@@ -1,6 +1,7 @@
 //! In-memory concurrent cache: synchronous `get` / `insert` / `remove`, async miss path, and
 //! executor-driven refresh.
 
+mod clock;
 mod expiry;
 mod flight;
 mod inner;
@@ -475,5 +476,20 @@ where
             Ok(scheduled) => scheduled,
             Err(e) => match e {},
         }
+    }
+}
+
+#[cfg(feature = "typesize")]
+impl<K, V, P, S> typesize::TypeSize for Cache<K, V, P, S>
+where
+    K: typesize::TypeSize + Eq + Hash + 'static,
+    V: typesize::TypeSize + 'static,
+    P: typesize::TypeSize + 'static,
+    S: typesize::TypeSize + 'static,
+{
+    /// Deep size estimate. Walks every shard under a read lock and every
+    /// slab entry — useful for diagnostics, not for hot paths.
+    fn extra_size(&self) -> usize {
+        inner::arc_inner_size(&self.inner)
     }
 }

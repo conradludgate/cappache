@@ -1465,7 +1465,9 @@ mod policy_time {
     #[tokio::test]
     async fn idle_timeout_expires_after_idle_without_reads() {
         with_timeout(Duration::from_secs(30), async {
-            let idle = Duration::from_millis(90);
+            // TTLs sit comfortably above the 250ms internal tick so the
+            // ceil-rounded deadline is observably in the past after the sleep.
+            let idle = Duration::from_millis(500);
             let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
@@ -1474,7 +1476,7 @@ mod policy_time {
                     .build(),
             );
             cache.insert("k".into(), "v".into());
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
             assert_eq!(cache.get("k"), None);
         })
         .await;
@@ -1483,7 +1485,7 @@ mod policy_time {
     #[tokio::test]
     async fn idle_timeout_read_extends_deadline() {
         with_timeout(Duration::from_secs(30), async {
-            let idle = Duration::from_millis(100);
+            let idle = Duration::from_millis(500);
             let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
@@ -1492,11 +1494,11 @@ mod policy_time {
                     .build(),
             );
             cache.insert("k".into(), "v".into());
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             assert_eq!(cache.get("k"), Some("v".into()));
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             assert_eq!(cache.get("k"), Some("v".into()));
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
             assert_eq!(cache.get("k"), None);
         })
         .await;
@@ -1505,7 +1507,7 @@ mod policy_time {
     #[tokio::test]
     async fn ttl_from_write_expires_after_ttl_without_reads() {
         with_timeout(Duration::from_secs(30), async {
-            let ttl = Duration::from_millis(80);
+            let ttl = Duration::from_millis(500);
             let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(ttl, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
@@ -1514,7 +1516,7 @@ mod policy_time {
                     .build(),
             );
             cache.insert("k".into(), "v".into());
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
             assert_eq!(cache.get("k"), None);
         })
         .await;
@@ -1523,7 +1525,7 @@ mod policy_time {
     #[tokio::test]
     async fn ttl_expire_then_try_get_with_runs_initializer() {
         with_timeout(Duration::from_secs(30), async {
-            let ttl = Duration::from_millis(80);
+            let ttl = Duration::from_millis(500);
             let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(ttl, DefaultPolicy));
             let cache = Arc::new(Cache::<K, V>::new(
                 CacheBuilder::<K, V>::new()
@@ -1533,7 +1535,7 @@ mod policy_time {
             ));
             let k = "tk".to_string();
             cache.insert(k.clone(), "old".into());
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_c = Arc::clone(&calls);
             let out = cache
@@ -1563,7 +1565,7 @@ mod policy_time {
     #[tokio::test]
     async fn idle_timeout_does_not_evict_recently_read_entry_after_first_deadline_passes() {
         with_timeout(Duration::from_secs(30), async {
-            let idle = Duration::from_millis(150);
+            let idle = Duration::from_millis(600);
             let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::new()
@@ -1573,11 +1575,11 @@ mod policy_time {
                     .build(),
             );
             cache.insert("k".into(), "v".into());
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             assert_eq!(cache.get("k"), Some("v".to_string()));
-            // The original (~+150ms) deadline is now in the past;
-            // the read-extended deadline (~+230ms) is still ahead.
-            tokio::time::sleep(Duration::from_millis(90)).await;
+            // The original (~+750ms ceil-tick) deadline is now in the past;
+            // the read-extended deadline (~+1250ms) is still ahead.
+            tokio::time::sleep(Duration::from_millis(400)).await;
             cache.insert("trigger".into(), "tv".into());
             assert_eq!(
                 cache.get("k"),
@@ -1599,7 +1601,7 @@ mod policy_time {
         with_timeout(Duration::from_secs(30), async {
             let (listener, log) = RecordingListener::new_pair();
             let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
-            let idle = Duration::from_millis(80);
+            let idle = Duration::from_millis(500);
             let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
             let cache = Cache::<K, V>::new(
                 CacheBuilder::new()
@@ -1618,7 +1620,7 @@ mod policy_time {
                 }
                 tokio::task::yield_now().await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
             cache.insert("trigger".into(), "tv".into());
 
             let events = log.lock().unwrap().clone();

@@ -13,7 +13,6 @@
 //! `super::expiry`. The orchestration that wires these into the cache
 //! lives in `Inner::reclaim` and friends.
 use std::collections::VecDeque;
-use std::time::Instant;
 
 use hashbrown::HashTable;
 use slotmap::SlotMap;
@@ -42,8 +41,16 @@ pub(super) type EntrySlab<K, V> = SlotMap<SlotKey, EntrySlot<K, V>>;
 
 pub(crate) struct CacheEntry<V> {
     pub(crate) value: V,
-    pub(crate) written_at: Instant,
-    pub(crate) deadline: Option<Instant>,
+    /// Quarter-second ticks since [`super::inner::Inner::start`] at
+    /// which this entry was last installed. Floor-rounded; converted
+    /// back to [`std::time::Instant`] only at the policy hook boundary.
+    pub(crate) written_at: super::clock::Tick,
+    /// Quarter-second ticks since `Inner::start` at which this entry
+    /// stops being served (ceil-rounded), or [`super::clock::NO_DEADLINE`]
+    /// if no time-based hook is active. Folded into a single `Tick`
+    /// rather than `Option<Tick>` so the live-check is one comparison,
+    /// not a discriminant + cmp.
+    pub(crate) deadline: super::clock::Tick,
 }
 
 /// Which S3-FIFO queue a slot currently lives on. A slot is in exactly
@@ -220,10 +227,14 @@ pub(super) struct GhostSet {
 }
 
 impl GhostSet {
+    /// Constructs a ghost set bounded to `cap` fingerprints. The ring
+    /// and membership table allocate lazily on first `insert`, so
+    /// caches that never reach the eviction-from-Small path (no time
+    /// budget pressure) carry zero ghost overhead.
     pub(super) fn new(cap: usize) -> Self {
         Self {
-            ring: VecDeque::with_capacity(cap),
-            set: HashTable::with_capacity(cap),
+            ring: VecDeque::new(),
+            set: HashTable::new(),
             cap,
         }
     }
@@ -287,6 +298,86 @@ impl GhostSet {
         }
     }
 }
+
+#[cfg(feature = "typesize")]
+mod typesize_impls {
+    //! `TypeSize` impls for slab-backed types. `extra_size` only counts
+    //! heap bytes beyond `mem::size_of::<Self>()`; the trait's default
+    //! `get_size` adds the stack-resident size on top.
+
+    use core::mem;
+
+    use typesize::TypeSize;
+
+    use super::{CacheEntry, EntrySlot, Fifo, GhostSet, Queue};
+
+    impl TypeSize for Queue {}
+
+    impl<V: TypeSize> TypeSize for CacheEntry<V> {
+        fn extra_size(&self) -> usize {
+            let Self {
+                value,
+                written_at,
+                deadline,
+            } = self;
+            value.extra_size() + written_at.extra_size() + deadline.extra_size()
+        }
+    }
+
+    impl<K: TypeSize, V: TypeSize> TypeSize for EntrySlot<K, V> {
+        fn extra_size(&self) -> usize {
+            // `SlotKey` comes from `slotmap::new_key_type!`; orphan rule
+            // blocks a `TypeSize` impl so `fifo_prev` / `fifo_next` fall
+            // through `_`. They're plain stack data, already counted in
+            // `mem::size_of::<Self>()`.
+            let Self {
+                key,
+                entry,
+                weight,
+                queue,
+                freq,
+                fifo_prev: _,
+                fifo_next: _,
+                refresh_inflight,
+            } = self;
+            key.extra_size()
+                + entry.extra_size()
+                + weight.extra_size()
+                + queue.extra_size()
+                + freq.extra_size()
+                + refresh_inflight.extra_size()
+        }
+    }
+
+    impl TypeSize for Fifo {
+        fn extra_size(&self) -> usize {
+            0
+        }
+    }
+
+    impl TypeSize for GhostSet {
+        fn extra_size(&self) -> usize {
+            // VecDeque has a power-of-two capacity ring buffer; charge by
+            // capacity * element size. HashTable's `allocation_size`
+            // already includes its bucket array.
+            self.ring.capacity() * mem::size_of::<u64>() + self.set.allocation_size()
+        }
+    }
+
+    /// Bytes the slotmap allocates for `capacity` slots of element `T`.
+    /// Matches `slotmap::SlotMap`'s internal `Vec<Slot<T>>` layout: each
+    /// slot carries `MaybeUninit<T>` plus a `u32` version and a `u32`
+    /// next-free pointer, rounded up to `align_of::<T>`.
+    pub(crate) fn slot_storage_bytes<T>(capacity: usize) -> usize {
+        let element = mem::size_of::<T>() + 2 * mem::size_of::<u32>();
+        let align = mem::align_of::<T>().max(mem::align_of::<u32>());
+        let stride = element.div_ceil(align) * align;
+        capacity * stride
+    }
+}
+
+#[cfg(feature = "typesize")]
+pub(crate) use typesize_impls::slot_storage_bytes;
 
 #[cfg(test)]
 mod fifo_tests {
