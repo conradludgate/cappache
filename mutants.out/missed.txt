@@ -1,18 +1,18 @@
 src/config.rs:97:5: replace default_shard_count -> usize with 0
 src/config.rs:97:5: replace default_shard_count -> usize with 1
-src/cache/inner.rs:185:9: replace SyncMissFlight<V>::wait -> Option<V> with None
-src/cache/inner.rs:277:9: replace <impl Equivalent<(K, TypeId)> for LaneKeyRef<'_, K>>::equivalent -> bool with true
-src/cache/inner.rs:277:28: replace && with || in <impl Equivalent<(K, TypeId)> for LaneKeyRef<'_, K>>::equivalent
-src/cache/inner.rs:538:9: replace <impl FifoNode for EntrySlot<K, V>>::fifo_next -> Option<SlotKey> with None
-src/cache/inner.rs:544:9: replace <impl FifoNode for EntrySlot<K, V>>::set_fifo_next with ()
-src/cache/inner.rs:957:9: replace <impl PartialOrd for HeapKey>::partial_cmp -> Option<Ordering> with None
-src/cache/inner.rs:999:28: replace > with == in expiry_push_extend
-src/cache/inner.rs:999:28: replace > with < in expiry_push_extend
-src/cache/inner.rs:999:28: replace > with >= in expiry_push_extend
-src/cache/inner.rs:1040:25: replace > with >= in drain_expired
-src/cache/inner.rs:1656:47: replace > with >= in Inner<K, V, P, S>::reclaim
-src/cache/inner.rs:1713:17: replace > with >= in Inner<K, V, P, S>::evict_from_small
-src/cache/inner.rs:1768:30: replace <= with > in Inner<K, V, P, S>::evict_from_main
-src/cache/inner.rs:1776:17: replace > with < in Inner<K, V, P, S>::evict_from_main
-src/cache/inner.rs:2219:21: replace match guard Some(dl) != prev with true in update_read_deadline
-src/cache/inner.rs:2224:51: replace && with || in update_read_deadline
+src/cache/expiry.rs:46:9: replace <impl PartialOrd for HeapKey>::partial_cmp -> Option<Ordering> with None
+src/cache/expiry.rs:93:28: replace > with == in expiry_push_extend
+src/cache/expiry.rs:93:28: replace > with < in expiry_push_extend
+src/cache/expiry.rs:93:28: replace > with >= in expiry_push_extend
+src/cache/expiry.rs:134:25: replace > with >= in drain_expired
+src/cache/flight.rs:159:9: replace SyncMissFlight<V>::wait -> Option<V> with None
+src/cache/flight.rs:260:9: replace <impl Equivalent<(K, TypeId)> for LaneKeyRef<'_, K>>::equivalent -> bool with true
+src/cache/flight.rs:260:28: replace && with || in <impl Equivalent<(K, TypeId)> for LaneKeyRef<'_, K>>::equivalent
+src/cache/inner.rs:797:21: replace match guard Some(dl) != prev with true in update_read_deadline
+src/cache/inner.rs:802:51: replace && with || in update_read_deadline
+src/cache/reclaim.rs:85:43: replace > with >= in reclaim
+src/cache/reclaim.rs:142:13: replace > with >= in evict_from_small
+src/cache/reclaim.rs:192:26: replace <= with > in evict_from_main
+src/cache/reclaim.rs:199:13: replace > with < in evict_from_main
+src/cache/slab.rs:94:9: replace <impl FifoNode for EntrySlot<K, V>>::fifo_next -> Option<SlotKey> with None
+src/cache/slab.rs:100:9: replace <impl FifoNode for EntrySlot<K, V>>::set_fifo_next with ()
