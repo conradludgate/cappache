@@ -11,8 +11,6 @@ Concurrent cache for Rust (API-first development).
 
 Integration tests: `**cargo test --test cache_surface**` covers builder and introspection; `**cargo test --test cache_ops**` covers data paths, concurrency, and refresh scheduling.
 
-Design intent (O(1) targets, deferred drops, `Policy`-driven time, etc.) is in [docs/DESIGN.md](docs/DESIGN.md).
-
 ## License
 
 TBD

@@ -27,11 +27,6 @@
 //!   (cheap `Arc`-style increment), so spawning workers around the same cache is the
 //!   intended pattern. Drop a clone independently; the cache is dropped when the last
 //!   handle is dropped.
-//!
-//! ## Design notes
-//!
-//! Non-normative implementation intent (O(1) targets, lazy maintenance, deferred drops) lives in
-//! [`DESIGN.md`](../docs/DESIGN.md) in the `docs/` folder.
 
 pub mod cache;
 pub mod config;
