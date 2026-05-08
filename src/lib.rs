@@ -5,8 +5,9 @@
 //!
 //! This crate is **`#![deny(unsafe_code)]`**. The in-memory [`Cache`](crate::Cache) implements
 //! synchronous `get` / `insert` / `remove`, async miss helpers, and executor-driven refresh.
-//! Sync miss-coalescing lives on [`Cache::get_or_insert_with`] (Condvar-backed; no async
-//! runtime needed) for callers outside Tokio.
+//! Sync miss-coalescing lives on [`Cache::get_with_blocking`] /
+//! [`Cache::try_get_with_blocking`] (Condvar-backed; no async runtime needed) for callers
+//! outside Tokio.
 //!
 //! ## Overview
 //!
@@ -18,7 +19,8 @@
 //! - Observe removals and updates through [`lifecycle::LifecycleReason`] and [`lifecycle::LifecycleListener`].
 //! - [`Cache::get`], [`Cache::insert`], and [`Cache::remove`] are **synchronous**; miss-path helpers are
 //!   async [`Cache::try_get_with`] / [`Cache::get_with`], plus the sync
-//!   [`Cache::get_or_insert_with`] for callers without an async runtime.
+//!   [`Cache::try_get_with_blocking`] / [`Cache::get_with_blocking`] for callers without an
+//!   async runtime.
 //! - Caller-driven background refresh: [`Cache::try_revalidate`], [`Cache::revalidate`] with an [`Executor`]
 //!   from the [`rt`] module.
 //! - Fallible miss path uses **`E: Clone`** on [`Cache::try_get_with`] / [`Cache::try_revalidate`] instead of `Arc<E>`;

@@ -8,7 +8,7 @@
 //! key. Init errors may be returned from `try_revalidate` or only after the async job—see
 //! `try_revalidate_initializer_error_propagates_as_err`.
 //!
-//! Prefer `get_with` + `.await` inside `#[tokio::test]` over `get_or_insert_with` on the Tokio
+//! Prefer `get_with` + `.await` inside `#[tokio::test]` over `get_with_blocking` on the Tokio
 //! worker when the initializer would need the same runtime (see crate rustdoc on blocking hazards).
 
 use std::future::Future;
@@ -344,13 +344,13 @@ mod miss {
     }
 
     #[test]
-    fn get_or_insert_with_hit_does_not_run_initializer() {
+    fn get_with_blocking_hit_does_not_run_initializer() {
         let cache = test_cache();
         let k = "block_hit".to_string();
         let _ = cache.insert(k.clone(), "cached".to_string());
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = Arc::clone(&calls);
-        let v = cache.get_or_insert_with(k.clone(), |_| {
+        let v = cache.get_with_blocking(k.clone(), |_| {
             calls_c.fetch_add(1, Ordering::SeqCst);
             "wrong".to_string()
         });
@@ -376,19 +376,37 @@ mod miss {
     }
 
     #[test]
-    fn get_or_insert_with_miss_on_sync_thread() {
+    fn get_with_blocking_miss_on_sync_thread() {
         let cache = test_cache();
         let k = "block1".to_string();
-        let v = cache.get_or_insert_with(k.clone(), |_| "blocked".to_string());
+        let v = cache.get_with_blocking(k.clone(), |_| "blocked".to_string());
         assert_eq!(v, "blocked");
         assert_eq!(cache.get(&k), Some("blocked".to_string()));
+    }
+
+    /// Sync sibling of `try_get_with_err_then_ok_same_key_installs_ok`:
+    /// `try_get_with_blocking` returns the leader's `Err` to followers,
+    /// does **not** cache it, and the next call re-runs `init` and
+    /// installs the resulting value.
+    #[test]
+    fn try_get_with_blocking_err_then_ok_same_key_installs_ok() {
+        let cache = test_cache();
+        let k = "sync_recover".to_string();
+        let first: Result<String, ()> = cache.try_get_with_blocking(k.clone(), |_| Err(()));
+        assert_eq!(first, Err(()));
+        assert_eq!(cache.get(&k), None);
+
+        let second: Result<String, ()> =
+            cache.try_get_with_blocking(k.clone(), |_| Ok("ok".to_string()));
+        assert_eq!(second, Ok("ok".to_string()));
+        assert_eq!(cache.get(&k), Some("ok".to_string()));
     }
 
     /// Sync miss-coalescing: many sync waiters on the same key share one
     /// init invocation. Mirrors the async `concurrent_get_with_same_key`
     /// guarantee but exercises the Condvar-backed path.
     #[test]
-    fn concurrent_get_or_insert_with_same_key_single_initializer() {
+    fn concurrent_get_with_blocking_same_key_single_initializer() {
         use std::sync::Barrier;
         use std::thread;
 
@@ -406,7 +424,7 @@ mod miss {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                cache.get_or_insert_with(k.clone(), |_| {
+                cache.get_with_blocking(k.clone(), |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(std::time::Duration::from_millis(20));
                     "computed".to_string()
@@ -1268,7 +1286,7 @@ mod cancellation {
     }
 
     /// Sync sibling of `panicking_leader_lets_follower_progress`: a
-    /// panic from the closure passed to `get_or_insert_with` must
+    /// panic from the closure passed to `get_with_blocking` must
     /// release the leader's inflight lane so a follow-up call can
     /// install a value instead of joining a flight that will never
     /// settle.
@@ -1279,15 +1297,15 @@ mod cancellation {
         let panic_cache = Arc::clone(&cache);
         let panic_key = key.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            panic_cache.get_or_insert_with(panic_key, |_| -> String { panic!("init blew up") });
+            panic_cache.get_with_blocking(panic_key, |_| -> String { panic!("init blew up") });
         }));
         assert!(result.is_err(), "panic should propagate to the caller");
-        let v = cache.get_or_insert_with(key.clone(), |_| "recovered".to_string());
+        let v = cache.get_with_blocking(key.clone(), |_| "recovered".to_string());
         assert_eq!(v, "recovered");
         assert_eq!(cache.get(&key), Some("recovered".to_string()));
     }
 
-    /// A sync follower already blocked inside `get_or_insert_with`
+    /// A sync follower already blocked inside `get_with_blocking`
     /// must wake when the leader's initializer panics — the
     /// leader's drop guard cancels the in-flight lane and signals
     /// every Condvar waiter, who then re-enter the probe loop and
@@ -1308,7 +1326,7 @@ mod cancellation {
         let release = Arc::clone(&release_leader);
         let leader = thread::spawn(move || {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                c_leader.get_or_insert_with(k_leader, |_| -> String {
+                c_leader.get_with_blocking(k_leader, |_| -> String {
                     started.wait();
                     release.wait();
                     panic!("sync init blew up");
@@ -1322,7 +1340,7 @@ mod cancellation {
         let c_follow = Arc::clone(&cache);
         let k_follow = key.clone();
         let follower = thread::spawn(move || {
-            let v = c_follow.get_or_insert_with(k_follow, |_| "follower".to_string());
+            let v = c_follow.get_with_blocking(k_follow, |_| "follower".to_string());
             let _ = tx.send(v);
         });
 
@@ -1866,10 +1884,10 @@ mod clear {
     }
 
     /// Sync sibling of the previous test: a thread blocked inside
-    /// `get_or_insert_with` must also wake when `clear()` runs and
+    /// `get_with_blocking` must also wake when `clear()` runs and
     /// install its own value on retry.
     #[test]
-    fn clear_during_inflight_get_or_insert_with_lets_follower_install_fresh_value() {
+    fn clear_during_inflight_get_with_blocking_lets_follower_install_fresh_value() {
         use std::sync::{Barrier, mpsc};
         use std::thread;
 
@@ -1883,7 +1901,7 @@ mod clear {
         let started = Arc::clone(&leader_started);
         let release = Arc::clone(&release_leader);
         let leader = thread::spawn(move || {
-            c_leader.get_or_insert_with(k_leader, |_| {
+            c_leader.get_with_blocking(k_leader, |_| {
                 started.wait();
                 release.wait();
                 "leader".to_string()
@@ -1896,7 +1914,7 @@ mod clear {
         let c_follow = Arc::clone(&cache);
         let k_follow = key.clone();
         let follower = thread::spawn(move || {
-            let v = c_follow.get_or_insert_with(k_follow, |_| "follower".to_string());
+            let v = c_follow.get_with_blocking(k_follow, |_| "follower".to_string());
             let _ = tx.send(v);
         });
 
@@ -1918,7 +1936,7 @@ mod clear {
 }
 
 mod insert_vs_leader {
-    //! `Cache::insert` runs while a `try_get_with` / `get_or_insert_with`
+    //! `Cache::insert` runs while a `try_get_with` / `get_with_blocking`
     //! leader's initialiser is still awaiting. The leader resumes, takes
     //! the shard lock, removes its lane, and installs its value. Without
     //! a dedup at install time, both rows survive in `entries` (and both
@@ -1972,7 +1990,7 @@ mod insert_vs_leader {
     }
 
     #[test]
-    fn get_or_insert_with_leader_install_after_concurrent_insert_keeps_one_row() {
+    fn get_with_blocking_leader_install_after_concurrent_insert_keeps_one_row() {
         use std::sync::{Barrier, mpsc};
         use std::thread;
 
@@ -1987,7 +2005,7 @@ mod insert_vs_leader {
         let release = Arc::clone(&release_leader);
         let (tx, rx) = mpsc::channel();
         let leader = thread::spawn(move || {
-            let v = c_leader.get_or_insert_with(k_leader, |_| {
+            let v = c_leader.get_with_blocking(k_leader, |_| {
                 started.wait();
                 release.wait();
                 "v2".to_string()

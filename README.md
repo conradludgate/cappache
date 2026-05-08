@@ -6,9 +6,9 @@ refresh, all behind a `#![deny(unsafe_code)]` boundary.
 
 - **Sync core**: `get`, `insert`, `remove`, `contains_key`, `len`,
   `weight`, `clear`.
-- **Sync miss-coalescing**: `get_or_insert_with` runs the user closure
-  once across concurrent callers on the same key without needing an
-  async runtime.
+- **Sync miss-coalescing**: `get_with_blocking` / `try_get_with_blocking`
+  run the user closure once across concurrent callers on the same key
+  without needing an async runtime.
 - **Async miss-coalescing**: `try_get_with` (`Result<V, E>`) and
   `get_with` (infallible) park concurrent followers on the same
   in-flight leader.
@@ -210,7 +210,7 @@ The engine lives under [`src/cache/`](src/cache/), split by concern:
 | [`expiry.rs`](src/cache/expiry.rs) | Min-heap of deadlines with lazy validation on pop |
 | [`flight.rs`](src/cache/flight.rs) | Miss-coalescing lanes (`MissFlight`, `SyncMissFlight`) |
 | [`reclaim.rs`](src/cache/reclaim.rs) | S3-FIFO size-based eviction |
-| [`miss.rs`](src/cache/miss.rs) | `try_get_with` / `get_or_insert_with` orchestration |
+| [`miss.rs`](src/cache/miss.rs) | `try_get_with` / `try_get_with_blocking` orchestration |
 
 A few choices worth knowing about:
 

@@ -1,6 +1,6 @@
 //! Miss-coalescing primitives.
 //!
-//! Every `try_get_with` / `get_or_insert_with` follower for the same
+//! Every `try_get_with` / `try_get_with_blocking` follower for the same
 //! `(key, F)` joins the same in-flight lane so we run `init` exactly
 //! once per coalesced burst. The flight types ([`MissFlight`] for the
 //! async path, [`SyncMissFlight`] for the Condvar-backed sync path)
@@ -115,28 +115,33 @@ where
 }
 
 /// Per-key Condvar-backed coalescing point for the sync
-/// `get_or_insert_with` path. Lives alongside the async
+/// `try_get_with_blocking` path. Lives alongside the async
 /// [`MissFlight<V, E>`] entries in `State::inflight`, distinguished by the
 /// concrete `TypeId` of the flight type carried in the map's `(K, TypeId)`
-/// key — a sync follower's `(key, TypeId<SyncMissFlight<V>>)` lookup can
-/// never collide with an async lane (and vice versa).
-pub(super) struct SyncMissFlight<V>
+/// key — a sync follower's `(key, TypeId<SyncMissFlight<V, E>>)` lookup
+/// can never collide with an async lane (and vice versa). Sync lanes are
+/// also keyed on `E` so two sync followers with different error types
+/// install their own lanes, mirroring the async [`MissFlight<V, E>`]
+/// behaviour.
+pub(super) struct SyncMissFlight<V, E>
 where
     V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
 {
-    state: Mutex<SyncFlightState<V>>,
+    state: Mutex<SyncFlightState<V, E>>,
     cond: Condvar,
 }
 
-enum SyncFlightState<V> {
+enum SyncFlightState<V, E> {
     Pending,
-    Settled(V),
+    Settled(Result<V, E>),
     Cancelled,
 }
 
-impl<V> SyncMissFlight<V>
+impl<V, E> SyncMissFlight<V, E>
 where
     V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
 {
     fn new() -> Self {
         Self {
@@ -145,33 +150,34 @@ where
         }
     }
 
-    pub(super) fn publish(&self, v: V) {
+    pub(super) fn publish_result(&self, r: Result<V, E>) {
         let mut s = self.state.lock().expect("sync flight mutex poisoned");
-        *s = SyncFlightState::Settled(v);
+        *s = SyncFlightState::Settled(r);
         self.cond.notify_all();
     }
 
-    /// Returns `Some(v)` once the leader publishes a value. Returns
-    /// `None` when the leader cancelled (init future dropped or leader
+    /// Returns `Some(res)` once the leader publishes an outcome. Returns
+    /// `None` when the leader cancelled (init closure panicked or leader
     /// guard fired); the caller is then expected to re-enter the probe
     /// loop to either become leader or join a fresh follower.
-    pub(super) fn wait(&self) -> Option<V> {
+    pub(super) fn wait(&self) -> Option<Result<V, E>> {
         let mut s = self.state.lock().expect("sync flight mutex poisoned");
         loop {
             match &*s {
                 SyncFlightState::Pending => {
                     s = self.cond.wait(s).expect("sync flight mutex poisoned");
                 }
-                SyncFlightState::Settled(v) => return Some(v.clone()),
+                SyncFlightState::Settled(r) => return Some(r.clone()),
                 SyncFlightState::Cancelled => return None,
             }
         }
     }
 }
 
-impl<V> Flight for SyncMissFlight<V>
+impl<V, E> Flight for SyncMissFlight<V, E>
 where
     V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
 {
     fn cancel(&self) {
         let mut s = self.state.lock().expect("sync flight mutex poisoned");
@@ -182,9 +188,10 @@ where
     }
 }
 
-impl<V> NewFlight for SyncMissFlight<V>
+impl<V, E> NewFlight for SyncMissFlight<V, E>
 where
     V: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
 {
     fn fresh() -> Self {
         Self::new()
@@ -262,7 +269,7 @@ impl<K: Eq> Equivalent<(K, TypeId)> for LaneKeyRef<'_, K> {
 }
 
 /// Outcome of a single probe attempt on a miss-coalescing flight type `F`.
-/// `F` is `MissFlight<V, E>` for the async paths and `SyncMissFlight<V>`
+/// `F` is `MissFlight<V, E>` for the async paths and `SyncMissFlight<V, E>`
 /// for the sync path; both share the Hit/Wait/Leader trichotomy.
 pub(super) enum MissStep<V, F>
 where
@@ -329,7 +336,7 @@ where
 /// forever on a sender / Condvar that will never publish.
 ///
 /// One generic guard covers both `try_get_with` (`F = MissFlight<V, E>`)
-/// and `get_or_insert_with` (`F = SyncMissFlight<V>`); the only
+/// and `try_get_with_blocking` (`F = SyncMissFlight<V, E>`); the only
 /// per-flight behaviour difference is the cancellation channel, which is
 /// already abstracted by `Flight::cancel`.
 pub(super) struct LeaderGuard<'a, F, K, V, P, S>

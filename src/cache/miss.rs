@@ -3,7 +3,7 @@
 //! Hosts the per-iteration probe (`miss_probe`), the lock-protected
 //! hit/expiry pre-check (`with_probe_for_hit`), the post-leader install
 //! step (`finish_miss_ok`), and the public miss-coalescing entry points
-//! `try_get_with` (async) and `get_or_insert_with` (sync). The shard
+//! `try_get_with` (async) and `try_get_with_blocking` (sync). The shard
 //! lock is held only for the probe-and-install windows; user-supplied
 //! init closures run with the lock released so the cache stays
 //! responsive on other keys.
@@ -140,7 +140,7 @@ where
     /// served hit, in-flight miss wait, or install miss leader. Avoids
     /// TOCTOU between separate `get_served` / miss checks / leader insert.
     /// Used by both [`Self::try_get_with`] (`F = MissFlight<V, E>`) and
-    /// [`Self::get_or_insert_with`] (`F = SyncMissFlight<V>`).
+    /// [`Self::try_get_with_blocking`] (`F = SyncMissFlight<V, E>`).
     fn miss_probe<F>(&self, key: &K) -> MissStep<V, F>
     where
         K: Clone + 'static,
@@ -227,27 +227,30 @@ where
         }
     }
 
-    /// Sync miss-coalescing entry point. The user closure runs **without**
-    /// the shard lock held, so the cache stays responsive on other keys
-    /// while the leader produces a value.
+    /// Sync fallible miss-coalescing entry point. The user closure runs
+    /// **without** the shard lock held, so the cache stays responsive on
+    /// other keys while the leader produces a value. `Err` outcomes are
+    /// published to followers but never installed in the slab — the next
+    /// caller probes fresh.
     ///
     /// `key` is taken by value to match the async [`Self::try_get_with`]
     /// signature; internally it is borrowed everywhere except the owned
     /// clone that goes into the `inflight` map and the slab.
     #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn get_or_insert_with<F>(self: &Arc<Self>, key: K, init: F) -> V
+    pub(crate) fn try_get_with_blocking<F, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
     where
         K: Clone + Send + Sync + 'static,
         V: Clone + Send + Sync + 'static,
-        F: FnOnce(&K) -> V,
+        E: Clone + Send + Sync + 'static,
+        F: FnOnce(&K) -> Result<V, E>,
     {
         let mut init = Some(init);
         loop {
-            match self.miss_probe::<SyncMissFlight<V>>(&key) {
-                MissStep::Hit(v) => return v,
+            match self.miss_probe::<SyncMissFlight<V, E>>(&key) {
+                MissStep::Hit(v) => return Ok(v),
                 MissStep::Wait(f) => {
-                    if let Some(v) = f.wait() {
-                        return v;
+                    if let Some(res) = f.wait() {
+                        return res;
                     }
                     // Leader cancelled — its lane is gone; loop and either
                     // observe a fresh value or take leadership ourselves.
@@ -256,31 +259,48 @@ where
                     let init = init
                         .take()
                         .expect("init consumed: only the leader arm consumes it");
-                    let mut guard = LeaderGuard::<SyncMissFlight<V>, K, V, P, S> {
+                    let mut guard = LeaderGuard::<SyncMissFlight<V, E>, K, V, P, S> {
                         inner: self.as_ref(),
                         key: &key,
                         flight: miss,
                         armed: true,
                     };
-                    let value = init(&key);
+                    let res = init(&key);
                     let mut st = guard.inner.shard_for(&key).write();
                     remove_lane(
                         &mut st,
                         &key,
-                        TypeId::of::<SyncMissFlight<V>>(),
+                        TypeId::of::<SyncMissFlight<V, E>>(),
                         Arc::as_ptr(&guard.flight).cast::<()>(),
                     );
-                    let now = Instant::now();
-                    let (reclaimed, displaced) = self.finish_miss_ok(&mut st, &key, &value, now);
-                    guard.flight.publish(value.clone());
+
+                    let finish = if let Ok(v) = &res {
+                        let now = Instant::now();
+                        Some(self.finish_miss_ok(&mut st, &key, v, now))
+                    } else {
+                        None
+                    };
+
+                    // Publish under the lock so a follower that wakes and
+                    // immediately calls `get(key)` cannot observe a state
+                    // where the value was reported settled but is not yet
+                    // installed in `entries`.
+                    guard.flight.publish_result(res.clone());
                     guard.armed = false;
                     drop(guard);
                     drop(st);
-                    if let Some(prev) = displaced {
-                        self.notify_lifecycle(LifecycleReason::Updated, key.clone(), Some(prev));
+
+                    if let Some((rec, displaced)) = finish {
+                        if let Some(prev) = displaced {
+                            self.notify_lifecycle(
+                                LifecycleReason::Updated,
+                                key.clone(),
+                                Some(prev),
+                            );
+                        }
+                        self.fire_reclaim(rec);
                     }
-                    self.fire_reclaim(reclaimed);
-                    return value;
+                    return res;
                 }
             }
         }

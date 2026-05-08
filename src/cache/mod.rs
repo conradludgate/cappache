@@ -314,32 +314,67 @@ where
     ///
     /// # Panics
     ///
-    /// Panics under the same conditions as [`Self::try_get_with`], and if an [`Infallible`] `Err`
-    /// is ever produced (unreachable for this API).
+    /// Panics under the same conditions as [`Self::try_get_with`].
     pub async fn get_with<F, Fut>(&self, key: K, init: F) -> V
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = V>,
     {
-        self.try_get_with(key, || {
-            let f = init();
-            async move { Ok::<_, Infallible>(f.await) }
-        })
-        .await
-        .expect("infallible: get_with uses OkIntoResult")
+        match self
+            .try_get_with(key, || {
+                let f = init();
+                async move { Ok::<_, Infallible>(f.await) }
+            })
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => match e {},
+        }
     }
 
-    /// Synchronous miss-coalescing variant of [`Self::get_with`]: blocks
-    /// the current thread on a Condvar until the leader publishes a
-    /// value. Does **not** drive any async runtime, so it is safe to use
-    /// outside (or inside) a Tokio context. The shard lock is released
-    /// before `init` runs, so other keys remain responsive while the
-    /// initializer is executing.
-    pub fn get_or_insert_with<F>(&self, key: K, init: F) -> V
+    /// Synchronous fallible miss-coalescing variant of
+    /// [`Self::try_get_with`]: blocks the current thread on a Condvar
+    /// until the leader publishes an outcome. Does **not** drive any
+    /// async runtime, so it is safe to use outside (or inside) a Tokio
+    /// context. The shard lock is released before `init` runs, so other
+    /// keys remain responsive while the initializer is executing. `Err`
+    /// outcomes are forwarded to followers but never installed in the
+    /// slab — the next caller probes fresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `Err` produced by `init`. Errors are not cached;
+    /// every caller after a failed leader runs `init` again (or joins
+    /// a fresh in-flight follower).
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same internal-bug conditions as
+    /// [`Self::try_get_with`].
+    pub fn try_get_with_blocking<F, E>(&self, key: K, init: F) -> Result<V, E>
+    where
+        F: FnOnce(&K) -> Result<V, E>,
+        E: Clone + Send + Sync + 'static,
+    {
+        inner::Inner::try_get_with_blocking(&self.inner, key, init)
+    }
+
+    /// Synchronous infallible miss-coalescing variant of
+    /// [`Self::get_with`]: blocks the current thread on a Condvar until
+    /// the leader publishes a value. Wraps [`Self::try_get_with_blocking`]
+    /// with [`Infallible`] errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::try_get_with_blocking`].
+    pub fn get_with_blocking<F>(&self, key: K, init: F) -> V
     where
         F: FnOnce(&K) -> V,
     {
-        inner::Inner::get_or_insert_with(&self.inner, key, init)
+        match self.try_get_with_blocking::<_, Infallible>(key, |k| Ok(init(k))) {
+            Ok(v) => v,
+            Err(e) => match e {},
+        }
     }
 
     /// Schedules a refresh job on `executor` for `key`.
@@ -428,8 +463,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics under the same conditions as [`Self::try_revalidate`], and if an [`Infallible`] `Err`
-    /// is ever produced (unreachable for this API).
+    /// Panics under the same conditions as [`Self::try_revalidate`].
     pub fn revalidate<Ex, F, Fut>(&self, key: K, executor: &Ex, init: F) -> RevalidateScheduled
     where
         Ex: Executor<RefreshWork<K, V, Infallible, P, S>> + ?Sized,
@@ -437,7 +471,9 @@ where
         Fut: Future<Output = V> + Send + 'static,
         K: Unpin,
     {
-        self.try_revalidate(key, executor, |k| OkIntoResult::new(init(k)))
-            .expect("infallible: revalidate uses OkIntoResult")
+        match self.try_revalidate(key, executor, |k| OkIntoResult::new(init(k))) {
+            Ok(scheduled) => scheduled,
+            Err(e) => match e {},
+        }
     }
 }
