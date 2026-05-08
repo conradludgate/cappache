@@ -18,9 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use clache::{
-    Cache, CacheBuilder, Executor, LifecycleListener, LifecycleReason, Weight,
-};
+use clache::{Cache, CacheBuilder, Executor, LifecycleListener, LifecycleReason, Weight};
 
 /// Forwards every refresh job to `tokio::spawn`. The blanket impl
 /// covers both `Executor<RefreshWork<…, MyError, …>>` and

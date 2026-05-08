@@ -37,12 +37,7 @@ impl Policy<String, String> for LenWeight {
         time_remaining
     }
 
-    fn expire_after_write(
-        &self,
-        _key: &String,
-        _value: &String,
-        _written_at: Instant,
-    ) -> Duration {
+    fn expire_after_write(&self, _key: &String, _value: &String, _written_at: Instant) -> Duration {
         TIME_UNBOUNDED
     }
 }
