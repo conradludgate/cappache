@@ -201,3 +201,82 @@ mod bug1 {
         );
     }
 }
+
+mod bug2 {
+    use clache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
+
+    use super::{CapturingExecutor, InitError, drive_to_completion};
+
+    /// Bug #2: `apply_refresh_ok` resurrects a refreshed value into a
+    /// slot the user already removed. The race here is sequential —
+    /// `try_revalidate` schedules the job, the user `remove`s the
+    /// entry before the executor runs, and the refresh nonetheless
+    /// installs the value. This contradicts the documented
+    /// `RevalidateScheduled::AbsentKey` invariant: refresh must not
+    /// promote into install for an entry the user has decided to
+    /// drop.
+    ///
+    /// Fixed in: `fix: skip refresh install when slot identity changed`.
+    #[test]
+    fn refresh_does_not_resurrect_removed_entry() {
+        let cache: Cache<String, String> = Cache::new(
+            CacheBuilder::new().max_weight(Weight::new(10_000)).build(),
+        );
+        let ex = CapturingExecutor::new();
+        let k = "k".to_string();
+        cache.insert(k.clone(), "old".into());
+
+        assert_eq!(
+            cache
+                .try_revalidate(k.clone(), &*ex, |_| async move {
+                    Ok::<_, InitError>("new".to_string())
+                })
+                .expect("submit ok"),
+            RevalidateScheduled::Submitted,
+        );
+
+        assert_eq!(cache.remove(&k), Some("old".into()));
+
+        drive_to_completion(ex.take_latest());
+
+        assert!(
+            cache.get(&k).is_none(),
+            "removed entry must stay removed after a refresh completes",
+        );
+    }
+
+    /// Bug #2 (variant): if the user `remove`s the entry mid-refresh
+    /// and then `insert`s a fresh value, the in-flight refresh must
+    /// not stomp the user's new value.
+    ///
+    /// Fixed in: `fix: skip refresh install when slot identity changed`.
+    #[test]
+    fn refresh_does_not_overwrite_reinserted_entry() {
+        let cache: Cache<String, String> = Cache::new(
+            CacheBuilder::new().max_weight(Weight::new(10_000)).build(),
+        );
+        let ex = CapturingExecutor::new();
+        let k = "k".to_string();
+        cache.insert(k.clone(), "old".into());
+
+        assert_eq!(
+            cache
+                .try_revalidate(k.clone(), &*ex, |_| async move {
+                    Ok::<_, InitError>("refreshed".to_string())
+                })
+                .expect("submit ok"),
+            RevalidateScheduled::Submitted,
+        );
+
+        let _ = cache.remove(&k);
+        cache.insert(k.clone(), "user".into());
+
+        drive_to_completion(ex.take_latest());
+
+        assert_eq!(
+            cache.get(&k),
+            Some("user".into()),
+            "user-driven re-insert must not be overwritten by the in-flight refresh",
+        );
+    }
+}
