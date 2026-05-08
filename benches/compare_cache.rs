@@ -1,9 +1,9 @@
 //! Three-way comparative microbenchmarks across clache / moka / quick_cache.
 //!
-//! Phase 0 baseline harness: identical workloads on identical configs so the
-//! resulting Criterion baseline is meaningful before any cache refactor.
-//! Each scenario uses `BenchmarkId::new("<impl>", <param>)` inside one group so
-//! `target/criterion/<scenario>/<impl>/<param>` lays the impls out side by side.
+//! Identical workloads on identical configs so Criterion can diff the impls
+//! directly. Each scenario uses `BenchmarkId::new("<impl>", <param>)` inside
+//! one group so `target/criterion/<scenario>/<impl>/<param>` lays the impls
+//! out side by side.
 
 use std::hint::black_box;
 

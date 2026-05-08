@@ -174,21 +174,21 @@ pub(crate) struct State<K, V> {
     /// fingerprint into `ghost` (cold).
     pub(super) small: Fifo,
     /// S3-FIFO Main queue. Holds slots that survived a Small-tail
-    /// promotion or were re-inserted while their fingerprint sat in
-    /// `ghost`. Stage 2 keeps this empty; the cutover commit wires
-    /// admission and the recirculation loop.
+    /// promotion (`freq > 1` at the Small tail) or were re-inserted
+    /// while their fingerprint sat in `ghost`. Drains via
+    /// [`reclaim::evict_from_main`](super::reclaim) only when Small
+    /// is at or under its share of the budget.
     pub(super) main: Fifo,
-    /// Bounded set of fingerprints recently evicted from `small`. The
-    /// install path consumes membership to route a returning key
-    /// straight to `main`. Stage 2 keeps this empty; the cutover commit
-    /// wires population and consumption.
+    /// Bounded set of fingerprints recently evicted from `small` with
+    /// `freq <= 1`. The install path consumes membership
+    /// (`ghost.remove(fp)`) to route a returning key straight to
+    /// `main` with `freq = 0`.
     pub(super) ghost: GhostSet,
     /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over
-    /// slots currently in `small`. Cutover uses
-    /// `small_weight > shard_max_weight / SMALL_DENOMINATOR` to decide
-    /// whether to drain Small first vs Main. Maintained eagerly on
-    /// install / evict so the cutover does not have to retrofit the
-    /// invariant onto existing call sites.
+    /// slots currently in `small`. The reclaim outer loop drains Small
+    /// first when `small_weight > shard_max_weight / SMALL_DENOMINATOR`,
+    /// otherwise Main. Maintained eagerly on install / evict so the
+    /// reclaim path does not have to recompute it.
     pub(super) small_weight: u64,
     /// Min-heap of `(deadline, slot)` tuples used to find past-deadline
     /// entries in `O(log n)`. Validated lazily on pop: a tuple is
