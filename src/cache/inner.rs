@@ -727,7 +727,7 @@ where
     P: Policy<K, V> + ?Sized,
 {
     let d = policy.expire_after_write(key, value, now);
-    if d >= crate::policy::TIME_UNBOUNDED / 2 {
+    if d >= crate::policy::TIME_UNBOUNDED {
         None
     } else {
         now.checked_add(d)
@@ -787,7 +787,7 @@ where
         dl.saturating_duration_since(now)
     });
     let d = policy.expire_after_read(key, &e.value, now, e.written_at, time_remaining);
-    let new = if d >= crate::policy::TIME_UNBOUNDED / 2 {
+    let new = if d >= crate::policy::TIME_UNBOUNDED {
         None
     } else {
         now.checked_add(d)

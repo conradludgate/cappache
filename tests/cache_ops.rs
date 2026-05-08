@@ -1747,12 +1747,12 @@ mod mutation_guards {
     }
 
     #[derive(Clone)]
-    struct MidReadBoundWitness {
+    struct ReadSentinelWitness {
         reads: Arc<AtomicUsize>,
         second_hit_tr_is_sentinel: Arc<AtomicBool>,
     }
 
-    impl Policy<K, V> for MidReadBoundWitness {
+    impl Policy<K, V> for ReadSentinelWitness {
         fn weight(&self, _k: &K, _v: &V) -> Weight {
             Weight::new(1)
         }
@@ -1766,13 +1766,11 @@ mod mutation_guards {
             time_remaining: Duration,
         ) -> Duration {
             let n = self.reads.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                TIME_UNBOUNDED / 2 + Duration::from_nanos(1)
-            } else {
+            if n > 0 {
                 self.second_hit_tr_is_sentinel
                     .store(time_remaining == TIME_UNBOUNDED, Ordering::SeqCst);
-                TIME_UNBOUNDED
             }
+            TIME_UNBOUNDED
         }
 
         fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
@@ -1780,14 +1778,21 @@ mod mutation_guards {
         }
     }
 
+    /// A read hook that returns the literal [`TIME_UNBOUNDED`] sentinel
+    /// must fold the deadline to `None` (skipping the expiry heap), so
+    /// the next hit still observes the sentinel as `time_remaining`
+    /// rather than a finite drift. Exercises the read-side fold
+    /// branch in `update_read_deadline`, complementing
+    /// [`get_passes_sentinel_time_remaining_when_write_is_unbounded_and_deadline_none`]
+    /// which only covers the write-side fold.
     #[test]
-    fn mid_band_read_allowance_materializes_deadline_none_until_next_hit() {
+    fn read_returning_sentinel_keeps_deadline_none_for_next_hit() {
         let reads = Arc::new(AtomicUsize::new(0));
         let second = Arc::new(AtomicBool::new(false));
         let cache = Cache::new(
             CacheBuilder::new()
                 .max_weight(Weight::new(100))
-                .policy(Arc::new(MidReadBoundWitness {
+                .policy(Arc::new(ReadSentinelWitness {
                     reads: reads.clone(),
                     second_hit_tr_is_sentinel: second.clone(),
                 }))
@@ -1800,7 +1805,7 @@ mod mutation_guards {
         assert!(cache.get(&k).is_some());
         assert!(
             second.load(Ordering::SeqCst),
-            "after folding mid-band read allowance into None, the next hit must still observe TIME_UNBOUNDED remaining"
+            "after folding a sentinel read allowance into None, the next hit must still observe TIME_UNBOUNDED remaining"
         );
     }
 
