@@ -110,7 +110,6 @@ where
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(v)) => {
                 this.inner.apply_refresh_ok(&this.key, v);
-                this.inner.refresh_inflight_remove(&this.key);
                 this.cleaned = true;
                 Poll::Ready(())
             }
