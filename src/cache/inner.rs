@@ -212,6 +212,8 @@ where
         freq: 0,
         fifo_prev: None,
         fifo_next: None,
+        expiry_prev: None,
+        expiry_next: None,
         refresh_inflight: false,
     });
     st.queue_push_head(queue, id);
