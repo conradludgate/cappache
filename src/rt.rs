@@ -43,6 +43,13 @@ pub trait Executor<Fut> {
 /// ([`Cache::try_get_with`](crate::Cache::try_get_with) /
 /// [`Cache::get_with`](crate::Cache::get_with)) — so the call is a no-op
 /// and the caller can decide whether to fall back to a miss.
+///
+/// The same guarantee extends past submission: if a scheduled refresh
+/// completes against a key that has since been removed (or removed and
+/// then replaced by a fresh `insert`), the cache discards the refresh
+/// result rather than resurrecting the prior slot. Callers can rely on
+/// `remove` / `clear` / `insert` taking precedence over an in-flight
+/// refresh.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RevalidateScheduled {
