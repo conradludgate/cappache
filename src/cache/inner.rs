@@ -192,7 +192,7 @@ where
 }
 
 /// Slab + queue + `entries` + `expiry` + weight: the single install
-/// site for `Ready` slots. Keeps the heap and ghost invariants in
+/// site for `Ready` slots. Keeps the bucket and ghost invariants in
 /// lockstep with the slab.
 pub(super) fn install_ready<K, V, H>(
     st: &mut State<K, V>,

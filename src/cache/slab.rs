@@ -8,10 +8,11 @@ use hashbrown::HashTable;
 use slotmap::SlotMap;
 
 slotmap::new_key_type! {
-    /// Versioned slab handle. The version gates stale heap tuples
-    /// (recycled slot → `slab.get` returns `None`); a deadline-equality
-    /// check at the call site additionally rejects tuples superseded by
-    /// a read hook on the same live slot.
+    /// Versioned slab handle. The version is what makes a recycled
+    /// slot observable as a different identity: a stale `SlotKey`
+    /// retained outside the shard lock will fail the version check
+    /// inside `slab.get` and return `None` instead of resolving to
+    /// whatever entry now occupies the same slot.
     pub(crate) struct SlotKey;
 }
 

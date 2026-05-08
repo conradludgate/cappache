@@ -1,18 +1,48 @@
-//! Time-based eviction primitives.
+//! Time-based eviction: per-shard intrusive deadline buckets.
 //!
-//! Per shard the cache keeps deadlines in [`ExpiryBuckets`]: a sorted
-//! map from deadline tick to an intrusive doubly-linked list of slots
-//! expiring at that tick. List links live on `EntrySlot`
-//! (`expiry_prev` / `expiry_next`), so the structure adds no separate
-//! per-slot allocation; the `BTreeMap` only carries one head/tail pair
-//! per *distinct* deadline.
+//! Each shard owns an [`ExpiryBuckets`] — a `BTreeMap<Tick,
+//! BucketHead>` whose values point at intrusive doubly-linked lists
+//! threaded through `EntrySlot::expiry_prev` / `expiry_next`. Sibling
+//! links live on the slab entries, mirroring the same pattern used by
+//! [`super::slab::FifoNode`] for the S3-FIFO queues, so the bucket
+//! map is the only auxiliary allocation: one entry per *distinct*
+//! deadline tick, regardless of how many entries share it.
 //!
-//! No stale tuples accumulate: every state-changing op
-//! ([`push`], [`unlink`], [`reschedule`]) updates the bucket
-//! immediately. [`reschedule`] early-exits when the new deadline
-//! rounds to the same tick as the old, which is the common case under
-//! read-extending policies (e.g. `IdleTimeout`) sampling reads inside
-//! one of the cache's 250 ms ticks.
+//! ## Operations
+//!
+//! Let `B` be the number of distinct live deadline ticks
+//! (`B ≤ slab.len()`) and `E` the number of entries drained.
+//!
+//! | Op                    | Cost          |
+//! |-----------------------|---------------|
+//! | [`push`]              | `O(log B)`    |
+//! | [`unlink`]            | `O(log B)`    |
+//! | [`reschedule`]        | `O(log B)`, with a fast `O(1)` early-exit when the deadline rounds to the same tick. |
+//! | [`drain_expired`]     | `O(E + log B)` per drained bucket. |
+//!
+//! ## Why intrusive buckets
+//!
+//! The previous design kept a `BinaryHeap<(Tick, SlotKey)>` per shard
+//! with lazy validation on pop. Read-extending policies (e.g.
+//! `IdleTimeout`) push a fresh tuple on every hit, leaving stale
+//! tuples behind that have to be tolerated on pop or swept by a
+//! periodic full rebuild. Under sustained reads on small caches the
+//! rebuild cadence approached one rebuild per read.
+//!
+//! Buckets eliminate stale state: every op updates the `BTreeMap`
+//! and the list immediately, no rebuild path. [`reschedule`] further
+//! short-circuits when the new deadline rounds to the same 250 ms
+//! tick as the old — the dominant case under `IdleTimeout` whenever
+//! reads land inside the same tick window.
+//!
+//! ## Drain
+//!
+//! [`drain_expired`] walks `by_tick` in ascending order and lifts
+//! each ready bucket out of the map up front. The per-slot [`unlink`]
+//! call inside `evict_slot` then no-ops on the bucket lookup (it's
+//! already gone) and only zeroes the slab-side sibling pointers,
+//! avoiding the cost of patching the bucket head/tail `N` times
+//! while we're tearing it down anyway.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;

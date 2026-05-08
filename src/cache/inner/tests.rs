@@ -3,7 +3,7 @@
 
 /// Pins every key to shard 0 (clears the top 8 bits used by
 /// `(h << 7) >> 63`) while preserving lower-bit fingerprints so the
-/// FIFO / ghost / heap invariants stay observable.
+/// FIFO / ghost / bucket invariants stay observable.
 #[derive(Clone, Copy, Default)]
 struct SingleShardHasher;
 
