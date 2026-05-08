@@ -1,95 +1,57 @@
-//! S3-FIFO storage primitives.
-//!
-//! - [`SlotKey`] / [`EntrySlab`]: versioned-key slab over `slotmap`.
-//!   Stale heap tuples and stale `entries` rows self-clean on `slab.get`.
-//! - [`EntrySlot`] / [`CacheEntry`]: the owned cache entry plus its
-//!   intrusive FIFO links and S3-FIFO bookkeeping (`queue`, `freq`).
-//! - [`Fifo`] / [`FifoNode`]: O(1) intrusive FIFO threaded through any
-//!   slotmap-backed type that carries the `(prev, next)` pair.
-//! - [`GhostSet`]: bounded fingerprint FIFO used for S3-FIFO's
-//!   second-chance admission.
-//!
-//! Crate-private surface; consumed only from `super::inner` and
-//! `super::expiry`. The orchestration that wires these into the cache
-//! lives in `Inner::reclaim` and friends.
+//! S3-FIFO storage primitives: versioned slot keys, owned slab entries,
+//! intrusive FIFO links, and the bounded ghost set used by S3-FIFO's
+//! second-chance admission.
+
 use std::collections::VecDeque;
 
 use hashbrown::HashTable;
 use slotmap::SlotMap;
 
 slotmap::new_key_type! {
-    /// Stable handle into [`EntrySlab`]. Wraps `slotmap::KeyData`
-    /// (`u32` index + non-zero `u32` version), so:
-    ///
-    /// - the slab caps at 2^32-2 occupants, far past any RAM-bounded cache;
-    /// - `Option<SlotKey>` niche-packs to 8 bytes (one machine word) via
-    ///   the version field;
-    /// - every `slab.get(key)` / `slab.remove(key)` validates the version
-    ///   automatically, so a recycled slot never aliases a stale key.
-    ///
-    /// The version is what gates stale heap tuples in
-    /// [`super::expiry::drain_expired`] (slot recycled → `slab.get`
-    /// returns `None` → tuple is silently dropped); the deadline-equality
-    /// check still gates *deadline-shifted* tuples for the same live slot.
+    /// Versioned slab handle. The version gates stale heap tuples
+    /// (recycled slot → `slab.get` returns `None`); a deadline-equality
+    /// check at the call site additionally rejects tuples superseded by
+    /// a read hook on the same live slot.
     pub(crate) struct SlotKey;
 }
 
-/// Backing storage for every `Ready` entry in one shard. Versioned slot
-/// handles let stale heap tuples self-discard without an explicit
-/// generation field on [`EntrySlot`].
 pub(super) type EntrySlab<K, V> = SlotMap<SlotKey, EntrySlot<K, V>>;
 
 pub(crate) struct CacheEntry<V> {
     pub(crate) value: V,
-    /// Quarter-second ticks since [`super::inner::Inner::start`] at
-    /// which this entry was last installed. Floor-rounded; converted
-    /// back to [`std::time::Instant`] only at the policy hook boundary.
+    /// Quarter-second ticks since `Inner::start` (floor-rounded).
     pub(crate) written_at: super::clock::Tick,
-    /// Quarter-second ticks since `Inner::start` at which this entry
-    /// stops being served (ceil-rounded), or [`super::clock::NO_DEADLINE`]
-    /// if no time-based hook is active. Folded into a single `Tick`
-    /// rather than `Option<Tick>` so the live-check is one comparison,
-    /// not a discriminant + cmp.
+    /// Quarter-second ticks since `Inner::start` (ceil-rounded), or
+    /// [`super::clock::NO_DEADLINE`] when no time-based hook is active.
+    /// Folded into a single `Tick` (not `Option<Tick>`) so the
+    /// live-check is one comparison.
     pub(crate) deadline: super::clock::Tick,
 }
 
-/// Which S3-FIFO queue a slot currently lives on. A slot is in exactly
-/// one queue at a time, which is why [`EntrySlot`] only carries one
-/// `(fifo_prev, fifo_next)` pair to thread it through whichever queue
-/// owns it.
+/// A slot lives on exactly one queue at a time, which is why
+/// [`EntrySlot`] only carries one `(fifo_prev, fifo_next)` pair.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Queue {
     Small,
     Main,
 }
 
-/// Owned cache entry held inside the slab. The `key` back-reference lets
-/// eviction find and remove the corresponding `entries` map slot in O(1).
-/// Slot identity / freshness lives on [`SlotKey`] (slotmap version), not
-/// on a per-entry generation field.
 pub(super) struct EntrySlot<K, V> {
+    /// Back-reference so eviction can remove this slot's row from the
+    /// `entries` table in O(1).
     pub(super) key: K,
     pub(super) entry: CacheEntry<V>,
-    /// Cached `Policy::weight` so eviction does not need to re-call the user policy.
+    /// Cached `Policy::weight`, so eviction doesn't re-call the policy.
     pub(super) weight: u64,
-    /// Which FIFO (`Small` or `Main`) this slot is currently linked into.
-    /// Read by `evict_slot` to pick which queue to unlink from and
-    /// whether to debit `State::small_weight`. Set on install, mutated
-    /// when `evict_from_small` promotes to Main.
     pub(super) queue: Queue,
-    /// Saturating frequency counter (0..=`super::inner::FREQ_CAP`)
-    /// consumed by `evict_from_small` (promote vs evict) and
-    /// `evict_from_main` (recirculate vs evict). Read paths bump it
-    /// without touching FIFO order. Stays as a plain `u8` (not atomic)
-    /// because the read path already takes the shard write lock for
-    /// deadline updates.
+    /// Saturating freq counter (0..=`super::inner::FREQ_CAP`). Read
+    /// paths bump it under the shard write lock — no atomic needed.
     pub(super) freq: u8,
     pub(super) fifo_prev: Option<SlotKey>,
     pub(super) fifo_next: Option<SlotKey>,
     /// `true` while a `try_revalidate` job for this key is in flight.
-    /// Held on the slot rather than a side `HashSet<K>` to skip the
-    /// per-revalidate `K::clone()` + hash + insert; cleared by
-    /// `refresh_inflight_remove` (or dropped with the slot on eviction).
+    /// Held on the slot to skip a per-revalidate `K::clone() + hash +
+    /// insert` into a side set.
     pub(super) refresh_inflight: bool,
 }
 
@@ -108,12 +70,6 @@ impl<K, V> FifoNode for EntrySlot<K, V> {
     }
 }
 
-/// Intrusive FIFO link accessor. Implemented by any node held in a
-/// [`SlotMap<SlotKey, T>`] that wishes to thread itself through a
-/// [`Fifo`]. A node is in at most one [`Fifo`] at any time, so a single
-/// `(prev, next)` pair on the node is enough to support multiple FIFOs
-/// that this node may move between (`Small` ↔ `Main` in the S3-FIFO
-/// reclaim path).
 pub(super) trait FifoNode {
     fn fifo_prev(&self) -> Option<SlotKey>;
     fn fifo_next(&self) -> Option<SlotKey>;
@@ -121,9 +77,8 @@ pub(super) trait FifoNode {
     fn set_fifo_next(&mut self, next: Option<SlotKey>);
 }
 
-/// Intrusive FIFO over slotmap-backed nodes. `head` is the insertion
-/// end (newest), `tail` the eviction end (oldest); operations are
-/// `O(1)` and never allocate.
+/// Intrusive FIFO threaded through a slotmap. `head` is newest,
+/// `tail` is oldest. All ops are O(1) and never allocate.
 #[derive(Default)]
 pub(super) struct Fifo {
     head: Option<SlotKey>,
@@ -204,22 +159,15 @@ impl Fifo {
     }
 }
 
-/// Bounded FIFO of fingerprints (already-hashed key images) used by
-/// S3-FIFO as the second-chance signal: when an `evict_from_small`
-/// drop happens at `freq <= 1`, the key's fingerprint goes into
-/// [`GhostSet`]; if the key is reinserted before the fingerprint
-/// rotates out, the install path routes the entry directly into Main
-/// instead of Small.
+/// Bounded FIFO of recently-evicted-from-Small key fingerprints.
+/// S3-FIFO's second-chance signal: a returning key whose fingerprint
+/// is still in `GhostSet` skips Small and re-enters at Main.
 ///
-/// Internally a `VecDeque<u64>` plus a `HashTable<u64>`: the deque
-/// gives FIFO order, the table gives O(1) membership for `remove`.
-/// `remove` is **tombstoning** — it deletes from the membership table
-/// only and leaves the deque entry to be popped lazily on the next
-/// `insert` overflow. That keeps `remove` O(1) at the cost of a
-/// tombstone entry occupying one ring slot until it ages out, which
-/// shrinks effective ghost capacity transiently under high promotion
-/// rates. The trade-off is deliberate: the alternative (linear scan
-/// on `remove`) is O(cap) and untenable for million-entry caches.
+/// `remove` is tombstoning — it deletes from `set` only and leaves the
+/// deque entry to be popped lazily on the next `insert` overflow.
+/// Keeps `remove` O(1) at the cost of transient ring slack under high
+/// promotion rates. The alternative (linear scan) is O(cap) and
+/// untenable for million-entry caches.
 pub(super) struct GhostSet {
     ring: VecDeque<u64>,
     set: HashTable<u64>,
@@ -227,10 +175,8 @@ pub(super) struct GhostSet {
 }
 
 impl GhostSet {
-    /// Constructs a ghost set bounded to `cap` fingerprints. The ring
-    /// and membership table allocate lazily on first `insert`, so
-    /// caches that never reach the eviction-from-Small path (no time
-    /// budget pressure) carry zero ghost overhead.
+    /// Lazy: ring and table allocate on first `insert`, so caches that
+    /// never evict from Small carry zero ghost overhead.
     pub(super) fn new(cap: usize) -> Self {
         Self {
             ring: VecDeque::new(),
@@ -239,11 +185,6 @@ impl GhostSet {
         }
     }
 
-    /// Records `fp` as recently-evicted-from-Small. No-op when `cap == 0`
-    /// (used in tests / degenerate configs) or when `fp` is already
-    /// tracked. On overflow, drops the oldest ring entry and best-effort
-    /// removes it from the membership table (no-op if it was already a
-    /// tombstone).
     pub(super) fn insert(&mut self, fp: u64) {
         if self.cap == 0 || self.contains(fp) {
             return;
@@ -257,10 +198,8 @@ impl GhostSet {
         self.table_insert(fp);
     }
 
-    /// Consumes the membership for `fp`. Returns `true` if the
-    /// fingerprint was tracked (the install path then routes the
-    /// reinserted entry into Main). The deque entry is left as a
-    /// tombstone, see the type-level docstring.
+    /// Consumes membership for `fp`. The deque entry is left as a
+    /// tombstone (see type-level docstring).
     pub(super) fn remove(&mut self, fp: u64) -> bool {
         if !self.contains(fp) {
             return false;
@@ -301,10 +240,6 @@ impl GhostSet {
 
 #[cfg(feature = "typesize")]
 mod typesize_impls {
-    //! `TypeSize` impls for slab-backed types. `extra_size` only counts
-    //! heap bytes beyond `mem::size_of::<Self>()`; the trait's default
-    //! `get_size` adds the stack-resident size on top.
-
     use core::mem;
 
     use typesize::TypeSize;
@@ -326,10 +261,9 @@ mod typesize_impls {
 
     impl<K: TypeSize, V: TypeSize> TypeSize for EntrySlot<K, V> {
         fn extra_size(&self) -> usize {
-            // `SlotKey` comes from `slotmap::new_key_type!`; orphan rule
-            // blocks a `TypeSize` impl so `fifo_prev` / `fifo_next` fall
-            // through `_`. They're plain stack data, already counted in
-            // `mem::size_of::<Self>()`.
+            // `SlotKey` is foreign (slotmap) so `fifo_prev` / `fifo_next`
+            // fall through `_`; they're stack-only and already counted
+            // in `mem::size_of::<Self>()`.
             let Self {
                 key,
                 entry,
@@ -357,17 +291,13 @@ mod typesize_impls {
 
     impl TypeSize for GhostSet {
         fn extra_size(&self) -> usize {
-            // VecDeque has a power-of-two capacity ring buffer; charge by
-            // capacity * element size. HashTable's `allocation_size`
-            // already includes its bucket array.
             self.ring.capacity() * mem::size_of::<u64>() + self.set.allocation_size()
         }
     }
 
-    /// Bytes the slotmap allocates for `capacity` slots of element `T`.
-    /// Matches `slotmap::SlotMap`'s internal `Vec<Slot<T>>` layout: each
-    /// slot carries `MaybeUninit<T>` plus a `u32` version and a `u32`
-    /// next-free pointer, rounded up to `align_of::<T>`.
+    /// Bytes the slotmap allocates for `capacity` slots of `T`: each
+    /// slot is `MaybeUninit<T> + u32 version + u32 next-free`, padded
+    /// to `align_of::<T>`.
     pub(crate) fn slot_storage_bytes<T>(capacity: usize) -> usize {
         let element = mem::size_of::<T>() + 2 * mem::size_of::<u32>();
         let align = mem::align_of::<T>().max(mem::align_of::<u32>());

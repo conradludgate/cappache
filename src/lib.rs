@@ -89,10 +89,7 @@ mod compile_tests {
         let _ = CacheBuilder::<String, String>::new().policy(Arc::new(CustomPolicy));
     }
 
-    /// Monomorphic policy path: concrete `P = CustomPolicy` (no `Arc`,
-    /// no vtable). This is the `Cache<K, V, P>` variant the type
-    /// parameter on `Cache` was added for; keep a compile-only check so
-    /// it stays callable without the `Arc::new` dance.
+    /// Vtable-free monomorphic policy path.
     #[test]
     fn cache_accepts_concrete_policy_without_arc() {
         let cfg = CacheBuilder::<String, String>::new()
@@ -121,18 +118,14 @@ mod compile_tests {
         );
     }
 
-    /// Custom-hasher path: building a `Cache` with `.hasher(...)` should
-    /// produce a fully usable cache whose `S` type parameter reflects
-    /// the supplied `BuildHasher`. The hasher choice is observable on
-    /// the type, so this also serves as a compile-time check that the
-    /// `S` parameter threads through `CacheBuilder` -> `CacheConfig`
-    /// -> `Cache` without erasure.
+    /// Confirms `S` threads through builder → config → cache without
+    /// erasure.
     #[test]
     fn cache_accepts_custom_hasher() {
         use std::hash::{BuildHasherDefault, Hasher};
 
-        // Constant zero hasher: pathological for distribution but useful
-        // here — it's `Clone + Default + Send + Sync` with no deps.
+        // Pathological for distribution; chosen here for its zero deps
+        // (`Clone + Default + Send + Sync`).
         #[derive(Default)]
         struct ZeroHasher(u64);
         impl Hasher for ZeroHasher {

@@ -1,16 +1,12 @@
 //! Miss-coalescing primitives.
 //!
-//! Every `try_get_with` / `try_get_with_blocking` follower for the same
-//! `(key, F)` joins the same in-flight lane so we run `init` exactly
-//! once per coalesced burst. The flight types ([`MissFlight`] for the
-//! async path, [`SyncMissFlight`] for the Condvar-backed sync path)
-//! both implement the cache-side [`Flight`] trait so cancellation is
-//! uniform; per-lane bookkeeping ([`InflightLane`], [`LaneKeyRef`],
-//! [`LeaderGuard`]) lives here too.
-//!
-//! Crate-private surface: every public type / fn is `pub(super)` and
-//! used only from `super::inner`. The orchestration that ties these
-//! together lives in `Inner::miss_probe` and friends.
+//! Followers for the same `(key, F)` join the same in-flight lane so
+//! `init` runs exactly once per coalesced burst. The async path uses
+//! [`MissFlight`] (tokio `watch`); the blocking path uses
+//! [`SyncMissFlight`] (`Mutex` + `Condvar`). Both impl [`Flight`] so
+//! cancel-all paths (e.g. `Cache::clear`) can fire `cancel()` without
+//! knowing the concrete `(V, E)` specialisation.
+
 use std::any::{Any, TypeId};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,37 +16,24 @@ use tokio::sync::watch;
 
 use super::inner::{Inner, State};
 
-/// Outcome published on a miss flight's settle channel. `Cancelled` is sent by
-/// [`LeaderGuard::drop`] when the leader's `init` future was dropped or
-/// panicked before producing a value; followers translate it into a probe
-/// retry. Each lane is monomorphic on `(V, E)` so no `Any` downcast is needed
-/// to read the result.
+/// `Cancelled` is sent when the leader's `init` was dropped or panicked
+/// before producing a value; followers translate it into a probe retry.
 #[derive(Clone)]
 pub(super) enum LaneOutcome<V, E> {
     Settled(Result<V, E>),
     Cancelled,
 }
 
-/// Common cache-side surface for an in-flight miss lane. The cache only
-/// needs to signal cancellation through this trait; the leader/follower
-/// publish-and-wait API is concrete on the typed flight (`publish_result` /
-/// `await_settled` for async, `publish` / `wait` for sync) so user-facing
-/// code keeps full type information for `(V, E)` or `V`.
 pub(super) trait Flight: Any + Send + Sync {
     fn cancel(&self);
 }
 
-/// Construction sibling of [`Flight`]: gives `install_or_join_lane` a way
-/// to mint a fresh lane without naming the concrete type at the call
-/// site. Both `MissFlight<V, E>` and `SyncMissFlight<V>` impl it.
 pub(super) trait NewFlight: Flight + Sized {
     fn fresh() -> Self;
 }
 
-/// Per-(key, error type) coalescing point for `try_get_with`. Followers with
-/// the same `E` subscribe to the same flight; followers with a different `E`
-/// install their own lane and run their own `init`. Mirrors moka's typed miss
-/// lanes — see `State::inflight`.
+/// Async miss-coalescing lane. Followers with a different `E` install
+/// their own lane: the `(K, TypeId)` map key keys on the flight type.
 pub(super) struct MissFlight<V, E>
 where
     V: Clone + Send + Sync + 'static,
@@ -73,8 +56,7 @@ where
         let _ = self.settle.send(Some(LaneOutcome::Settled(r)));
     }
 
-    /// `None` when the leader cancelled (sender published `Cancelled`, or
-    /// dropped before publishing); callers re-enter the probe loop.
+    /// `None` means the leader cancelled; callers re-enter the probe loop.
     pub(super) async fn await_settled(&self) -> Option<Result<V, E>> {
         let mut rx = self.settle.subscribe();
         loop {
@@ -114,15 +96,9 @@ where
     }
 }
 
-/// Per-key Condvar-backed coalescing point for the sync
-/// `try_get_with_blocking` path. Lives alongside the async
-/// [`MissFlight<V, E>`] entries in `State::inflight`, distinguished by the
-/// concrete `TypeId` of the flight type carried in the map's `(K, TypeId)`
-/// key — a sync follower's `(key, TypeId<SyncMissFlight<V, E>>)` lookup
-/// can never collide with an async lane (and vice versa). Sync lanes are
-/// also keyed on `E` so two sync followers with different error types
-/// install their own lanes, mirroring the async [`MissFlight<V, E>`]
-/// behaviour.
+/// Sync (`Condvar`-backed) counterpart to [`MissFlight`]. Distinguished
+/// from the async lanes by `TypeId` in the `(K, TypeId)` map key, so
+/// sync and async followers never join each other.
 pub(super) struct SyncMissFlight<V, E>
 where
     V: Clone + Send + Sync + 'static,
@@ -156,10 +132,7 @@ where
         self.cond.notify_all();
     }
 
-    /// Returns `Some(res)` once the leader publishes an outcome. Returns
-    /// `None` when the leader cancelled (init closure panicked or leader
-    /// guard fired); the caller is then expected to re-enter the probe
-    /// loop to either become leader or join a fresh follower.
+    /// `None` means the leader cancelled; caller re-enters the probe loop.
     pub(super) fn wait(&self) -> Option<Result<V, E>> {
         let mut s = self.state.lock().expect("sync flight mutex poisoned");
         loop {
@@ -198,17 +171,11 @@ where
     }
 }
 
-/// One in-flight miss flight. Type-erased through [`Any`] so the
-/// per-shard `inflight` map can mix sync and async lanes uniformly; the
-/// concrete flight type lives in the map's `(K, TypeId)` key, so a
-/// follower's `downcast::<F>` is infallible by invariant (the `Option`
-/// return is preserved purely as defensive API ergonomics). The
-/// [`Flight`] vtable lets cancel-all paths fire `cancel()` without
-/// knowing the concrete type statically.
+/// Type-erased lane stored in `State::inflight`. The concrete flight
+/// type is recovered by `Any::downcast_ref`; `cancel_fn` lets the
+/// cancel-all paths fire `Flight::cancel` without naming the type.
 pub(super) struct InflightLane {
     flight: Arc<dyn Any + Send + Sync>,
-    /// Captured at construction so cancel goes through the [`Flight`]
-    /// vtable without the call site needing to name the concrete type.
     cancel_fn: fn(&Arc<dyn Any + Send + Sync>),
 }
 
@@ -230,20 +197,15 @@ impl InflightLane {
         Arc::clone(&self.flight).downcast::<F>().ok()
     }
 
-    /// Used by `Cache::clear` (and any other cancel-all paths) to signal
-    /// every follower waiting on this lane that the leader is gone, so
-    /// they re-enter the probe loop instead of blocking forever.
     pub(super) fn cancel(&self) {
         (self.cancel_fn)(&self.flight);
     }
 }
 
-/// Borrowed lookup adapter for [`State::inflight`]. Pairs `&K` with the
-/// concrete flight `TypeId` so `inflight.get` / `inflight.remove` probe
-/// the `(K, TypeId)` map without cloning the key. Tuple `Hash` is just
-/// `K::hash` then `TypeId::hash` with no length prefix, so the byte
-/// stream produced here is identical to what an owned `(K, TypeId)`
-/// would produce, satisfying the [`Equivalent`] hash invariant.
+/// Borrowed `(K, TypeId)` lookup adapter for `State::inflight`. Tuple
+/// `Hash` is `K::hash` then `TypeId::hash` (no length prefix), which
+/// matches what an owned `(K, TypeId)` produces — required by
+/// [`Equivalent`].
 struct LaneKeyRef<'a, K> {
     key: &'a K,
     type_id: TypeId,
@@ -268,9 +230,6 @@ impl<K: Eq> Equivalent<(K, TypeId)> for LaneKeyRef<'_, K> {
     }
 }
 
-/// Outcome of a single probe attempt on a miss-coalescing flight type `F`.
-/// `F` is `MissFlight<V, E>` for the async paths and `SyncMissFlight<V, E>`
-/// for the sync path; both share the Hit/Wait/Leader trichotomy.
 pub(super) enum MissStep<V, F>
 where
     F: Flight,
@@ -281,11 +240,9 @@ where
     Leader { miss: Arc<F> },
 }
 
-/// Identity-aware lane removal. The `(K, TypeId)` key locates the row
-/// uniquely, but we still gate the actual removal on `Arc` pointer
-/// identity so a fresh lane installed for the same `(key, F)` between
-/// leader-takes-lock and leader-runs-cleanup (cancelled then
-/// re-entered) is not disturbed.
+/// Removes the lane only when the stored `Arc` matches `flight_ptr`. A
+/// fresh lane installed for the same `(key, F)` between leader-cancel
+/// and leader-cleanup must not be disturbed.
 pub(super) fn remove_lane<K, V>(
     st: &mut State<K, V>,
     key: &K,
@@ -304,12 +261,6 @@ pub(super) fn remove_lane<K, V>(
     }
 }
 
-/// Looks up the lane at `(key, TypeId<F>)`. Returns `Wait(lane)` if a
-/// follower can join the existing leader, otherwise installs a fresh
-/// `F` lane and returns `Leader { miss }`. Type discrimination is by
-/// `TypeId<F>` carried in the map key, so an async
-/// (`MissFlight<V, E>`) and sync (`SyncMissFlight<V>`) lane for the
-/// same key occupy distinct rows and never join each other.
 pub(super) fn install_or_join_lane<K, V, F>(st: &mut State<K, V>, key: &K) -> MissStep<V, F>
 where
     K: Eq + Hash + Clone + 'static,
@@ -329,16 +280,9 @@ where
     MissStep::Leader { miss }
 }
 
-/// RAII cleanup for any miss-coalescing leader. On drop (cancel or panic),
-/// removes the lane (identified by Arc identity, so we won't disturb a
-/// follower-installed replacement) and dispatches `Flight::cancel` so any
-/// follower waiting on this exact flight retries instead of blocking
-/// forever on a sender / Condvar that will never publish.
-///
-/// One generic guard covers both `try_get_with` (`F = MissFlight<V, E>`)
-/// and `try_get_with_blocking` (`F = SyncMissFlight<V, E>`); the only
-/// per-flight behaviour difference is the cancellation channel, which is
-/// already abstracted by `Flight::cancel`.
+/// RAII cleanup for a miss-coalescing leader. On drop (cancel or
+/// panic), removes the lane (Arc-identity check) and fires
+/// `Flight::cancel` so followers retry instead of blocking forever.
 pub(super) struct LeaderGuard<'a, F, K, V, P, S>
 where
     F: Flight,
@@ -365,10 +309,8 @@ where
         if !self.armed {
             return;
         }
-        // `clashcore::RwLock` does not poison, so a panicking leader leaves
-        // the shard in its last consistent state — we can take the write
-        // lock here and clean up without the std::sync::Mutex `into_inner`
-        // dance.
+        // `clashcore::RwLock` doesn't poison, so we can take the write
+        // lock here even after a panic.
         let mut st = self.inner.shard_for(self.key).write();
         let flight_ptr = Arc::as_ptr(&self.flight).cast::<()>();
         remove_lane(&mut st, self.key, TypeId::of::<F>(), flight_ptr);
@@ -383,11 +325,8 @@ mod typesize_impls {
 
     use super::InflightLane;
 
-    /// Shallow size only: the `Arc<dyn Any>` payload (`MissFlight` /
-    /// `SyncMissFlight`) is type-erased here so we can't deeply walk it
-    /// without reconstructing every concrete `(V, E)` flight specialisation.
-    /// The lane struct itself, plus the wide pointer, is captured by
-    /// `mem::size_of::<InflightLane>()`.
+    // Shallow only: the `Arc<dyn Any>` payload is type-erased; we can't
+    // deeply walk it without reconstructing every `(V, E)` flight type.
     impl TypeSize for InflightLane {
         fn extra_size(&self) -> usize {
             0

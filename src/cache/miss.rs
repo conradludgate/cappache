@@ -1,15 +1,9 @@
-//! Miss-path orchestration for `Inner`.
-//!
-//! Hosts the per-iteration probe (`miss_probe`), the lock-protected
-//! hit/expiry pre-check (`with_probe_for_hit`), the post-leader install
-//! step (`finish_miss_ok`), and the public miss-coalescing entry points
-//! `try_get_with` (async) and `try_get_with_blocking` (sync). The shard
-//! lock is held only for the probe-and-install windows; user-supplied
-//! init closures run with the lock released so the cache stays
-//! responsive on other keys.
-//!
-//! Crate-private surface; consumed only from `super::Cache` via the
-//! `Inner` impl methods exposed here.
+//! Miss-path orchestration: per-iteration probe, hit/expiry pre-check,
+//! post-leader install, and the public coalescing entry points
+//! `try_get_with` (async) and `try_get_with_blocking` (sync). Shard
+//! locks are released before user `init` closures run so the cache
+//! stays responsive on other keys.
+
 use std::any::TypeId;
 use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
@@ -36,12 +30,9 @@ where
     S: BuildHasher,
 {
     /// Installs a fresh `Ready` slot for a leader's miss outcome.
-    ///
-    /// Returns the post-install reclaim victims plus the prior value (if a
-    /// concurrent `Cache::insert` for the same key landed while the leader
-    /// was running its `init`); callers fire `Updated` for that prior
-    /// value once the shard lock is released, mirroring [`Self::insert`]
-    /// and [`Self::apply_refresh_ok`].
+    /// Returned `displaced` is the prior value when a concurrent
+    /// `Cache::insert` for the same key landed while the leader was
+    /// running its `init`; the caller fires `Updated` for it.
     pub(super) fn finish_miss_ok(
         &self,
         st: &mut State<K, V>,
@@ -72,17 +63,11 @@ where
         (reclaimed, displaced)
     }
 
-    /// Acquires the shard write lock, drains an expired entry (if any),
-    /// bumps the freq counter on a still-live entry + pushes a
-    /// refreshed read-side expiry, then hands control to `then` with
-    /// the held lock and the hit (if any). The closure runs in the
-    /// same critical section so the install/join-lane decision sees no
+    /// Hit/expiry pre-check inside one critical section. Drops + retakes
+    /// the lock around the `TimeExpired` lifecycle callback so observers
+    /// can re-enter the cache. The closure runs inside the same
+    /// critical section as the install/join-lane decision so there's no
     /// TOCTOU window between hit detection and lane install.
-    ///
-    /// Releases and retakes the shard lock around the `TimeExpired`
-    /// lifecycle callback so observers may re-enter the cache. The
-    /// closure pattern keeps the [`RwLockWriteGuard`] type private to
-    /// this method so we do not need `lock_api` as a direct dep.
     fn with_probe_for_hit<R>(
         &self,
         shard: &Shard<K, V>,
@@ -144,11 +129,9 @@ where
         then(&mut st, hit)
     }
 
-    /// Single critical section for one miss iteration on flight type `F`:
-    /// served hit, in-flight miss wait, or install miss leader. Avoids
-    /// TOCTOU between separate `get_served` / miss checks / leader insert.
-    /// Used by both [`Self::try_get_with`] (`F = MissFlight<V, E>`) and
-    /// [`Self::try_get_with_blocking`] (`F = SyncMissFlight<V, E>`).
+    /// One miss iteration on flight type `F`: hit, wait, or become
+    /// leader. Used by both [`Self::try_get_with`] (async) and
+    /// [`Self::try_get_with_blocking`] (sync).
     fn miss_probe<F>(&self, key: &K) -> MissStep<V, F>
     where
         K: Clone + 'static,
@@ -176,12 +159,11 @@ where
         loop {
             match self.miss_probe::<MissFlight<V, E>>(&key) {
                 MissStep::Hit(v) => return Ok(v),
+                // Leader cancelled — loop to either hit or become leader.
                 MissStep::Wait(f) => {
                     if let Some(res) = f.await_settled().await {
                         return res;
                     }
-                    // Leader cancelled — its lane has been cleared. Loop and
-                    // either hit a fresh value or take leadership ourselves.
                 }
                 MissStep::Leader { miss } => {
                     let init = init
@@ -210,10 +192,9 @@ where
                         None
                     };
 
-                    // Publish under the lock so a follower that wakes and
-                    // immediately calls `get(key)` cannot observe a state
-                    // where the value was reported settled but is not yet
-                    // installed in `entries`.
+                    // Publish under the lock: a follower that wakes and
+                    // immediately calls `get(key)` must not observe
+                    // "settled but not yet installed in entries".
                     guard.flight.publish_result(res.clone());
                     guard.armed = false;
                     drop(guard);
@@ -235,15 +216,8 @@ where
         }
     }
 
-    /// Sync fallible miss-coalescing entry point. The user closure runs
-    /// **without** the shard lock held, so the cache stays responsive on
-    /// other keys while the leader produces a value. `Err` outcomes are
-    /// published to followers but never installed in the slab — the next
-    /// caller probes fresh.
-    ///
-    /// `key` is taken by value to match the async [`Self::try_get_with`]
-    /// signature; internally it is borrowed everywhere except the owned
-    /// clone that goes into the `inflight` map and the slab.
+    /// Sync miss-coalescing. `Err` outcomes are published to followers
+    /// but never installed; the next caller probes fresh.
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn try_get_with_blocking<F, E>(self: &Arc<Self>, key: K, init: F) -> Result<V, E>
     where
@@ -260,8 +234,6 @@ where
                     if let Some(res) = f.wait() {
                         return res;
                     }
-                    // Leader cancelled — its lane is gone; loop and either
-                    // observe a fresh value or take leadership ourselves.
                 }
                 MissStep::Leader { miss } => {
                     let init = init
@@ -289,10 +261,6 @@ where
                         None
                     };
 
-                    // Publish under the lock so a follower that wakes and
-                    // immediately calls `get(key)` cannot observe a state
-                    // where the value was reported settled but is not yet
-                    // installed in `entries`.
                     guard.flight.publish_result(res.clone());
                     guard.armed = false;
                     drop(guard);

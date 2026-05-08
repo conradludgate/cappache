@@ -37,16 +37,6 @@ where
     pub max_weight: Weight,
     pub policy: P,
     pub hasher: S,
-    /// Final shard count: a power of two `>= 2`. Backed by
-    /// [`clashcore::ClashCollection`], which requires a power-of-two
-    /// shard count strictly greater than 1.
-    ///
-    /// The observed total weight may exceed `max_weight` by up to
-    /// `shards - 1` units of rounding slack.
-    ///
-    /// Crate-private: callers set this via [`CacheBuilder::shards`],
-    /// which clamps to `>= 2` and rounds up to the next power of two
-    /// before this field is populated.
     pub(crate) shards: usize,
     pub(crate) lifecycle_listener: Option<Arc<dyn LifecycleListener<K, V> + Send + Sync>>,
     pub(crate) _marker: PhantomData<(K, V)>,
@@ -90,16 +80,9 @@ where
     }
 }
 
-/// Default shard count = next-power-of-two of available parallelism,
-/// minimum 2. Picked to spread per-shard contention across cores
-/// without inflating per-cache memory beyond what callers expect.
-/// Fall back to 2 when the runtime can't report parallelism. Pure
-/// concurrency-tuning default — every value `>= 2` is functionally
-/// correct, only contention behaviour changes.
-///
-/// The minimum of 2 matches [`clashcore::ClashCollection`]'s
-/// shard-amount precondition; single-shard mode would require a
-/// separate degenerate code path we deliberately don't carry.
+/// next-pow2(available parallelism), min 2. Functionally any value
+/// `>= 2` works; only contention behaviour changes. Min 2 matches
+/// `clashcore::ClashCollection`'s precondition.
 fn default_shard_count() -> usize {
     std::thread::available_parallelism()
         .map_or(2, usize::from)

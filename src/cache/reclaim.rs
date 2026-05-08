@@ -1,19 +1,16 @@
 //! S3-FIFO size-based eviction.
 //!
 //! Two-phase reclaim called before installing a new entry:
-//! 1. `drain_expired` over the deadline heap (delegated to
-//!    `super::expiry`).
-//! 2. While the projected weight exceeds the per-shard cap, drain the
-//!    Small queue first when it sits over its
-//!    `shard_max_weight / SMALL_DENOMINATOR` budget, otherwise drain
-//!    Main. Each step either promotes / recirculates the tail slot or
-//!    evicts it; cold Small evictions seed the ghost set so a quick
-//!    re-insert routes the entry back into Main.
+//! 1. Drain the deadline heap (delegated to [`drain_expired`]).
+//! 2. While projected weight exceeds `shard_max_weight`, drain the
+//!    Small queue while it's over its `max / SMALL_DENOMINATOR` budget,
+//!    otherwise drain Main. Each Small step either promotes
+//!    (`freq > 1`) or evicts and seeds the ghost set; each Main step
+//!    either recirculates (`freq > 0`, decrement) or evicts.
 //!
-//! `Reclaimed<K, V>` keeps the two victim lists separate so the caller
-//! can fire the right `LifecycleReason` for each phase.
-//!
-//! Crate-private surface; consumed only from `super::inner`.
+//! Skip-key short-circuit: the slot the caller is about to replace is
+//! never reclaimed in this pass — it's rotated back to its queue's head.
+
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
@@ -21,33 +18,13 @@ use super::expiry::drain_expired;
 use super::inner::{Inner, SMALL_DENOMINATOR, State, entries_find, evict_slot};
 use super::slab::Queue;
 
-/// Result of a single [`reclaim`] pass. Split per lifecycle reason so the
-/// caller fires `TimeExpired` for the deadline drain and `EvictedSize`
-/// for the S3-FIFO size drain that brought weight back under capacity.
+/// Per-phase victim split so the caller fires `TimeExpired` for
+/// `expired` and `EvictedSize` for `evicted`.
 pub(super) struct Reclaimed<K, V> {
     pub(super) expired: Vec<(K, V)>,
     pub(super) evicted: Vec<(K, V)>,
 }
 
-/// Two-phase capacity reclaim, called before installing a new entry of
-/// weight `add_w` for `skip_key`:
-///
-/// 1. **Expiry drain** — pop heap tuples with `deadline ≤ now` and evict
-///    the matching slots. Lazy validation discards stale tuples in O(1).
-///    Cost: `O(d log n)` for `d` validated victims; `O(s log n)` for
-///    `s` stale tuples observed.
-/// 2. **S3-FIFO size drain** — while the projected post-install weight
-///    exceeds `max_weight`, drain Small first when it sits over its
-///    `shard_max_weight / SMALL_DENOMINATOR` budget, otherwise drain
-///    Main. Each [`evict_from_small`] either promotes the tail slot to
-///    Main (when its `freq > 1`) or evicts + records its fingerprint
-///    in `ghost`. Each [`evict_from_main`] either recirculates the
-///    tail (decrementing `freq`) or evicts. The skip-key short-circuit
-///    is preserved on both queues: the skip slot, when surfacing at
-///    the tail, is promoted back to its current queue's head.
-///
-/// Returns the two victim lists separately so the caller can fire the
-/// correct lifecycle reason for each phase.
 pub(super) fn reclaim<K, V, P, S>(
     inner: &Inner<K, V, P, S>,
     st: &mut State<K, V>,
@@ -63,11 +40,8 @@ where
     let now_tick = super::clock::floor_tick(inner.start, now);
     let expired = drain_expired(st, &inner.hasher, now_tick, Some(skip_key));
 
-    // Hoist the existing-slot weight lookup out of the loop: the
-    // skip_key short-circuit means its slot is never reclaimed in this
-    // pass, so its weight is invariant across iterations. Only
-    // `state.total_weight` changes per iteration; the projection then
-    // becomes a couple of arithmetic ops instead of a HashTable probe.
+    // The skip slot's weight is invariant across iterations (never
+    // reclaimed), so look it up once instead of per-loop.
     let displaced_weight = entries_find(&st.entries, &inner.hasher, &st.slab, skip_key)
         .and_then(|id| st.slab.get(id))
         .map_or(0, |es| es.weight);
@@ -79,10 +53,8 @@ where
         if !projected_weight_over_capacity(st, displaced_weight, add_w, max) {
             break;
         }
-        // Try the prescribed queue first; fall back to the other if
-        // the prescribed one had nothing actionable. This handles
-        // the transient cases where Small drained to empty mid-pass
-        // (we still need to reclaim from Main) and vice versa.
+        // Fall back to the other queue if the prescribed one had nothing
+        // actionable (Small drained empty mid-pass and friends).
         let small_first = st.small_weight > small_max;
         let primary = if small_first {
             evict_from_small(inner, st, skip_key, &mut evicted)
@@ -104,9 +76,7 @@ where
     Reclaimed { expired, evicted }
 }
 
-/// One step against the Small queue's tail. Returns `true` when state
-/// changed (promotion to Main, eviction, or skip-key rotation) so the
-/// outer reclaim loop iterates; `false` when Small is empty.
+/// Returns `true` when state changed (promotion / eviction / rotation).
 fn evict_from_small<K, V, P, S>(
     inner: &Inner<K, V, P, S>,
     st: &mut State<K, V>,
@@ -141,7 +111,7 @@ where
     }
 
     if freq > 1 {
-        // Warm slot: migrate Small → Main with freq reset to 0.
+        // Warm: Small → Main, freq reset.
         st.queue_unlink(Queue::Small, tail_id);
         let es = st
             .slab
@@ -154,8 +124,7 @@ where
         st.queue_push_head(Queue::Main, tail_id);
         true
     } else {
-        // Cold slot: evict and seed ghost so a quick re-insert
-        // routes the returning entry straight to Main.
+        // Cold: evict and seed ghost so a quick re-insert lands in Main.
         let Some((k, v, _)) = evict_slot(st, &inner.hasher, tail_id) else {
             return false;
         };
@@ -165,9 +134,7 @@ where
     }
 }
 
-/// One step against the Main queue's tail. Returns `true` when state
-/// changed (recirculation, eviction, or skip-key rotation) so the
-/// outer reclaim loop iterates; `false` when Main is empty.
+/// Returns `true` when state changed (recirculation / eviction / rotation).
 fn evict_from_main<K, V, P, S>(
     inner: &Inner<K, V, P, S>,
     st: &mut State<K, V>,
@@ -198,9 +165,8 @@ where
     }
 
     if freq > 0 {
-        // Recirculate: decrement freq and reinsert at Main head.
-        // Each Main slot is touched at most FREQ_CAP+1 times before
-        // being forced to freq=0 and dropped, bounding loop work.
+        // Recirculate. Each Main slot is touched at most FREQ_CAP+1
+        // times before freq=0 forces eviction, bounding the loop.
         st.queue_unlink(Queue::Main, tail_id);
         let es = st
             .slab
@@ -210,7 +176,7 @@ where
         st.queue_push_head(Queue::Main, tail_id);
         true
     } else {
-        // No second-chance seed: only Small evictions populate ghost.
+        // Only Small evictions seed ghost; Main misses don't.
         let Some((k, v, _)) = evict_slot(st, &inner.hasher, tail_id) else {
             return false;
         };

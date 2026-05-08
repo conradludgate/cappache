@@ -72,12 +72,8 @@ pub trait Policy<K, V>: Send + Sync {
     fn expire_after_write(&self, key: &K, value: &V, written_at: Instant) -> Duration;
 }
 
-/// Forwards every method through `Arc::deref`, so an `Arc<dyn Policy<K, V> +
-/// Send + Sync>` (or any other `Arc<P>`) satisfies the generic policy
-/// parameter on [`crate::Cache`]. This is what keeps the type-erased path
-/// cheap — callers who want monomorphisation pass a concrete `P` directly,
-/// callers who want a vtable pass `Arc<dyn Policy<…>>` and pay the same
-/// indirection they always did.
+/// Lets `Arc<dyn Policy<K, V>>` (or any `Arc<P>`) satisfy the
+/// `Policy<K, V>` bound on [`crate::Cache`].
 impl<K, V, T> Policy<K, V> for Arc<T>
 where
     T: Policy<K, V> + ?Sized,

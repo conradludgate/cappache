@@ -16,87 +16,45 @@ use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
 use crate::policy::Policy;
 
-/// One cache-padded shard, as exposed by [`ClashCollection::shards`].
-/// Aliased so the verbose `CachePadded<RwLock<...>>` stack does not
-/// need to spell itself out at every use site (and so clippy stops
-/// flagging it for `type_complexity`).
 pub(super) type Shard<K, V> = clashcore::CachePadded<RwLock<State<K, V>>>;
 
-/// Decision returned by [`Inner::try_mark_refresh_inflight`]. Mirrors the
-/// public [`crate::rt::RevalidateScheduled`] variants so the call site only
-/// has to translate, not branch on slot state directly.
 pub(crate) enum RefreshGate {
-    /// Caller should poll `init` and submit to the executor.
     Submit,
-    /// A refresh for this key is already in flight; caller returns
-    /// `RevalidateScheduled::SkippedInFlight`.
     SkipInFlight,
-    /// No `Ready` slot exists for this key; caller returns
-    /// `RevalidateScheduled::AbsentKey`.
     AbsentKey,
 }
 
 pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = DefaultHashBuilder> {
     pub(crate) config: CacheConfig<K, V, P, S>,
-    /// Sharded per-key state. [`ClashCollection`] supplies the
-    /// `Box<[CachePadded<RwLock<T>>]>` storage *and* the
-    /// `(h << 7) >> shift` indexing math: the left-shift parks the high
-    /// 7 bits of the hash for `hashbrown`'s SIMD tag, the right-shift
-    /// picks the next `log2(shard_count)` bits as the shard index.
-    /// Single-key paths take exactly one shard's `RwLock` (mostly
-    /// `.write()` because reads mutate `freq` and read-side deadlines;
-    /// `contains_key`, `len`, `is_empty`, `weight` take `.read()`).
-    /// Multi-key paths fold across [`ClashCollection::shards`].
-    ///
-    /// `clashcore::lock::RwLock` is `lock_api::RwLock<RawRwLock, T>`: a
-    /// single-CAS uncontended fast path, no poisoning. Releasing before
-    /// awaiting user `init` futures in [`Self::try_get_with`] remains a
-    /// hard requirement.
+    /// Sharded per-key state. [`ClashCollection`] does the
+    /// `(h << 7) >> shift` indexing — left-shift parks the top 7 bits
+    /// for hashbrown's SIMD tag, right-shift picks the shard. Releasing
+    /// the shard lock before awaiting user `init` futures is a hard
+    /// requirement (see [`super::miss`]).
     pub(crate) shards: ClashCollection<State<K, V>>,
-    /// Hasher used both to pick a shard and (per shard) to hash table
-    /// entries. Stored at the `Inner` level so all shards share the same
-    /// seed — that keeps a key's bucket position stable across `Cache`
-    /// clones and across shard boundaries during `clear`/iteration.
-    ///
-    /// Type-parameterised so callers can opt into `ahash`, `foldhash`,
-    /// `xxh3`, or any other [`BuildHasher`] without us paying for a
-    /// vtable on the hot path. Defaults to [`DefaultHashBuilder`]
-    /// (foldhash via `hashbrown` 0.17).
+    /// Used both for shard selection and per-shard table lookup —
+    /// stored once at `Inner` level so a key's bucket stays stable
+    /// across clones and cross-shard iteration.
     pub(crate) hasher: S,
-    /// Per-shard weight cap: `ceil(max_weight / shard_count)`. The
-    /// observed total weight may exceed `config.max_weight` by up to
+    /// Per-shard weight cap: `ceil(max_weight / shard_count)`. Total
+    /// observed weight may overshoot `max_weight` by up to
     /// `shard_count - 1` units of rounding slack.
     pub(crate) shard_max_weight: u64,
-    /// Monotonic anchor recorded at construction. All per-slot
-    /// timestamps (`written_at`, `deadline`) and heap keys are stored
-    /// as quarter-second tick offsets from this `Instant`; conversion
-    /// back to `Instant` happens only at the [`Policy`] hook boundary
-    /// (see [`super::clock`]).
+    /// Monotonic anchor for `super::clock` ticks.
     pub(crate) start: Instant,
 }
 
-/// Inverse-fraction sizing for the S3-FIFO Small queue: per shard,
 /// `small_max_weight = shard_max_weight / SMALL_DENOMINATOR`. Yang et
-/// al. (SOSP'23) §4 default to S = 10%; the V1 mokabench validation
-/// pass on the same trace set we baseline against (DS1, S2/S3, P-series,
-/// OLTP) preferred a smaller Small (~3%) — closer to `quick_cache`'s
-/// `hot_allocation = 0.97` — across nearly every operating point. Held
-/// as a module-level constant rather than a builder knob so the tuning
-/// surface stays narrow for V1; revisit if a workload demands per-cache
-/// override.
+/// al. (SOSP'23) §4 default to S = 10%; we use ~3% (matching
+/// `quick_cache`'s `hot_allocation = 0.97`) which won across nearly
+/// every operating point in our mokabench validation pass.
 pub(super) const SMALL_DENOMINATOR: u64 = 33;
 
-/// Per-slot frequency-counter saturation cap. The cutoff at 3 mirrors
-/// Yang et al.'s reference: enough resolution for `evict_from_small` to
-/// distinguish "single-touch" from "warm" without growing the counter
-/// past a single byte.
 pub(super) const FREQ_CAP: u8 = 3;
 
-/// `entries` lookup that compares keys through the slab — the table only
-/// holds [`SlotKey`] so equality lives on `EntrySlot::key`. Returns
-/// `None` when no slot matches (or when the matching bucket points at a
-/// slot whose `slotmap` version no longer matches, which is the
-/// self-cleaning behaviour we get for free from `slab.get`).
+/// Lookup keyed by `K` against the [`SlotKey`]-only `entries` table.
+/// Equality goes through the slab, so a recycled slot (slotmap version
+/// mismatch) self-cleans here as `slab.get` returning `None`.
 pub(super) fn entries_find<K, V, Q, H>(
     entries: &HashTable<SlotKey>,
     hasher: &H,
@@ -116,9 +74,8 @@ where
         .copied()
 }
 
-/// `entries` insert. Caller has already pushed `id` into the slab and is
-/// responsible for the resize closure rehashing existing entries against
-/// the same `slab`. The slot must be occupied at `id`.
+/// Caller must have pushed `id` into the slab already; the resize
+/// closure rehashes against the live slab.
 fn entries_insert<K, V, H>(
     entries: &mut HashTable<SlotKey>,
     hasher: &H,
@@ -140,82 +97,35 @@ fn entries_insert<K, V, H>(
 }
 
 pub(crate) struct State<K, V> {
-    /// Lookup table for `Ready` entries. Stores only [`SlotKey`]; the key
-    /// itself lives once on the slab as `EntrySlot::key`. Migrating from
-    /// `HashMap<K, SlotKey>` to `HashTable<SlotKey>` removes one `K`
-    /// allocation per ready entry (notable for `String`-keyed caches) and
-    /// collapses the previous "find then remove" two-probe pattern into a
-    /// single probe via `find_entry`.
-    ///
-    /// Equality during probes goes through [`SlotMap::get`] so the table
-    /// can stay key-free; the `hasher` field below is the matching
-    /// `BuildHasher` used both at insert time and at probe time so the
-    /// stored hash matches what `find` recomputes.
-    ///
-    /// In-flight miss leaders live in [`Self::inflight`] under their own
-    /// `(K, TypeId<F>)` lane so a `try_get_with::<…, E1>` call cannot
-    /// deadlock waiting on a leader that will publish an unrelated `E2`.
+    /// Key-free lookup table; equality goes through the slab so we
+    /// don't double-store `K` (one copy lives on `EntrySlot::key`).
     pub(crate) entries: HashTable<SlotKey>,
-    /// In-flight miss lanes keyed by `(K, TypeId<F>)`. At most one
-    /// leader per `(key, F)` pair: concurrent `try_get_with` calls that
-    /// agree on both `K` and `F = MissFlight<V, E>` follow the same
-    /// leader, while a disagreeing `E` (or the sync
-    /// `SyncMissFlight<V>` lane for the same key) installs its own row.
-    /// Borrowed lookups go through [`LaneKeyRef`] so `&K` paths do not
-    /// clone the key.
+    /// In-flight miss lanes keyed by `(K, TypeId<F>)`. Distinct `E`
+    /// (or sync vs async) install separate rows so a leader cannot
+    /// deadlock followers expecting a different result type. Borrowed
+    /// lookups use `LaneKeyRef` to avoid cloning the key.
     pub(super) inflight: HashMap<(K, TypeId), InflightLane>,
-    /// Backing storage for `Ready` entries. The slab owns `CacheEntry`,
-    /// the back-reference key, the cached weight, and the intrusive
-    /// FIFO links. `slotmap` carries a per-slot version on the key;
-    /// recycled slots produce a fresh [`SlotKey`] that no stale heap
-    /// tuple or `entries` row will validate against.
     pub(super) slab: EntrySlab<K, V>,
-    /// S3-FIFO Small queue. New inserts land here at the head and age
-    /// toward the tail. The reclaim path's `evict_from_small` decides
-    /// per slot whether to promote into `main` (warm) or evict +
-    /// fingerprint into `ghost` (cold).
     pub(super) small: Fifo,
-    /// S3-FIFO Main queue. Holds slots that survived a Small-tail
-    /// promotion (`freq > 1` at the Small tail) or were re-inserted
-    /// while their fingerprint sat in `ghost`. Drains via
-    /// [`reclaim::evict_from_main`](super::reclaim) only when Small
-    /// is at or under its share of the budget.
     pub(super) main: Fifo,
-    /// Bounded set of fingerprints recently evicted from `small` with
-    /// `freq <= 1`. The install path consumes membership
-    /// (`ghost.remove(fp)`) to route a returning key straight to
-    /// `main` with `freq = 0`.
+    /// Fingerprints of slots recently evicted from Small with
+    /// `freq ≤ 1`. The install path consumes membership to route a
+    /// returning key straight to Main.
     pub(super) ghost: GhostSet,
-    /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over
-    /// slots currently in `small`. The reclaim outer loop drains Small
-    /// first when `small_weight > shard_max_weight / SMALL_DENOMINATOR`,
-    /// otherwise Main. Maintained eagerly on install / evict so the
-    /// reclaim path does not have to recompute it.
+    /// Cached `sum(weight)` over Small. Maintained eagerly on
+    /// install/evict so reclaim's drain decision is O(1).
     pub(super) small_weight: u64,
-    /// Min-heap of `(deadline, slot)` tuples used to find past-deadline
-    /// entries in `O(log n)`. Validated lazily on pop: a tuple is
-    /// honoured only if `slab.get(slot)` returns `Some` (slotmap version
-    /// still matches) **and** the slot's deadline equals the tuple's. The
-    /// version check covers slot recycling and outright eviction; the
-    /// deadline check covers read hooks that pushed a fresh tuple for the
-    /// same live slot. Read-deadline updates always push a new tuple
-    /// rather than mutating the old one.
+    /// Min-heap of `(deadline, slot)` tuples; lazily validated on pop
+    /// (slotmap version + deadline equality).
     pub(super) expiry: ExpiryHeap,
-    /// Number of heap pushes that superseded a still-finite prior deadline
-    /// for the same slot (i.e. left a stale tuple behind). Read-extending
-    /// policies — `IdleTimeout`, custom `expire_after_read` hooks — can
-    /// pile these up arbitrarily under read-heavy workloads. When the
-    /// stale count exceeds the live slab size we rebuild the heap from
-    /// scratch so memory stays bounded by `slab.len()`.
+    /// Heap pushes that left a stale tuple behind. Triggers a rebuild
+    /// when it exceeds `slab.len()` so memory stays bounded under
+    /// read-extending policies.
     pub(super) stale_pushes: u64,
-    /// Sum of [`Policy::weight`](crate::policy::Policy::weight) over `Ready` entries only.
     pub(crate) total_weight: u64,
 }
 
 impl<K, V> State<K, V> {
-    /// Routes `Fifo::unlink` through the queue picked by `EntrySlot::queue`,
-    /// hiding the disjoint `&mut self.{small|main}` + `&mut self.slab`
-    /// borrow under one method call.
     pub(super) fn queue_unlink(&mut self, queue: Queue, id: SlotKey) {
         match queue {
             Queue::Small => self.small.unlink(&mut self.slab, id),
@@ -223,7 +133,6 @@ impl<K, V> State<K, V> {
         }
     }
 
-    /// Push `id` at the head of the queue picked by `queue`.
     pub(super) fn queue_push_head(&mut self, queue: Queue, id: SlotKey) {
         match queue {
             Queue::Small => self.small.push_head(&mut self.slab, id),
@@ -231,8 +140,6 @@ impl<K, V> State<K, V> {
         }
     }
 
-    /// Promote `id` to the head of its current queue (used by reclaim's
-    /// skip-key short-circuit when the skip slot surfaces at the tail).
     pub(super) fn queue_promote_to_head(&mut self, queue: Queue, id: SlotKey) {
         match queue {
             Queue::Small => self.small.promote_to_head(&mut self.slab, id),
@@ -240,8 +147,6 @@ impl<K, V> State<K, V> {
         }
     }
 
-    /// Pop the tail of the queue picked by `queue`. Used by `clear` to
-    /// drain Main and Small in turn.
     pub(super) fn queue_pop_tail(&mut self, queue: Queue) -> Option<SlotKey> {
         match queue {
             Queue::Small => self.small.pop_tail(&mut self.slab),
@@ -250,17 +155,10 @@ impl<K, V> State<K, V> {
     }
 }
 
-/// Removes the slab slot at `id` and the matching `entries` map row, drops it
-/// from whichever S3-FIFO queue it currently belongs to (consulted via
-/// `EntrySlot::queue`), and returns the owned `(K, V)` plus the entry's
-/// cached weight (already subtracted from `total_weight`, and from
-/// `small_weight` when the slot lived in Small). Returns `None` if the
-/// slot was already free (defensive — should not happen under our invariants).
-/// Stale tuples in `state.expiry` are not removed here; lazy validation on
-/// pop discards them once the slot is recycled. Stale `entries` rows are
-/// likewise self-cleaned by the `slab.get(id).is_some_and(...)` filter
-/// inside [`entries_find`] — so even if a bucket walk misses the row
-/// to remove, no probe will ever return a value for a freed slot.
+/// Removes `id` from the slab, its FIFO, and `entries`; debits weight.
+/// Returns the owned `(K, V, weight)`. Stale heap tuples and stale
+/// `entries` rows for this slot are left to self-clean via slotmap
+/// version mismatch (see [`entries_find`]).
 pub(super) fn evict_slot<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
@@ -272,10 +170,9 @@ where
 {
     let queue = st.slab.get(id)?.queue;
     st.queue_unlink(queue, id);
-    // Take the slot out first so the entries removal can compare against
-    // a slab that no longer holds `id` — the probe predicate uses
-    // `slab.get(id)`, which now returns `None`, so we hash by the taken
-    // entry's key and match buckets by `SlotKey` directly.
+    // Take the slot out first; the `entries` probe predicate uses
+    // `slab.get`, so removing the slab entry up front means we can
+    // match the table row by `SlotKey` directly.
     let entry_slot = st.slab.remove(id)?;
     st.total_weight = st.total_weight.saturating_sub(entry_slot.weight);
     if matches!(queue, Queue::Small) {
@@ -288,13 +185,9 @@ where
     Some((entry_slot.key, entry_slot.entry.value, entry_slot.weight))
 }
 
-/// Allocate a slab slot for `key`/`entry`/`weight`, route it to the
-/// right S3-FIFO queue (Main when its fingerprint sits in `ghost`,
-/// otherwise Small), register it in `state.entries`, bump
-/// `total_weight` (and `small_weight` when the entry lands in Small),
-/// and (if applicable) push the deadline into `state.expiry`.
-/// Centralises every install site so the heap invariant cannot be
-/// silently dropped.
+/// Slab + queue + `entries` + `expiry` + weight: the single install
+/// site for `Ready` slots. Keeps the heap and ghost invariants in
+/// lockstep with the slab.
 pub(super) fn install_ready<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
@@ -308,8 +201,7 @@ where
 {
     let deadline = entry.deadline;
     let key_hash = hasher.hash_one(&key);
-    // Ghost membership is consume-on-hit: a true return removes the
-    // fingerprint and routes the entry into Main with freq=0.
+    // Consume-on-hit: a present fingerprint routes the entry to Main.
     let to_main = st.ghost.remove(key_hash);
     let queue = if to_main { Queue::Main } else { Queue::Small };
     let id = st.slab.insert(EntrySlot {
@@ -338,33 +230,21 @@ impl<K, V, P, S> Inner<K, V, P, S>
 where
     S: BuildHasher,
 {
-    /// Returns the shard responsible for `key`. Single-key paths funnel
-    /// through here so the shard mapping is centralised; cross-shard
-    /// work (`len`, `weight`, `clear`) iterates `self.shards` directly.
-    ///
-    /// Kept on a bound-free impl block so that the `LeaderGuard::drop`
-    /// path can call it without re-asserting the full `Inner` bounds.
-    /// Delegates to [`ClashCollection::determine_shard`] so the indexing
-    /// scheme matches `clashmap` exactly.
     pub(super) fn shard_for<Q>(&self, key: &Q) -> &Shard<K, V>
     where
         K: Borrow<Q>,
         Q: Hash + ?Sized,
     {
-        // Cast the 64-bit hash down to `usize`. High bits get dropped on
-        // 32-bit targets; the default hasher distributes well enough that
-        // the truncation does not bias shard selection.
+        // 32-bit truncation is fine: the default hasher distributes
+        // well enough that dropping high bits doesn't bias selection.
         #[allow(clippy::cast_possible_truncation)]
         let h = self.hasher.hash_one(key) as usize;
         let idx = self.shards.determine_shard(h);
         &self.shards.shards()[idx]
     }
 
-    /// Clears the per-slot `refresh_inflight` flag for `key`. Best-effort:
-    /// if the slot has been evicted in the meantime there is nothing to
-    /// clear. Lives on the bound-free impl so cleanup paths
-    /// (`RefreshGuard`, `RefreshWork::Drop`) can invoke it without the
-    /// fuller `Policy<K, V>` bound the method-bearing impl carries.
+    /// Best-effort clear of `refresh_inflight`. On the bound-free impl
+    /// so `RefreshGuard::drop` can call it without `Policy<K, V>`.
     pub(crate) fn refresh_inflight_remove(&self, key: &K)
     where
         K: Eq + Hash,
@@ -409,19 +289,13 @@ where
     S: BuildHasher + Clone,
 {
     pub(crate) fn new(config: CacheConfig<K, V, P, S>) -> Self {
-        // `ClashCollection::with_shard_amount` requires a power-of-two
-        // shard count strictly greater than 1; `CacheBuilder::shards`
-        // enforces both invariants up-front.
+        // `ClashCollection::with_shard_amount` requires a pow2 ≥ 2;
+        // `CacheBuilder::shards` enforces that up front.
         let shard_count = config.shards;
         let max_weight = config.max_weight.get();
-        // Round up so the per-shard sum is at least `max_weight`. The
-        // observed total weight may exceed `max_weight` by up to
-        // `shard_count - 1` (rounding slack).
         let shard_max_weight = max_weight.div_ceil(shard_count as u64).max(1);
-        // Entries / slab grow on demand: pre-sizing them from `max_weight`
-        // over-allocates as soon as `Policy::weight` returns anything other
-        // than 1, so we eat a few rehashes on the first inserts instead of
-        // guessing wrong here.
+        // Don't pre-size from max_weight: `Policy::weight != 1`
+        // over-allocates immediately. Eat a few rehashes instead.
         let shards = ClashCollection::with_shard_amount(shard_count, || State {
             entries: HashTable::new(),
             inflight: HashMap::new(),
@@ -456,15 +330,13 @@ where
 
         let id = entries_find(&st.entries, &self.hasher, &st.slab, key)?;
 
-        // Fast-path read: borrow the slot to inspect the deadline; if expired,
-        // drop the borrow and fall into the eviction path below.
         let expired = st
             .slab
             .get(id)
             .is_some_and(|es| !entry_is_served(&es.entry, now_tick));
         if expired {
-            // Use the slot's owned key for the lifecycle event so callers
-            // querying with a borrowed `Q` need not own a `K`.
+            // Use the slot's owned key so a `Q`-keyed caller doesn't
+            // have to own a `K` for the lifecycle event.
             let (k, v, _) = evict_slot(&mut st, &self.hasher, id)?;
             drop(st);
             self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
@@ -475,8 +347,7 @@ where
             let es = st.slab.get_mut(id)?;
             es.freq = es.freq.saturating_add(1).min(FREQ_CAP);
             let value = es.entry.value.clone();
-            // Disjoint-field borrow: `&es.key` (immutable) and `&mut es.entry`
-            // (mutable) don't overlap, so the borrow checker accepts both.
+            // Disjoint-field borrow: `&es.key` and `&mut es.entry`.
             let update =
                 update_read_deadline(&es.key, &mut es.entry, &self.config.policy, self.start, now);
             (value, update)
@@ -496,18 +367,16 @@ where
         let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key) else {
             return false;
         };
-        // Read-only check: do not evict expired entries here; let the next
-        // `get`/`insert` reclaim path do it so contains_key has no side
-        // effects beyond taking the lock.
+        // No eviction here: keep `contains_key` side-effect-free; the
+        // next `get`/`insert` will reclaim.
         let now_tick = clock::floor_tick(self.start, Instant::now());
         st.slab
             .get(id)
             .is_some_and(|es| entry_is_served(&es.entry, now_tick))
     }
 
-    /// Sums per-shard `slab.len()`. Briefly takes each shard's read lock
-    /// in turn; not snapshot-consistent under concurrent mutation, but
-    /// each shard's contribution is taken atomically.
+    // Per-shard locks taken in turn; not snapshot-consistent but each
+    // shard's contribution is taken atomically.
     pub(crate) fn len(&self) -> usize {
         self.shards
             .shards()
@@ -516,9 +385,6 @@ where
             .sum()
     }
 
-    /// Short-circuiting form of `len() == 0`: bails out on the first
-    /// non-empty shard so a busy cache only pays for a single lock+probe.
-    /// Inherits the non-snapshot caveat from [`Self::len`].
     pub(crate) fn is_empty(&self) -> bool {
         self.shards
             .shards()
@@ -526,8 +392,6 @@ where
             .all(|s| s.read().slab.len() == 0)
     }
 
-    /// Sums per-shard `total_weight`. Same consistency caveat as
-    /// [`Self::len`].
     pub(crate) fn weight(&self) -> u64 {
         self.shards
             .shards()
@@ -536,11 +400,6 @@ where
             .sum()
     }
 
-    /// Drains every `Ready` slot across every shard, fires `Removed` for
-    /// each one outside the locks, and cancels every in-flight miss lane
-    /// so any waiter sees a retry signal rather than blocking forever on
-    /// an abandoned flight. Walks shards in deterministic index order so
-    /// `Removed` callbacks observe a stable cross-shard sequence.
     pub(crate) fn clear(&self)
     where
         K: 'static,
@@ -549,11 +408,8 @@ where
         for shard in self.shards.shards() {
             let mut st = shard.write();
             let mut drained: Vec<(K, V)> = Vec::with_capacity(st.slab.len());
-            // Deterministic drain order: Main first (warm tail-to-head),
-            // then Small (cold tail-to-head). The order does not carry
-            // an "oldest-first" meaning (S3-FIFO has no global recency
-            // axis); it is documented purely so observers see a stable
-            // sequence of `Removed` lifecycle events across runs.
+            // Main then Small, tail-to-head, for a stable cross-run
+            // `Removed` sequence (S3-FIFO has no global recency axis).
             for queue in [Queue::Main, Queue::Small] {
                 while let Some(tail) = st.queue_pop_tail(queue) {
                     if let Some(entry_slot) = st.slab.remove(tail) {
@@ -568,9 +424,8 @@ where
             st.total_weight = 0;
             st.small_weight = 0;
 
-            // Cancel pending miss lanes before releasing the lock so
-            // followers see Cancelled instead of waiting on a sender we
-            // are about to drop.
+            // Cancel before releasing the lock so followers see
+            // Cancelled instead of blocking on a sender we just dropped.
             let cancelled: Vec<InflightLane> = st.inflight.drain().map(|(_, v)| v).collect();
             drop(st);
 
@@ -594,16 +449,14 @@ where
         let key_for_updated = key.clone();
         let mut st = self.shard_for(&key).write();
 
-        // Single lookup: cache the existing slot id, then derive both the
-        // returned `prev` value and the displaced-slot eviction from it.
-        // Avoids two passes through `entries.find` per insert.
+        // Cache `existing_id` once: derive both `prev` and the displaced
+        // eviction from it instead of probing twice.
         let existing_id = entries_find(&st.entries, &self.hasher, &st.slab, &key);
         let prev = existing_id.and_then(|id| st.slab.get(id).map(|es| es.entry.value.clone()));
 
         let reclaimed = reclaim(self, &mut st, new_w, &key, now);
 
-        // `reclaim` never evicts `skip_key`, so `existing_id` is still valid
-        // here if it was valid before the call.
+        // `reclaim` skips `skip_key`, so `existing_id` is still valid.
         if let Some(id) = existing_id {
             let _ = evict_slot(&mut st, &self.hasher, id);
         }
@@ -644,11 +497,8 @@ where
         Some(v)
     }
 
-    /// Atomically inspects the slot for `key` and decides whether
-    /// `try_revalidate` should submit, skip (already inflight), or refuse
-    /// (no `Ready` slot). On `Submit`, sets the slot's
-    /// `refresh_inflight = true` so the next call returns `SkipInFlight`
-    /// until the matching `refresh_inflight_remove`.
+    /// On `Submit`, flips `refresh_inflight = true`; subsequent calls
+    /// return `SkipInFlight` until `refresh_inflight_remove`.
     pub(crate) fn try_mark_refresh_inflight(&self, key: &K) -> RefreshGate
     where
         K: Eq + Hash,
@@ -695,9 +545,7 @@ where
         );
 
         drop(st);
-        // Mirror `Inner::insert`: when an existing Ready value is replaced,
-        // emit Updated outside the lock so listeners see the same lifecycle
-        // for refresh-driven and caller-driven replacements.
+        // Mirror `Inner::insert`: emit Updated outside the lock.
         if let Some(prev) = displaced {
             self.notify_lifecycle(LifecycleReason::Updated, key.clone(), Some(prev));
         }
@@ -728,40 +576,26 @@ where
     }
 }
 
-/// Whether the entry may be returned for a read at `now_tick`. The
-/// `NO_DEADLINE` sentinel (= `Tick::MAX`) folds into "always served"
-/// because `now_tick < Tick::MAX` for any realistic clock.
-///
-/// [`Policy::expire_after_read`](crate::policy::Policy::expire_after_read) runs only after a live hit
-/// in [`update_read_deadline`] to compute the next deadline.
+/// `NO_DEADLINE` (= `Tick::MAX`) folds into "always served" because
+/// `now_tick < Tick::MAX` for any realistic clock.
 pub(super) fn entry_is_served<V>(e: &CacheEntry<V>, now_tick: clock::Tick) -> bool {
     now_tick < e.deadline
 }
 
-/// Per-shard ghost-set bound for S3-FIFO's "warm-on-reinsert" path. Holds
-/// the fingerprints of recently evicted Small-tail entries so a returning
-/// key skips Small and goes straight to Main with `freq = 0`. Sized as a
-/// fixed constant rather than a function of `max_weight` because that
-/// translates between weight and entry count incorrectly the moment
-/// `Policy::weight` returns anything other than 1. Picked at "big enough
-/// to cover typical working sets, small enough not to bloat per-shard
-/// memory"; tune via a future builder knob if a workload demands it.
+// Sized as a fixed constant: deriving from `max_weight` is wrong as
+// soon as `Policy::weight != 1`. Pick "big enough for typical working
+// sets, small enough not to bloat per-shard memory".
 const DEFAULT_GHOST_CAP_PER_SHARD: usize = 1024;
 
-/// Outcome of [`update_read_deadline`]. `new_deadline` is `Some` only when
-/// the deadline transitioned to a fresh finite value the caller still has
-/// to push into the expiry heap. `superseded_finite` is `true` when the
-/// previous deadline was finite (so any tuple already in the heap for
-/// this slot is now stale) — read-extending policies pile these up over
-/// time and are what trigger the periodic rebuild.
 pub(super) struct ReadDeadlineUpdate {
+    /// `Some` only when the read hook transitioned to a fresh finite
+    /// deadline the caller still has to push into the heap.
     pub(super) new_deadline: Option<clock::Tick>,
+    /// `true` when the prior deadline was finite — the heap now holds
+    /// a stale tuple that contributes to the rebuild trigger.
     pub(super) superseded_finite: bool,
 }
 
-/// Apply the read hook to `e.deadline` in place. The returned
-/// [`ReadDeadlineUpdate`] tells the caller whether to push a fresh tuple
-/// and whether that push leaves a stale tuple behind.
 pub(super) fn update_read_deadline<K, V, P>(
     key: &K,
     e: &mut CacheEntry<V>,
@@ -807,12 +641,9 @@ mod tests;
 
 #[cfg(feature = "typesize")]
 mod typesize_impls {
-    //! `TypeSize` impls for shard / cache state.
-    //!
-    //! Acquiring `Inner::extra_size` walks every shard under a read lock
-    //! and iterates every slab entry — fine for diagnostics but not a hot
-    //! path. Bounds are kept on the impl block so the rest of the crate
-    //! stays free of `TypeSize` requirements.
+    //! `extra_size()` on `Inner` walks every shard's slab under a read
+    //! lock — fine for diagnostics, not a hot path.
+
     use core::mem;
     use std::any::TypeId;
     use std::sync::Arc;
@@ -825,9 +656,6 @@ mod typesize_impls {
     use crate::cache::flight::InflightLane;
 
     fn entries_extra(entries: &HashTable<SlotKey>) -> usize {
-        // SlotKey is plain (`u32`-pair); HashTable's allocation_size already
-        // accounts for buckets + control bytes + the inline `SlotKey`s, and
-        // SlotKey carries no heap of its own.
         entries.allocation_size()
     }
 
@@ -845,9 +673,6 @@ mod typesize_impls {
     where
         K: TypeSize + Eq + std::hash::Hash,
     {
-        // hashbrown 0.17's HashMap covers buckets + inline `(K, TypeId, V)`
-        // bytes via `allocation_size`; iterate live entries for any extra
-        // they own beyond their stack footprint.
         let buckets = inflight.allocation_size();
         let per_entry: usize = inflight
             .iter()
@@ -862,8 +687,8 @@ mod typesize_impls {
         V: TypeSize,
     {
         fn extra_size(&self) -> usize {
-            // Exhaustive destructure (no `..`) so a new `State` field is a
-            // compile error here until it's wired in.
+            // Exhaustive destructure: a new `State` field becomes a
+            // compile error until it's accounted for.
             let Self {
                 entries,
                 inflight,
@@ -889,16 +714,14 @@ mod typesize_impls {
         }
     }
 
-    /// Policy and hasher are deeply walked when their concrete types
-    /// provide `TypeSize`. The optional listener is `Arc<dyn …>` —
-    /// type-erased and beyond the orphan rule's reach, so it falls
-    /// through `_` like `Instant` and `SlotKey` elsewhere.
     impl<K, V, P, S> TypeSize for CacheConfig<K, V, P, S>
     where
         P: TypeSize,
         S: TypeSize,
     {
         fn extra_size(&self) -> usize {
+            // `lifecycle_listener: Arc<dyn …>` is type-erased beyond
+            // the orphan rule — falls through `_`.
             let Self {
                 max_weight,
                 policy,
@@ -922,14 +745,12 @@ mod typesize_impls {
         S: TypeSize,
     {
         fn extra_size(&self) -> usize {
+            // `start: Instant` is std-owned (orphan rule) and stack-only.
             let Self {
                 config,
                 shards,
                 hasher,
                 shard_max_weight,
-                // `Instant` is in std and not reachable through the
-                // orphan rule. Stack-only, already counted in
-                // `mem::size_of::<Self>()`.
                 start: _,
             } = self;
             shards.extra_size()
@@ -939,12 +760,8 @@ mod typesize_impls {
         }
     }
 
-    /// Re-exported helper so `Cache`'s impl in `mod.rs` can size the inner
-    /// `Arc<Inner>` without importing `SizableArc`'s trait paths.
     pub(crate) fn arc_inner_size<T: TypeSize>(arc: &Arc<T>) -> usize {
-        // `SizableArc<_, Owned>` reports: pointer (counted by mem::size_of)
-        // + 2 atomic counters (strong/weak) + size_of::<T>() + T::extra_size.
-        // We want only the heap portion (extra_size for `Arc<T>`):
+        // 2 atomic counters (strong/weak) + size_of::<T>() + extras.
         2 * mem::size_of::<usize>() + mem::size_of::<T>() + arc.extra_size()
     }
 }

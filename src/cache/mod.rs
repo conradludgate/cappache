@@ -27,9 +27,8 @@ use crate::policy::Policy;
 use crate::rt::{Executor, RevalidateScheduled};
 
 pin_project! {
-    /// Internal adapter wrapping a fallible miss future as `Result<_, Infallible>`
-    /// so [`Executor`] bounds on refresh can stay homogenous over `Result<V, E>`.
-    /// Crate-private: callers should not need to mention this type.
+    /// Wraps a `Future<Output = T>` as `Future<Output = Result<T, Infallible>>`
+    /// so refresh executors stay homogenous over `Result<V, E>`.
     pub(crate) struct OkIntoResult<Fut> {
         #[pin]
         fut: Fut,
@@ -50,11 +49,8 @@ impl<Fut: Future> Future for OkIntoResult<Fut> {
     }
 }
 
-/// RAII for [`Cache::try_revalidate`]: clears the per-slot `refresh_inflight`
-/// flag if the function unwinds (panicking `init`, panicking first poll, or
-/// panicking `Executor::execute`) before ownership of the flag is handed to
-/// the spawned [`RefreshWork`]. Disarmed on the success path; from there
-/// `RefreshWork::Drop` takes over.
+/// Clears `refresh_inflight` if `try_revalidate` unwinds before
+/// handing the flag off to the spawned [`RefreshWork`].
 struct RefreshGuard<'a, K, V, P, S>
 where
     K: Eq + Hash + 'static,
@@ -81,12 +77,9 @@ where
     }
 }
 
-/// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by [`Cache::try_revalidate`].
-///
-/// `cleanup` is captured at construction (where the `K: Eq + Hash` bounds
-/// are in scope) and invoked from [`Drop`] to clear `refresh_inflight` if
-/// the executor drops the job without polling it to completion. `cleaned`
-/// short-circuits that path once `poll` reaches `Ready`.
+/// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by
+/// [`Cache::try_revalidate`]. `cleanup` clears `refresh_inflight` if
+/// the executor drops the job without polling it to `Ready`.
 pub struct RefreshWork<
     K: 'static,
     V: 'static,
@@ -412,10 +405,6 @@ where
             }
         }
 
-        // RAII: clear `refresh_inflight` if `init`, the first poll, or
-        // `executor.execute` panics or returns Err before ownership of the
-        // flag is transferred to the spawned `RefreshWork`. Disarm only on
-        // the "fully handed off" path.
         let mut guard = RefreshGuard {
             inner: &self.inner,
             key: &key,
@@ -487,8 +476,8 @@ where
     P: typesize::TypeSize + 'static,
     S: typesize::TypeSize + 'static,
 {
-    /// Deep size estimate. Walks every shard under a read lock and every
-    /// slab entry — useful for diagnostics, not for hot paths.
+    /// Walks every shard under a read lock and every slab entry — for
+    /// diagnostics only.
     fn extra_size(&self) -> usize {
         inner::arc_inner_size(&self.inner)
     }
