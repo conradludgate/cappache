@@ -2,6 +2,34 @@
 //! invariants, and S3-FIFO routing decisions. Black-box behaviours
 //! observable through the public `Cache` API live in `tests/cache_ops.rs`.
 
+/// `BuildHasher` that pins every key to shard 0 *while preserving per-key
+/// fingerprints*. Wraps `DefaultHasher` (fixed initial state) and clears
+/// the top 8 bits of `finish()` so [`clashcore::ClashCollection::determine_shard`]'s
+/// `(h << 7) >> 63` always picks shard 0, but lower bits stay derived
+/// from the actual key bytes. Used by white-box tests that want
+/// single-shard determinism for FIFO / ghost / heap invariants without
+/// collapsing every fingerprint to a single value.
+#[derive(Clone, Copy, Default)]
+struct SingleShardHasher;
+
+struct SingleShardHasherImpl(std::collections::hash_map::DefaultHasher);
+
+impl std::hash::Hasher for SingleShardHasherImpl {
+    fn finish(&self) -> u64 {
+        self.0.finish() & ((1u64 << 56) - 1)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+}
+
+impl std::hash::BuildHasher for SingleShardHasher {
+    type Hasher = SingleShardHasherImpl;
+    fn build_hasher(&self) -> SingleShardHasherImpl {
+        SingleShardHasherImpl(std::collections::hash_map::DefaultHasher::new())
+    }
+}
+
 mod size_regressions {
     use super::super::*;
 
@@ -79,23 +107,6 @@ mod shard_tests {
         }
     }
 
-    /// With `shards == 1` the local cap equals the global cap exactly,
-    /// so the standard "weight never exceeds `max_weight`" invariant
-    /// holds without rounding slack. Documents the boundary the test
-    /// fixups above lean on.
-    #[test]
-    fn single_shard_strictly_caps_total_weight() {
-        let inner = build(1, 4);
-        for i in 0..32 {
-            inner.insert(format!("k{i}"), "v".to_string());
-            assert!(
-                inner.weight() <= 4,
-                "weight {} exceeded max=4 with shards=1 after inserting k{i}",
-                inner.weight(),
-            );
-        }
-    }
-
     /// The plan documents that with `shards > 1` the observed total
     /// weight may exceed `max_weight` by up to `shards - 1` units of
     /// rounding slack (each shard rounds its share up). Lock the bound
@@ -133,9 +144,15 @@ mod shard_tests {
             Duration::from_mins(1),
             crate::policy::DefaultPolicy,
         ));
+        // Pin every key to one shard with `SingleShardHasher` so the
+        // post-rebuild bound is observable without crawling all shards.
+        // `shards = 2` halves the effective shard cap, so double
+        // `max_weight` to keep shard 0 at cap 8 (matches the original
+        // single-shard fixture).
         let cfg = CacheBuilder::<K, V>::new()
-            .max_weight(Weight::new(8))
-            .shards(1)
+            .max_weight(Weight::new(16))
+            .shards(2)
+            .hasher(super::SingleShardHasher)
             .policy(policy)
             .build();
         let inner = Arc::new(Inner::new(cfg));
@@ -154,7 +171,13 @@ mod shard_tests {
             }
         }
 
-        let st = inner.shards[0].write();
+        let occupied = inner
+            .shards
+            .shards()
+            .iter()
+            .find(|s| !s.read().slab.is_empty())
+            .expect("at least one shard holds the inserted keys");
+        let st = occupied.write();
         let live = st.slab.len();
         let heap_len = st.expiry.len();
         assert!(
@@ -226,23 +249,30 @@ mod s3_fifo_tests {
     use std::sync::Arc;
 
     use super::super::*;
+    use super::SingleShardHasher;
     use crate::config::{CacheBuilder, DynPolicy};
     use crate::policy::{DefaultPolicy, Weight};
 
     type K = String;
     type V = String;
 
-    fn build(shards: usize, max_weight: u64) -> Arc<Inner<K, V, DynPolicy<K, V>>> {
+    /// Pin every key into shard 0 via [`SingleShardHasher`] so per-shard
+    /// FIFO ordering and ghost membership are observable without us
+    /// having to coax the default hasher into giving us colocated keys.
+    /// Uses `shards = 2` (the minimum the cache supports) — only shard 0
+    /// receives any entries.
+    fn build(max_weight: u64) -> Arc<Inner<K, V, DynPolicy<K, V>, SingleShardHasher>> {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
         let cfg = CacheBuilder::<K, V>::new()
             .max_weight(Weight::new(max_weight))
-            .shards(shards)
+            .shards(2)
+            .hasher(SingleShardHasher)
             .policy(policy)
             .build();
         Arc::new(Inner::new(cfg))
     }
 
-    fn queue_of<P>(inner: &Inner<K, V, P>, key: &K) -> Option<Queue>
+    fn queue_of<P>(inner: &Inner<K, V, P, SingleShardHasher>, key: &K) -> Option<Queue>
     where
         P: Policy<K, V>,
     {
@@ -256,7 +286,10 @@ mod s3_fifo_tests {
     /// new slot directly into Main.
     #[test]
     fn ghost_hit_lands_in_main() {
-        let inner = build(1, 2);
+        // `shards = 2` halves the per-shard cap, so feed `max_weight = 4`
+        // to land at cap 2 inside shard 0 (where every key resolves
+        // courtesy of `SingleShardHasher`).
+        let inner = build(4);
         // Fill Small to capacity with two cold (freq=0) keys.
         inner.insert("a".into(), "va".into());
         inner.insert("b".into(), "vb".into());
@@ -290,21 +323,21 @@ mod s3_fifo_tests {
     /// next reclaim would mis-balance Small vs Main.
     #[test]
     fn clear_resets_ghost_and_small_weight() {
-        let inner = build(1, 2);
+        let inner = build(4);
         inner.insert("a".into(), "v".into());
         inner.insert("b".into(), "v".into());
         // Force a Small eviction so `a`'s fingerprint enters ghost and
         // `small_weight` advances.
         inner.insert("c".into(), "v".into());
         {
-            let st = inner.shards[0].read();
+            let st = inner.shards.shards()[0].read();
             assert!(st.small_weight > 0);
         }
 
         inner.clear();
 
         {
-            let st = inner.shards[0].read();
+            let st = inner.shards.shards()[0].read();
             assert_eq!(st.small_weight, 0, "small_weight must reset on clear");
             assert!(st.small.tail().is_none(), "small must be empty after clear");
             assert!(st.main.tail().is_none(), "main must be empty after clear");

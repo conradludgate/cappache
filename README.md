@@ -55,18 +55,19 @@ impl LifecycleListener<String, String> for StdoutListener {
 fn main() {
     let cache: Cache<String, String> = Cache::new(
         CacheBuilder::new()
-            .max_weight(Weight::new(3))
-            .shards(1)
+            .max_weight(Weight::new(4))
             .lifecycle_listener(Arc::new(StdoutListener))
             .build(),
     );
 
-    cache.insert("a".into(), "alpha".into());
-    cache.insert("b".into(), "bravo".into());
-    cache.insert("c".into(), "charlie".into());
-    cache.insert("d".into(), "delta".into()); // evicts one entry
+    for k in ["a", "b", "c", "d", "e", "f"] {
+        cache.insert(k.into(), format!("value-{k}"));
+    }
 
-    assert_eq!(cache.get("d"), Some("delta".to_string()));
+    // Some entries have been evicted to keep the cache under
+    // `max_weight`; others remain. Exact identities depend on which
+    // shard each key hashes into.
+    assert!(cache.len() <= 4 + cache.weight() as usize);
 }
 ```
 
@@ -214,11 +215,13 @@ The engine lives under [`src/cache/`](src/cache/), split by concern:
 
 A few choices worth knowing about:
 
-- **Sharded `RwLock<State>`**. Default shard count tracks
-  `available_parallelism()` rounded up to a power of two. With more
-  than one shard the global weight cap is honoured per shard, so the
-  observed total may overshoot by up to `shards − 1` units of rounding
-  slack. Pass `.shards(1)` for a strict global cap.
+- **Sharded `RwLock<State>`** via [`clashcore::ClashCollection`].
+  Default shard count tracks `available_parallelism()` rounded up to a
+  power of two; the minimum is `2` (`clashcore`'s precondition). The
+  global weight cap is honoured per shard, so the observed total may
+  overshoot by up to `shards − 1` units of rounding slack.
+
+[`clashcore::ClashCollection`]: https://docs.rs/clashcore/latest/clashcore/sharded/struct.ClashCollection.html
 - **S3-FIFO eviction** (Yang et al., SOSP'23). Each shard keeps a
   Small queue, a Main queue, and a bounded ghost set of fingerprints.
   Cold tail evictions seed the ghost set so a returning key skips

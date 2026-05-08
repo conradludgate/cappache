@@ -37,13 +37,16 @@ where
     pub max_weight: Weight,
     pub policy: P,
     pub hasher: S,
-    /// Requested shard count. Rounded up to the next power of two at
-    /// cache construction; minimum 1. With `shards > 1` the observed
-    /// total weight may exceed `max_weight` by up to `shards - 1` units
-    /// of rounding slack — set to 1 for a strict global cap.
+    /// Final shard count: a power of two `>= 2`. Backed by
+    /// [`clashcore::ClashCollection`], which requires a power-of-two
+    /// shard count strictly greater than 1.
+    ///
+    /// The observed total weight may exceed `max_weight` by up to
+    /// `shards - 1` units of rounding slack.
     ///
     /// Crate-private: callers set this via [`CacheBuilder::shards`],
-    /// which clamps to a positive value before this field is populated.
+    /// which clamps to `>= 2` and rounds up to the next power of two
+    /// before this field is populated.
     pub(crate) shards: usize,
     pub(crate) lifecycle_listener: Option<Arc<dyn LifecycleListener<K, V> + Send + Sync>>,
     pub(crate) _marker: PhantomData<(K, V)>,
@@ -88,16 +91,20 @@ where
 }
 
 /// Default shard count = next-power-of-two of available parallelism,
-/// minimum 1. Picked to spread per-shard contention across cores
+/// minimum 2. Picked to spread per-shard contention across cores
 /// without inflating per-cache memory beyond what callers expect.
-/// Fall back to 1 when the runtime can't report parallelism. Pure
-/// concurrency-tuning default — every value is functionally correct,
-/// only contention behaviour changes.
+/// Fall back to 2 when the runtime can't report parallelism. Pure
+/// concurrency-tuning default — every value `>= 2` is functionally
+/// correct, only contention behaviour changes.
+///
+/// The minimum of 2 matches [`clashcore::ClashCollection`]'s
+/// shard-amount precondition; single-shard mode would require a
+/// separate degenerate code path we deliberately don't carry.
 fn default_shard_count() -> usize {
     std::thread::available_parallelism()
-        .map_or(1, usize::from)
+        .map_or(2, usize::from)
         .next_power_of_two()
-        .max(1)
+        .max(2)
 }
 
 impl<K, V> CacheBuilder<K, V, DynPolicy<K, V>, DefaultHashBuilder>
@@ -168,15 +175,15 @@ where
         }
     }
 
-    /// Sets the requested shard count (rounded up to a power of two,
-    /// minimum 1). With more than one shard, each shard enforces a
-    /// rounded-up share of [`Self::max_weight`], so the observed total
-    /// weight may overshoot by up to `shards - 1` units. Pass `1` for a
-    /// strict global cap (also useful for capacity tests that assume a
-    /// single LRU).
+    /// Sets the requested shard count. Clamped to `>= 2` and rounded up
+    /// to the next power of two — both invariants are required by
+    /// [`clashcore::ClashCollection`], which backs the per-shard storage.
+    /// Each shard enforces a rounded-up share of [`Self::max_weight`],
+    /// so the observed total weight may overshoot by up to
+    /// `shards - 1` units of rounding slack.
     #[must_use]
     pub fn shards(mut self, shards: usize) -> Self {
-        self.shards = shards.max(1);
+        self.shards = shards.max(2).next_power_of_two();
         self
     }
 

@@ -17,7 +17,7 @@ default = []
 # Enables `typesize::TypeSize` impls on the public cache types so callers can
 # fetch a deep memory-usage estimate for debugging. Acquires every shard
 # write lock and walks every slab entry; do not enable for hot paths.
-typesize = ["dep:typesize"]
+typesize = ["dep:typesize", "clashcore/typesize"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

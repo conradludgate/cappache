@@ -161,6 +161,7 @@ dependencies = [
  "lock_api",
  "parking_lot_core",
  "polonius-the-crab",
+ "typesize",
 ]
 
 [[package]]

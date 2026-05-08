@@ -24,6 +24,38 @@ use clache::{
 type K = String;
 type V = String;
 
+/// `BuildHasher` that pins every key to shard 0 *while preserving per-key
+/// fingerprints*. Wraps `DefaultHasher` (fixed initial state) and clears
+/// the top 8 bits of `finish()` so [`clashcore::ClashCollection::determine_shard`]'s
+/// `(h << 7) >> 63` always picks shard 0, but lower bits stay derived
+/// from the actual key bytes. Used by tests that want single-shard
+/// determinism without collapsing every ghost-set fingerprint to a
+/// single value (which would break S3-FIFO's hot-vs-cold routing).
+#[derive(Clone, Copy, Default)]
+struct SingleShardHasher;
+
+struct SingleShardHasherImpl(std::collections::hash_map::DefaultHasher);
+
+impl std::hash::Hasher for SingleShardHasherImpl {
+    fn finish(&self) -> u64 {
+        self.0.finish() & ((1u64 << 56) - 1)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+}
+
+impl std::hash::BuildHasher for SingleShardHasher {
+    type Hasher = SingleShardHasherImpl;
+    fn build_hasher(&self) -> SingleShardHasherImpl {
+        SingleShardHasherImpl(std::collections::hash_map::DefaultHasher::new())
+    }
+}
+
+/// Type alias for the `SingleShardHasher`-backed cache used by every
+/// "this test wants single-shard determinism" fixture below.
+type SingleShardCache<K, V> = Cache<K, V, DynPolicy<K, V>, SingleShardHasher>;
+
 fn test_cache() -> Cache<K, V> {
     let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
     Cache::new(
@@ -44,12 +76,16 @@ fn test_cache_ttl_zero_write() -> Cache<K, V> {
     )
 }
 
-fn test_cache_max_weight_one() -> Cache<K, V> {
+fn test_cache_max_weight_one() -> SingleShardCache<K, V> {
     let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
+    // `shards(2)` is the minimum the cache supports; `SingleShardHasher`
+    // pins every key into shard 0, and `max_weight = 2` rounds to a
+    // shard cap of 1 — same as the original `shards(1)` fixture.
     Cache::new(
         CacheBuilder::new()
-            .max_weight(Weight::new(1))
-            .shards(1)
+            .max_weight(Weight::new(2))
+            .shards(2)
+            .hasher(SingleShardHasher)
             .policy(policy)
             .build(),
     )
@@ -814,10 +850,11 @@ mod capacity {
     #[test]
     fn max_weight_two_keeps_both_unit_weight_entries() {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
-        let cache = Cache::<K, V>::new(
+        let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(2))
-                .shards(1)
+                .max_weight(Weight::new(4))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(policy)
                 .build(),
         );
@@ -869,8 +906,9 @@ mod lifecycle {
         let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(Duration::ZERO, DefaultPolicy));
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(8))
-                .shards(1)
+                .max_weight(Weight::new(16))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(policy)
                 .lifecycle_listener(listener)
                 .build(),
@@ -901,8 +939,9 @@ mod lifecycle {
         let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(Duration::ZERO, DefaultPolicy));
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(8))
-                .shards(1)
+                .max_weight(Weight::new(16))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(policy)
                 .lifecycle_listener(listener)
                 .build(),
@@ -1133,10 +1172,11 @@ mod borrow_lookup {
     #[test]
     fn contains_key_does_not_bump_freq() {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
-        let cache = Cache::<K, V>::new(
+        let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(2))
-                .shards(1)
+                .max_weight(Weight::new(4))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(policy)
                 .build(),
         );
@@ -1168,10 +1208,11 @@ mod borrow_lookup {
     #[test]
     fn repeated_get_promotes_warm_entry_into_main() {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
-        let cache = Cache::<K, V>::new(
+        let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(4))
-                .shards(1)
+                .max_weight(Weight::new(8))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(policy)
                 .build(),
         );
@@ -1567,10 +1608,11 @@ mod policy_time {
         with_timeout(Duration::from_secs(30), async {
             let idle = Duration::from_millis(600);
             let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
-            let cache = Cache::<K, V>::new(
+            let cache = Cache::new(
                 CacheBuilder::new()
-                    .max_weight(Weight::new(8))
-                    .shards(1)
+                    .max_weight(Weight::new(16))
+                    .shards(2)
+                    .hasher(SingleShardHasher)
                     .policy(policy)
                     .build(),
             );
@@ -1603,10 +1645,11 @@ mod policy_time {
             let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
             let idle = Duration::from_millis(500);
             let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(idle, DefaultPolicy));
-            let cache = Cache::<K, V>::new(
+            let cache = Cache::new(
                 CacheBuilder::new()
-                    .max_weight(Weight::new(64))
-                    .shards(1)
+                    .max_weight(Weight::new(128))
+                    .shards(2)
+                    .hasher(SingleShardHasher)
                     .policy(policy)
                     .lifecycle_listener(listener)
                     .build(),
@@ -1674,8 +1717,9 @@ mod mutation_guards {
         let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(12))
-                .shards(1)
+                .max_weight(Weight::new(24))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(Arc::new(LenWeightPolicy))
                 .lifecycle_listener(listener)
                 .build(),
@@ -1815,8 +1859,9 @@ mod mutation_guards {
     fn remove_restores_budget_for_len_weighted_values() {
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(10))
-                .shards(1)
+                .max_weight(Weight::new(20))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(Arc::new(LenWeightPolicy))
                 .build(),
         );
@@ -1841,8 +1886,9 @@ mod mutation_guards {
     fn oversized_entry_can_be_replaced_when_it_alone_exceeds_budget() {
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(4))
-                .shards(1)
+                .max_weight(Weight::new(8))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(Arc::new(LenWeightPolicy))
                 .build(),
         );
@@ -2208,12 +2254,16 @@ mod s3_fifo {
         }
     }
 
-    fn small_cache(max: u64) -> Cache<K, V> {
+    fn small_cache(max: u64) -> SingleShardCache<K, V> {
         let policy: DynPolicy<K, V> = Arc::new(DefaultPolicy);
+        // `max` is the cap callers want inside shard 0; doubling here
+        // compensates for the shard-budget rounding that `shards(2)`
+        // imposes (`shard_max_weight = ceil(max_weight / 2)`).
         Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(max))
-                .shards(1)
+                .max_weight(Weight::new(max * 2))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(policy)
                 .build(),
         )
@@ -2327,8 +2377,9 @@ mod s3_fifo {
     fn skip_key_short_circuit_in_small() {
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(8))
-                .shards(1)
+                .max_weight(Weight::new(16))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(Arc::new(LenWeightPolicy))
                 .build(),
         );
@@ -2352,8 +2403,9 @@ mod s3_fifo {
     fn skip_key_short_circuit_in_main() {
         let cache = Cache::new(
             CacheBuilder::new()
-                .max_weight(Weight::new(12))
-                .shards(1)
+                .max_weight(Weight::new(24))
+                .shards(2)
+                .hasher(SingleShardHasher)
                 .policy(Arc::new(LenWeightPolicy))
                 .build(),
         );

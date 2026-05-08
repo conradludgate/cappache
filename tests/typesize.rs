@@ -24,7 +24,10 @@ impl TypeSize for TestHasher {}
 fn build_cache(max_weight: u64) -> Cache<String, String, DefaultPolicy, TestHasher> {
     let cfg = CacheBuilder::new()
         .max_weight(Weight::new(max_weight))
-        .shards(1)
+        // `shards(2)` is the cache's documented minimum. `TestHasher`
+        // is deterministic across runs, so the per-shard distribution
+        // (and therefore the deep-size snapshot below) stays stable.
+        .shards(2)
         .policy(DefaultPolicy)
         .hasher(TestHasher)
         .build();
@@ -68,12 +71,12 @@ fn empty_cache_has_nonzero_extra_size() {
 /// internal struct layout) shows up as a one-line failure.
 ///
 /// `TestHasher` always seeds with `DefaultHasher::new()` (fixed initial
-/// state), the cache uses `shards(1)`, `max_weight = u64::MAX` (so
-/// `Policy::weight` doesn't gate anything), and inserts are strictly
-/// `format!("k-{i:04}") -> format!("v-{i:04}")` for `i in 0..1023` —
-/// one below `slotmap`'s doubling boundary so capacity exactly matches
-/// `len`. Gated to 64-bit targets because the constant below assumes
-/// 8-byte pointers.
+/// state), the cache uses `shards(2)` (cache's minimum), `max_weight =
+/// u64::MAX` (so `Policy::weight` doesn't gate anything), and inserts
+/// are strictly `format!("k-{i:04}") -> format!("v-{i:04}")` for
+/// `i in 0..1023` — one below `slotmap`'s doubling boundary so capacity
+/// exactly matches `len` per shard once keys distribute. Gated to
+/// 64-bit targets because the constant below assumes 8-byte pointers.
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn snapshot_size_is_stable_with_fixed_seed_hasher() {
@@ -86,7 +89,7 @@ fn snapshot_size_is_stable_with_fixed_seed_hasher() {
     // (hashbrown 0.17, slotmap 1, typesize 0.1.14). If you legitimately
     // change layout, re-run and update — but pause first to confirm
     // the new number reflects an intentional shift, not a regression.
-    const EXPECTED_DEEP_SIZE: usize = 133_504;
+    const EXPECTED_DEEP_SIZE: usize = 182_200;
     assert_eq!(
         cache.get_size(),
         EXPECTED_DEEP_SIZE,

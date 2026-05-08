@@ -3,7 +3,7 @@ use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
-use clashcore::CachePadded;
+use clashcore::ClashCollection;
 use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 
@@ -16,10 +16,11 @@ use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
 use crate::policy::Policy;
 
-/// One cache-padded shard. Aliased so the verbose `CachePadded<RwLock<...>>`
-/// stack does not need to spell itself out at every use site (and so
-/// clippy stops flagging `Inner::shards` for `type_complexity`).
-pub(super) type Shard<K, V> = CachePadded<RwLock<State<K, V>>>;
+/// One cache-padded shard, as exposed by [`ClashCollection::shards`].
+/// Aliased so the verbose `CachePadded<RwLock<...>>` stack does not
+/// need to spell itself out at every use site (and so clippy stops
+/// flagging it for `type_complexity`).
+pub(super) type Shard<K, V> = clashcore::CachePadded<RwLock<State<K, V>>>;
 
 /// Decision returned by [`Inner::try_mark_refresh_inflight`]. Mirrors the
 /// public [`crate::rt::RevalidateScheduled`] variants so the call site only
@@ -37,26 +38,21 @@ pub(crate) enum RefreshGate {
 
 pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = DefaultHashBuilder> {
     pub(crate) config: CacheConfig<K, V, P, S>,
-    /// Per-shard state, cache-padded to keep adjacent shards out of each
-    /// other's cache lines. Single-key paths take exactly one shard's
-    /// `RwLock` (mostly `.write()` because reads mutate the slot's
-    /// S3-FIFO `freq` counter and read-deadline state; pure read-only
-    /// views — `contains_key`, `len`, `is_empty`, `weight` — take
-    /// `.read()`). Multi-key paths fold across all shards.
+    /// Sharded per-key state. [`ClashCollection`] supplies the
+    /// `Box<[CachePadded<RwLock<T>>]>` storage *and* the
+    /// `(h << 7) >> shift` indexing math: the left-shift parks the high
+    /// 7 bits of the hash for `hashbrown`'s SIMD tag, the right-shift
+    /// picks the next `log2(shard_count)` bits as the shard index.
+    /// Single-key paths take exactly one shard's `RwLock` (mostly
+    /// `.write()` because reads mutate `freq` and read-side deadlines;
+    /// `contains_key`, `len`, `is_empty`, `weight` take `.read()`).
+    /// Multi-key paths fold across [`ClashCollection::shards`].
     ///
     /// `clashcore::lock::RwLock` is `lock_api::RwLock<RawRwLock, T>`: a
-    /// single-CAS uncontended fast path with no poisoning. Releasing
-    /// before awaiting user `init` futures in [`Self::try_get_with`]
-    /// remains a hard requirement.
-    pub(crate) shards: Box<[Shard<K, V>]>,
-    /// `usize::BITS - log2(shards.len())` for the shard count, used by
-    /// the `(h << 7) >> shift` indexing borrowed from `clashcore`'s
-    /// `ClashCollection`. The left-shift hides the high 7 bits of the
-    /// hash from shard selection so `hashbrown`'s SIMD tag does not
-    /// collide with our shard partition. Unused (and set to `0`) when
-    /// `shards.len() == 1`; that case short-circuits to index 0 in
-    /// [`Self::shard_for`] to avoid an `usize::BITS` shift (UB).
-    pub(crate) shard_shift: u32,
+    /// single-CAS uncontended fast path, no poisoning. Releasing before
+    /// awaiting user `init` futures in [`Self::try_get_with`] remains a
+    /// hard requirement.
+    pub(crate) shards: ClashCollection<State<K, V>>,
     /// Hasher used both to pick a shard and (per shard) to hash table
     /// entries. Stored at the `Inner` level so all shards share the same
     /// seed — that keeps a key's bucket position stable across `Cache`
@@ -67,17 +63,15 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = Default
     /// vtable on the hot path. Defaults to [`DefaultHashBuilder`]
     /// (foldhash via `hashbrown` 0.17).
     pub(crate) hasher: S,
-    /// Per-shard weight cap: `ceil(max_weight / shards.len())`. With more
-    /// than one shard the observed total weight may exceed
-    /// `config.max_weight` by up to `shards.len() - 1` units of rounding
-    /// slack; pass `.shards(1)` for a strict global cap.
+    /// Per-shard weight cap: `ceil(max_weight / shard_count)`. The
+    /// observed total weight may exceed `config.max_weight` by up to
+    /// `shard_count - 1` units of rounding slack.
     pub(crate) shard_max_weight: u64,
     /// Monotonic anchor recorded at construction. All per-slot
     /// timestamps (`written_at`, `deadline`) and heap keys are stored
-    /// as nanosecond offsets from this `Instant`, halving the bytes
-    /// each `CacheEntry` / `HeapKey` carries. Conversion back to
-    /// `Instant` happens only at the [`Policy`] hook boundary; see
-    /// [`super::clock`].
+    /// as quarter-second tick offsets from this `Instant`; conversion
+    /// back to `Instant` happens only at the [`Policy`] hook boundary
+    /// (see [`super::clock`]).
     pub(crate) start: Instant,
 }
 
@@ -350,28 +344,20 @@ where
     ///
     /// Kept on a bound-free impl block so that the `LeaderGuard::drop`
     /// path can call it without re-asserting the full `Inner` bounds.
-    /// Borrowed verbatim from `clashcore::ClashCollection::determine_shard`:
-    /// `(hash << 7) >> shift` keeps the high 7 bits of the hash for
-    /// hashbrown's SIMD tag while picking a shard from the next bits.
+    /// Delegates to [`ClashCollection::determine_shard`] so the indexing
+    /// scheme matches `clashmap` exactly.
     pub(super) fn shard_for<Q>(&self, key: &Q) -> &Shard<K, V>
     where
         K: Borrow<Q>,
         Q: Hash + ?Sized,
     {
-        let idx = if self.shards.len() == 1 {
-            0
-        } else {
-            // Mirrors `clashcore::ClashCollection::determine_shard`: cast
-            // the 64-bit hash down to `usize` and pick the upper
-            // `log2(shard_count)` bits after the 7-bit SIMD-tag shift.
-            // High bits get dropped on 32-bit targets, which is fine — the
-            // default hasher distributes well enough that the truncation
-            // does not bias shard selection.
-            #[allow(clippy::cast_possible_truncation)]
-            let h = self.hasher.hash_one(key) as usize;
-            (h << 7) >> self.shard_shift
-        };
-        &self.shards[idx]
+        // Cast the 64-bit hash down to `usize`. High bits get dropped on
+        // 32-bit targets; the default hasher distributes well enough that
+        // the truncation does not bias shard selection.
+        #[allow(clippy::cast_possible_truncation)]
+        let h = self.hasher.hash_one(key) as usize;
+        let idx = self.shards.determine_shard(h);
+        &self.shards.shards()[idx]
     }
 
     /// Clears the per-slot `refresh_inflight` flag for `key`. Best-effort:
@@ -423,48 +409,35 @@ where
     S: BuildHasher + Clone,
 {
     pub(crate) fn new(config: CacheConfig<K, V, P, S>) -> Self {
-        let shard_count = config.shards.max(1).next_power_of_two();
+        // `ClashCollection::with_shard_amount` requires a power-of-two
+        // shard count strictly greater than 1; `CacheBuilder::shards`
+        // enforces both invariants up-front.
+        let shard_count = config.shards;
         let max_weight = config.max_weight.get();
-        // Round up so the per-shard sum is at least `max_weight`. With more
-        // than one shard total observed weight may exceed `max_weight` by
-        // up to `shard_count - 1` (rounding); callers wanting a strict
-        // global cap pass `.shards(1)`.
+        // Round up so the per-shard sum is at least `max_weight`. The
+        // observed total weight may exceed `max_weight` by up to
+        // `shard_count - 1` (rounding slack).
         let shard_max_weight = max_weight.div_ceil(shard_count as u64).max(1);
-        let shards = (0..shard_count)
-            .map(|_| {
-                // Entries / slab grow on demand: pre-sizing them from
-                // `max_weight` over-allocates as soon as `Policy::weight`
-                // returns anything other than 1, so we eat a few rehashes
-                // on the first inserts instead of guessing wrong here.
-                CachePadded::new(RwLock::new(State {
-                    entries: HashTable::new(),
-                    inflight: HashMap::new(),
-                    slab: EntrySlab::with_key(),
-                    small: Fifo::default(),
-                    main: Fifo::default(),
-                    ghost: GhostSet::new(DEFAULT_GHOST_CAP_PER_SHARD),
-                    small_weight: 0,
-                    expiry: ExpiryHeap::default(),
-                    stale_pushes: 0,
-                    total_weight: 0,
-                }))
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        // Match clashcore::ClashCollection's shard indexing: shift leaves
-        // the high 7 bits of the hash undisturbed for hashbrown's SIMD
-        // tag. The single-shard branch in `shard_for` bypasses the shift
-        // entirely so `usize::BITS` here would be UB — set to 0 instead.
-        let shard_shift = if shard_count == 1 {
-            0
-        } else {
-            usize::BITS - shard_count.trailing_zeros()
-        };
+        // Entries / slab grow on demand: pre-sizing them from `max_weight`
+        // over-allocates as soon as `Policy::weight` returns anything other
+        // than 1, so we eat a few rehashes on the first inserts instead of
+        // guessing wrong here.
+        let shards = ClashCollection::with_shard_amount(shard_count, || State {
+            entries: HashTable::new(),
+            inflight: HashMap::new(),
+            slab: EntrySlab::with_key(),
+            small: Fifo::default(),
+            main: Fifo::default(),
+            ghost: GhostSet::new(DEFAULT_GHOST_CAP_PER_SHARD),
+            small_weight: 0,
+            expiry: ExpiryHeap::default(),
+            stale_pushes: 0,
+            total_weight: 0,
+        });
         let hasher = config.hasher.clone();
         Self {
             config,
             shards,
-            shard_shift,
             hasher,
             shard_max_weight,
             start: Instant::now(),
@@ -536,20 +509,31 @@ where
     /// in turn; not snapshot-consistent under concurrent mutation, but
     /// each shard's contribution is taken atomically.
     pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.read().slab.len()).sum()
+        self.shards
+            .shards()
+            .iter()
+            .map(|s| s.read().slab.len())
+            .sum()
     }
 
     /// Short-circuiting form of `len() == 0`: bails out on the first
     /// non-empty shard so a busy cache only pays for a single lock+probe.
     /// Inherits the non-snapshot caveat from [`Self::len`].
     pub(crate) fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| s.read().slab.len() == 0)
+        self.shards
+            .shards()
+            .iter()
+            .all(|s| s.read().slab.len() == 0)
     }
 
     /// Sums per-shard `total_weight`. Same consistency caveat as
     /// [`Self::len`].
     pub(crate) fn weight(&self) -> u64 {
-        self.shards.iter().map(|s| s.read().total_weight).sum()
+        self.shards
+            .shards()
+            .iter()
+            .map(|s| s.read().total_weight)
+            .sum()
     }
 
     /// Drains every `Ready` slot across every shard, fires `Removed` for
@@ -562,7 +546,7 @@ where
         K: 'static,
         V: 'static,
     {
-        for shard in &self.shards {
+        for shard in self.shards.shards() {
             let mut st = shard.write();
             let mut drained: Vec<(K, V)> = Vec::with_capacity(st.slab.len());
             // Deterministic drain order: Main first (warm tail-to-head),
@@ -837,7 +821,7 @@ mod typesize_impls {
     use typesize::TypeSize;
 
     use super::super::slab::slot_storage_bytes;
-    use super::{CacheConfig, EntrySlab, EntrySlot, Inner, Shard, SlotKey, State};
+    use super::{CacheConfig, EntrySlab, EntrySlot, Inner, SlotKey, State};
     use crate::cache::flight::InflightLane;
 
     fn entries_extra(entries: &HashTable<SlotKey>) -> usize {
@@ -941,7 +925,6 @@ mod typesize_impls {
             let Self {
                 config,
                 shards,
-                shard_shift,
                 hasher,
                 shard_max_weight,
                 // `Instant` is in std and not reachable through the
@@ -949,14 +932,9 @@ mod typesize_impls {
                 // `mem::size_of::<Self>()`.
                 start: _,
             } = self;
-            // Box<[Shard]> heap: stride of one Shard times shard count.
-            let shards_storage = shards.len() * mem::size_of::<Shard<K, V>>();
-            let shards_inner: usize = shards.iter().map(|sh| sh.read().extra_size()).sum();
-            shards_storage
-                + shards_inner
+            shards.extra_size()
                 + config.extra_size()
                 + hasher.extra_size()
-                + shard_shift.extra_size()
                 + shard_max_weight.extra_size()
         }
     }
