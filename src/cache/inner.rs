@@ -524,6 +524,17 @@ where
         V: 'static,
     {
         let mut st = self.shard_for(key).write();
+        // Slot-identity invariant: only the in-flight refresh job
+        // clears `refresh_inflight`, so `false` here means the slot
+        // we started refreshing was removed (or removed-then-replaced)
+        // since the job was scheduled — drop the result instead of
+        // resurrecting a value the user already evicted.
+        let still_ours = entries_find(&st.entries, &self.hasher, &st.slab, key)
+            .and_then(|id| st.slab.get(id))
+            .is_some_and(|es| es.refresh_inflight);
+        if !still_ours {
+            return;
+        }
         let now = Instant::now();
         let nw = self.config.policy.weight(key, &v).get();
         let reclaimed = reclaim(self, &mut st, nw, key, now);
