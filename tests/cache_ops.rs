@@ -402,6 +402,53 @@ mod miss {
         assert_eq!(cache.get(&k), Some("ok".to_string()));
     }
 
+    /// Concurrent sync followers on a fallible init that returns `Err`
+    /// must all observe the leader's outcome rather than each running
+    /// `init` themselves. Distinguishes a working `SyncMissFlight::wait`
+    /// from a stub that returns `None`: under the stub, followers would
+    /// loop back through the probe, find no installed entry (Err is not
+    /// cached), become leaders, and re-run `init`, blowing past the
+    /// single-flight guarantee on the error path.
+    #[test]
+    fn concurrent_try_get_with_blocking_err_runs_init_once() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        #[derive(Clone, PartialEq, Eq, Debug)]
+        struct E;
+
+        let cache = Arc::new(test_cache());
+        let k = "sync_err_shared".to_string();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let workers = 8usize;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let cache = Arc::clone(&cache);
+            let k = k.clone();
+            let calls = Arc::clone(&calls);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                cache.try_get_with_blocking::<_, E>(k.clone(), |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    Err(E)
+                })
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), Err(E));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "sync miss coalescing must run a failing init exactly once across waiters",
+        );
+        assert_eq!(cache.get(&k), None, "Err outcomes must not be cached");
+    }
+
     /// Sync miss-coalescing: many sync waiters on the same key share one
     /// init invocation. Mirrors the async `concurrent_get_with_same_key`
     /// guarantee but exercises the Condvar-backed path.
@@ -2187,6 +2234,28 @@ mod s3_fifo {
             Some("v".into()),
             "warm key (freq=3) must survive a 200-entry cold scan",
         );
+    }
+
+    /// `evict_from_small` uses a strict `freq > 1` test to decide
+    /// promote vs evict, so a single-read entry (`freq == 1`) is still
+    /// considered cold and evicted. Distinguishes the live `>` from a
+    /// `>=` slip that would let warm-once entries dodge eviction.
+    #[test]
+    fn freq_one_does_not_promote_on_small_reclaim() {
+        let cache = small_cache(2);
+        cache.insert("once".into(), "v1".into());
+        let _ = cache.get("once");
+        cache.insert("cold".into(), "vc".into());
+
+        cache.insert("new".into(), "vn".into());
+
+        assert_eq!(
+            cache.get("once"),
+            None,
+            "freq=1 must evict on Small reclaim, not promote to Main",
+        );
+        assert_eq!(cache.get("cold"), Some("vc".into()));
+        assert_eq!(cache.get("new"), Some("vn".into()));
     }
 
     /// Two slots in Small, one read twice (warm) and one untouched
