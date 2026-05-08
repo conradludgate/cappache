@@ -52,10 +52,8 @@ pub(super) struct EntrySlot<K, V> {
     /// Intrusive sibling links for the deadline-bucket list this slot
     /// belongs to. `None` for slots without a finite deadline.
     /// Maintained alongside `entry.deadline`, which identifies the
-    /// owning bucket. Wired up by `ExpiryBuckets`; allow until then.
-    #[allow(dead_code)]
+    /// owning bucket.
     pub(super) expiry_prev: Option<SlotKey>,
-    #[allow(dead_code)]
     pub(super) expiry_next: Option<SlotKey>,
     /// `true` while a `try_revalidate` job for this key is in flight.
     /// Held on the slot to skip a per-revalidate `K::clone() + hash +

@@ -101,54 +101,6 @@ mod shard_tests {
         }
     }
 
-    /// `IdleTimeout` pushes a fresh deadline tuple per read; without a
-    /// rebuild trigger the heap grows without bound. The trigger fires
-    /// once stale tuples exceed live slab size.
-    #[test]
-    fn heap_stays_bounded_under_read_extending_policy() {
-        use std::time::Duration;
-
-        use crate::policy::{IdleTimeout, Weight};
-
-        let policy: DynPolicy<K, V> = Arc::new(IdleTimeout::new(
-            Duration::from_mins(1),
-            crate::policy::DefaultPolicy,
-        ));
-        // `shards=2` halves the per-shard cap; double max_weight so
-        // shard 0 (where SingleShardHasher pins everything) caps at 8.
-        let cfg = CacheBuilder::<K, V>::new()
-            .max_weight(Weight::new(16))
-            .shards(2)
-            .hasher(super::SingleShardHasher)
-            .policy(policy)
-            .build();
-        let inner = Arc::new(Inner::new(cfg));
-
-        for i in 0..8 {
-            inner.insert(format!("k{i}"), "v".to_string());
-        }
-
-        for _ in 0..1024 {
-            for i in 0..8 {
-                let _ = inner.get_served(&format!("k{i}"));
-            }
-        }
-
-        let occupied = inner
-            .shards
-            .shards()
-            .iter()
-            .find(|s| !s.read().slab.is_empty())
-            .expect("at least one shard holds the inserted keys");
-        let st = occupied.write();
-        let live = st.slab.len();
-        let heap_len = st.expiry.len();
-        assert!(
-            heap_len <= 2 * live + 1,
-            "expiry heap grew to {heap_len} for {live} live entries; rebuild trigger broken",
-        );
-    }
-
     /// Filling one shard must not evict entries from another.
     #[test]
     fn eviction_stays_within_the_owning_shard() {

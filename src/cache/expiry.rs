@@ -1,95 +1,137 @@
 //! Time-based eviction primitives.
 //!
-//! Min-heap of `(deadline, slot)` tuples; tuples are validated lazily on
-//! pop so stale ones (recycled slot, deadline shifted by a read hook)
-//! self-discard. [`expiry_push_extend`] tracks a `stale_pushes` counter
-//! and rebuilds the heap from the slab once stale pushes exceed live
-//! entries — keeps memory bounded under read-extending policies.
+//! Per shard the cache keeps deadlines in [`ExpiryBuckets`]: a sorted
+//! map from deadline tick to an intrusive doubly-linked list of slots
+//! expiring at that tick. List links live on `EntrySlot`
+//! (`expiry_prev` / `expiry_next`), so the structure adds no separate
+//! per-slot allocation; the `BTreeMap` only carries one head/tail pair
+//! per *distinct* deadline.
+//!
+//! No stale tuples accumulate: every state-changing op
+//! ([`push`], [`unlink`], [`reschedule`]) updates the bucket
+//! immediately. [`reschedule`] early-exits when the new deadline
+//! rounds to the same tick as the old, which is the common case under
+//! read-extending policies (e.g. `IdleTimeout`) sampling reads inside
+//! one of the cache's 250 ms ticks.
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::hash::{BuildHasher, Hash};
-
-use slotmap::Key;
 
 use super::clock::{NO_DEADLINE, Tick};
 use super::inner::{State, evict_slot};
-use super::slab::SlotKey;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct HeapKey {
-    pub(super) deadline: Tick,
-    pub(super) slot: SlotKey,
-}
-
-impl Ord for HeapKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Slotmap version is the stale-tuple gate on pop; the FFI bytes
-        // here only break ties to give `Ord` a total order.
-        self.deadline
-            .cmp(&other.deadline)
-            .then_with(|| self.slot.data().as_ffi().cmp(&other.slot.data().as_ffi()))
-    }
-}
-
-impl PartialOrd for HeapKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+use super::slab::{EntrySlab, SlotKey};
 
 #[derive(Default)]
-pub(super) struct ExpiryHeap(BinaryHeap<Reverse<HeapKey>>);
+pub(super) struct ExpiryBuckets {
+    by_tick: BTreeMap<Tick, BucketHead>,
+}
 
-impl ExpiryHeap {
-    pub(super) fn push(&mut self, deadline: Tick, slot: SlotKey) {
-        self.0.push(Reverse(HeapKey { deadline, slot }));
-    }
+#[derive(Clone, Copy)]
+struct BucketHead {
+    head: SlotKey,
+    tail: SlotKey,
+}
 
-    pub(super) fn peek(&self) -> Option<HeapKey> {
-        self.0.peek().map(|Reverse(k)| *k)
-    }
-
-    pub(super) fn pop(&mut self) -> Option<HeapKey> {
-        self.0.pop().map(|Reverse(k)| k)
-    }
-
+impl ExpiryBuckets {
     pub(super) fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.0.len()
+        self.by_tick.clear();
     }
 }
 
-/// Push a deadline and trigger a rebuild once stale pushes outnumber
-/// live entries. `superseded_finite = true` means the previous tuple
-/// for this slot is now stale.
-pub(super) fn expiry_push_extend<K, V>(
-    st: &mut State<K, V>,
-    deadline: Tick,
+/// Link `slot` at the tail of `bucket(deadline)`. Caller must ensure
+/// the slot's `expiry_prev` / `expiry_next` are both `None` (fresh
+/// slots from `install_ready` satisfy this; otherwise call [`unlink`]
+/// first).
+pub(super) fn push<K, V>(
+    buckets: &mut ExpiryBuckets,
+    slab: &mut EntrySlab<K, V>,
     slot: SlotKey,
-    superseded_finite: bool,
+    deadline: Tick,
 ) {
-    st.expiry.push(deadline, slot);
-    if superseded_finite {
-        st.stale_pushes = st.stale_pushes.saturating_add(1);
-        if st.stale_pushes > st.slab.len() as u64 {
-            rebuild_expiry(st);
+    if deadline == NO_DEADLINE {
+        return;
+    }
+    debug_assert!(
+        slab[slot].expiry_prev.is_none() && slab[slot].expiry_next.is_none(),
+        "expiry::push: slot already linked into a bucket",
+    );
+    match buckets.by_tick.entry(deadline) {
+        Entry::Vacant(v) => {
+            v.insert(BucketHead {
+                head: slot,
+                tail: slot,
+            });
+        }
+        Entry::Occupied(mut o) => {
+            let bucket = o.get_mut();
+            let old_tail = bucket.tail;
+            bucket.tail = slot;
+            slab[slot].expiry_prev = Some(old_tail);
+            slab[old_tail].expiry_next = Some(slot);
         }
     }
 }
 
-fn rebuild_expiry<K, V>(st: &mut State<K, V>) {
-    st.expiry.clear();
-    for (id, es) in &st.slab {
-        if es.entry.deadline != NO_DEADLINE {
-            st.expiry.push(es.entry.deadline, id);
-        }
+/// Remove `slot` from `bucket(deadline)`, dropping the bucket from
+/// the `BTreeMap` if it becomes empty. Safe to call even when the
+/// bucket has already been lifted out of the map (drain path) or
+/// when `deadline` is `NO_DEADLINE` (no-op).
+pub(super) fn unlink<K, V>(
+    buckets: &mut ExpiryBuckets,
+    slab: &mut EntrySlab<K, V>,
+    slot: SlotKey,
+    deadline: Tick,
+) {
+    if deadline == NO_DEADLINE {
+        return;
     }
-    st.stale_pushes = 0;
+    let prev = std::mem::take(&mut slab[slot].expiry_prev);
+    let next = std::mem::take(&mut slab[slot].expiry_next);
+
+    // Patch sibling pointers. `get_mut` is defensive against the drain
+    // path, where neighbours may have been slab-removed already.
+    if let Some(p) = prev
+        && let Some(es) = slab.get_mut(p)
+    {
+        es.expiry_next = next;
+    }
+    if let Some(n) = next
+        && let Some(es) = slab.get_mut(n)
+    {
+        es.expiry_prev = prev;
+    }
+
+    // Patch bucket head/tail. The bucket may be missing during drain,
+    // which removes the BTreeMap entry up front.
+    let Some(bucket) = buckets.by_tick.get_mut(&deadline) else {
+        return;
+    };
+    match (prev, next) {
+        (None, None) => {
+            buckets.by_tick.remove(&deadline);
+        }
+        (None, Some(n)) => bucket.head = n,
+        (Some(p), None) => bucket.tail = p,
+        (Some(_), Some(_)) => {} // mid-list: head/tail unchanged
+    }
+}
+
+/// Move `slot` from `bucket(old)` to `bucket(new)`. Early-exits when
+/// `old == new` — the dominant case under read-extending policies
+/// when reads land inside the same 250 ms tick.
+pub(super) fn reschedule<K, V>(
+    buckets: &mut ExpiryBuckets,
+    slab: &mut EntrySlab<K, V>,
+    slot: SlotKey,
+    old: Tick,
+    new: Tick,
+) {
+    if old == new {
+        return;
+    }
+    unlink(buckets, slab, slot, old);
+    push(buckets, slab, slot, new);
 }
 
 /// Drain entries whose deadline is at or before `now_tick`. `skip_key`,
@@ -106,26 +148,27 @@ where
     H: BuildHasher,
 {
     let mut out = Vec::new();
-    while let Some(top) = st.expiry.peek() {
-        if top.deadline > now_tick {
+    while let Some((&tick, _)) = st.expiry.by_tick.first_key_value() {
+        if tick > now_tick {
             break;
         }
-        st.expiry.pop();
-        let Some(es) = st.slab.get(top.slot) else {
-            continue;
-        };
-        // Read hook superseded this tuple — drop it, the live slot has
-        // a fresh tuple in the heap already.
-        if es.entry.deadline != top.deadline {
-            continue;
-        }
-        if let Some(skip) = skip_key
-            && &es.key == skip
-        {
-            continue;
-        }
-        if let Some((k, v, _)) = evict_slot(st, hasher, top.slot) {
-            out.push((k, v));
+        // Lift the bucket out of the map up front. Per-slot `unlink`
+        // calls inside `evict_slot` then no-op on the bucket lookup,
+        // confining the bookkeeping to the slab fields.
+        let bucket = st.expiry.by_tick.remove(&tick).expect("first_key_value just yielded this tick");
+        let mut cursor = Some(bucket.head);
+        while let Some(slot) = cursor {
+            let next = st.slab.get(slot).and_then(|es| es.expiry_next);
+            if let Some(skip) = skip_key
+                && st.slab.get(slot).is_some_and(|es| &es.key == skip)
+            {
+                cursor = next;
+                continue;
+            }
+            if let Some((k, v, _)) = evict_slot(st, hasher, slot) {
+                out.push((k, v));
+            }
+            cursor = next;
         }
     }
     out
@@ -137,11 +180,14 @@ mod typesize_impls {
 
     use typesize::TypeSize;
 
-    use super::{ExpiryHeap, HeapKey, Reverse};
+    use super::{BucketHead, ExpiryBuckets, Tick};
 
-    impl TypeSize for ExpiryHeap {
+    impl TypeSize for ExpiryBuckets {
         fn extra_size(&self) -> usize {
-            self.0.capacity() * mem::size_of::<Reverse<HeapKey>>()
+            // BTreeMap doesn't expose its node-array overhead. Use the
+            // payload-only floor — stable across stdlib BTreeMap shape
+            // changes, undercounts by a small per-node constant.
+            self.by_tick.len() * (mem::size_of::<Tick>() + mem::size_of::<BucketHead>())
         }
     }
 }

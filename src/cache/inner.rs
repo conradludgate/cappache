@@ -8,7 +8,7 @@ use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
 
 use super::clock;
-use super::expiry::{ExpiryHeap, expiry_push_extend};
+use super::expiry::{self, ExpiryBuckets};
 use super::flight::InflightLane;
 use super::reclaim::{Reclaimed, reclaim};
 use super::slab::{CacheEntry, EntrySlab, EntrySlot, Fifo, GhostSet, Queue, SlotKey};
@@ -115,13 +115,9 @@ pub(crate) struct State<K, V> {
     /// Cached `sum(weight)` over Small. Maintained eagerly on
     /// install/evict so reclaim's drain decision is O(1).
     pub(super) small_weight: u64,
-    /// Min-heap of `(deadline, slot)` tuples; lazily validated on pop
-    /// (slotmap version + deadline equality).
-    pub(super) expiry: ExpiryHeap,
-    /// Heap pushes that left a stale tuple behind. Triggers a rebuild
-    /// when it exceeds `slab.len()` so memory stays bounded under
-    /// read-extending policies.
-    pub(super) stale_pushes: u64,
+    /// Sorted bucket map keyed by deadline tick. Each bucket holds an
+    /// intrusive doubly-linked list of slots (links on `EntrySlot`).
+    pub(super) expiry: ExpiryBuckets,
     pub(crate) total_weight: u64,
 }
 
@@ -153,12 +149,18 @@ impl<K, V> State<K, V> {
             Queue::Main => self.main.pop_tail(&mut self.slab),
         }
     }
+
+    /// Helper that borrows `expiry` and `slab` simultaneously without
+    /// requiring callers to deref a lock guard.
+    pub(super) fn expiry_reschedule(&mut self, slot: SlotKey, old: clock::Tick, new: clock::Tick) {
+        expiry::reschedule(&mut self.expiry, &mut self.slab, slot, old, new);
+    }
 }
 
-/// Removes `id` from the slab, its FIFO, and `entries`; debits weight.
-/// Returns the owned `(K, V, weight)`. Stale heap tuples and stale
-/// `entries` rows for this slot are left to self-clean via slotmap
-/// version mismatch (see [`entries_find`]).
+/// Removes `id` from the slab, its FIFO, its expiry bucket, and
+/// `entries`; debits weight. Returns the owned `(K, V, weight)`.
+/// Stale `entries` rows for this slot self-clean via slotmap version
+/// mismatch (see [`entries_find`]).
 pub(super) fn evict_slot<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
@@ -168,8 +170,12 @@ where
     K: Eq + Hash,
     H: BuildHasher,
 {
-    let queue = st.slab.get(id)?.queue;
+    let (queue, deadline) = {
+        let es = st.slab.get(id)?;
+        (es.queue, es.entry.deadline)
+    };
     st.queue_unlink(queue, id);
+    expiry::unlink(&mut st.expiry, &mut st.slab, id, deadline);
     // Take the slot out first; the `entries` probe predicate uses
     // `slab.get`, so removing the slab entry up front means we can
     // match the table row by `SlotKey` directly.
@@ -222,9 +228,7 @@ where
     }
     entries_insert(&mut st.entries, hasher, &st.slab, id, key_hash);
     st.total_weight = st.total_weight.saturating_add(weight);
-    if deadline != crate::cache::clock::NO_DEADLINE {
-        st.expiry.push(deadline, id);
-    }
+    expiry::push(&mut st.expiry, &mut st.slab, id, deadline);
     id
 }
 
@@ -306,8 +310,7 @@ where
             main: Fifo::default(),
             ghost: GhostSet::new(DEFAULT_GHOST_CAP_PER_SHARD),
             small_weight: 0,
-            expiry: ExpiryHeap::default(),
-            stale_pushes: 0,
+            expiry: ExpiryBuckets::default(),
             total_weight: 0,
         });
         let hasher = config.hasher.clone();
@@ -354,9 +357,7 @@ where
                 update_read_deadline(&es.key, &mut es.entry, &self.config.policy, self.start, now);
             (value, update)
         };
-        if let Some(dl) = update.new_deadline {
-            expiry_push_extend(&mut st, dl, id, update.superseded_finite);
-        }
+        st.expiry_reschedule(id, update.prev, update.new);
         Some(value)
     }
 
@@ -422,7 +423,6 @@ where
             st.ghost.clear();
             st.entries.clear();
             st.expiry.clear();
-            st.stale_pushes = 0;
             st.total_weight = 0;
             st.small_weight = 0;
 
@@ -601,12 +601,12 @@ pub(super) fn entry_is_served<V>(e: &CacheEntry<V>, now_tick: clock::Tick) -> bo
 const DEFAULT_GHOST_CAP_PER_SHARD: usize = 1024;
 
 pub(super) struct ReadDeadlineUpdate {
-    /// `Some` only when the read hook transitioned to a fresh finite
-    /// deadline the caller still has to push into the heap.
-    pub(super) new_deadline: Option<clock::Tick>,
-    /// `true` when the prior deadline was finite — the heap now holds
-    /// a stale tuple that contributes to the rebuild trigger.
-    pub(super) superseded_finite: bool,
+    /// Slot's deadline before this read; `NO_DEADLINE` if the slot
+    /// was time-unbounded.
+    pub(super) prev: clock::Tick,
+    /// Slot's deadline after this read; `NO_DEADLINE` if the policy
+    /// transitioned to time-unbounded.
+    pub(super) new: clock::Tick,
 }
 
 pub(super) fn update_read_deadline<K, V, P>(
@@ -621,15 +621,15 @@ where
     V: 'static,
     P: Policy<K, V> + ?Sized,
 {
-    let prev_tick = e.deadline;
-    let time_remaining = if prev_tick == clock::NO_DEADLINE {
+    let prev = e.deadline;
+    let time_remaining = if prev == clock::NO_DEADLINE {
         crate::policy::TIME_UNBOUNDED
     } else {
-        clock::tick_to_instant(start, prev_tick).saturating_duration_since(now)
+        clock::tick_to_instant(start, prev).saturating_duration_since(now)
     };
     let written_at = clock::tick_to_instant(start, e.written_at);
     let d = policy.expire_after_read(key, &e.value, now, written_at, time_remaining);
-    let new_tick = if d >= crate::policy::TIME_UNBOUNDED {
+    let new = if d >= crate::policy::TIME_UNBOUNDED {
         clock::NO_DEADLINE
     } else {
         match now.checked_add(d) {
@@ -637,16 +637,8 @@ where
             None => clock::NO_DEADLINE,
         }
     };
-    e.deadline = new_tick;
-    let new_deadline = if new_tick != clock::NO_DEADLINE && new_tick != prev_tick {
-        Some(new_tick)
-    } else {
-        None
-    };
-    ReadDeadlineUpdate {
-        new_deadline,
-        superseded_finite: new_deadline.is_some() && prev_tick != clock::NO_DEADLINE,
-    }
+    e.deadline = new;
+    ReadDeadlineUpdate { prev, new }
 }
 
 #[cfg(test)]
@@ -711,7 +703,6 @@ mod typesize_impls {
                 ghost,
                 expiry,
                 small_weight,
-                stale_pushes,
                 total_weight,
             } = self;
             entries_extra(entries)
@@ -722,7 +713,6 @@ mod typesize_impls {
                 + ghost.extra_size()
                 + expiry.extra_size()
                 + small_weight.extra_size()
-                + stale_pushes.extra_size()
                 + total_weight.extra_size()
         }
     }
