@@ -1,7 +1,10 @@
 use std::any::TypeId;
 use std::borrow::Borrow;
 use std::cell::Cell;
+use std::future::Future;
 use std::hash::{BuildHasher, Hash};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use clashcore::ClashCollection;
@@ -72,6 +75,33 @@ pub(super) const FREQ_CAP: u8 = 3;
 /// a write would otherwise have to evict still-served entries to fit
 /// — expired entries are always preferred over size eviction.
 pub(super) const WRITE_EXPIRY_BUDGET: usize = 16;
+
+/// Per-batch drain ceiling for [`Inner::run_pending_tasks`]. Sized
+/// larger than `WRITE_EXPIRY_BUDGET` because the background path is
+/// optimising for throughput-per-yield rather than per-write latency,
+/// but still small enough that one batch under one shard's write lock
+/// stays well under typical "responsive" lock-hold targets.
+pub(super) const BACKGROUND_DRAIN_BATCH: usize = 64;
+
+/// Cooperative yield that doesn't pin the cache to a specific runtime.
+/// Returns `Pending` once after self-rewaking; the next poll observes
+/// `Ready(())`. Equivalent in spirit to `tokio::task::yield_now`.
+fn yield_once() -> impl Future<Output = ()> {
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    YieldOnce(false)
+}
 
 /// Lookup keyed by `K` against the [`SlotKey`]-only `entries` table.
 /// Equality goes through the slab, so a recycled slot (slotmap version
@@ -477,6 +507,65 @@ where
                 self.notify_lifecycle(LifecycleReason::Removed, k, Some(v));
             }
         }
+    }
+
+    /// Drains every time-expired entry across all shards, firing
+    /// `TimeExpired` for each. Walks shards round-robin one
+    /// [`BACKGROUND_DRAIN_BATCH`]-sized batch at a time, releasing the
+    /// shard write lock and yielding to the executor between batches.
+    /// Terminates after one full round with no entries drained.
+    ///
+    /// Cancel-safe: each batch's lock acquire / drain / lifecycle fire
+    /// runs synchronously inside `with_reclaim_buf`, so dropping the
+    /// future between yields cannot leave the shard locked or the TLS
+    /// buffer half-populated.
+    pub(crate) async fn run_pending_tasks(&self)
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let shards = self.shards.shards();
+        let n = shards.len();
+        if n == 0 {
+            return;
+        }
+        let mut idx = 0usize;
+        let mut idle_run = 0usize;
+        while idle_run < n {
+            let drained_any = self.drain_one_shard_batch(&shards[idx]);
+            idle_run = if drained_any { 0 } else { idle_run + 1 };
+            idx = (idx + 1) % n;
+            yield_once().await;
+        }
+    }
+
+    /// Returns `true` iff this batch evicted at least one entry. `now`
+    /// is refreshed per call so a long [`Self::run_pending_tasks`] run
+    /// catches entries that expire mid-traversal.
+    fn drain_one_shard_batch(&self, shard: &Shard<K, V>) -> bool
+    where
+        K: 'static,
+        V: 'static,
+    {
+        let now = Instant::now();
+        let now_tick = clock::floor_tick(self.start, now);
+        self.with_reclaim_buf(|buf| {
+            let mut st = shard.write();
+            let _ = expiry::drain_expired(
+                &mut st,
+                &self.hasher,
+                now_tick,
+                None,
+                buf,
+                BACKGROUND_DRAIN_BATCH,
+            );
+            drop(st);
+            let drained = !buf.is_empty();
+            for (k, v) in buf.drain(..) {
+                self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
+            }
+            drained
+        })
     }
 
     pub(crate) fn insert(&self, key: K, value: V) -> Option<V>

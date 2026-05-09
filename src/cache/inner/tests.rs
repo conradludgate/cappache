@@ -243,3 +243,110 @@ mod s3_fifo_tests {
         );
     }
 }
+
+mod background_cleanup {
+    //! White-box drive of [`Inner::run_pending_tasks`] using a noop
+    //! waker so the round-robin shard walk + termination logic can be
+    //! exercised without an async runtime.
+
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::super::*;
+    use crate::config::{CacheBuilder, DynPolicy};
+    use crate::policy::{DefaultPolicy, TtlFromWrite, Weight};
+
+    type K = String;
+    type V = String;
+
+    /// Multi-shard cache with a 1-tick TTL (rounded up by `ceil_tick`
+    /// to one 250 ms quantum). After a 300 ms sleep every inserted
+    /// entry sits in a `by_tick` bucket strictly less than the current
+    /// tick, so [`drain_expired`] is guaranteed to evict it.
+    fn build_ttl_cache(shards: usize) -> Arc<Inner<K, V, DynPolicy<K, V>>> {
+        let policy: DynPolicy<K, V> =
+            Arc::new(TtlFromWrite::new(Duration::from_millis(1), DefaultPolicy));
+        let cfg = CacheBuilder::<K, V>::new()
+            .max_weight(Weight::new(1024))
+            .shards(shards)
+            .policy(policy)
+            .build();
+        Arc::new(Inner::new(cfg))
+    }
+
+    fn poll_to_completion<F: Future<Output = ()>>(fut: F) {
+        let mut fut = pin!(fut);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(()) = fut.as_mut().poll(&mut cx) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn run_pending_tasks_drains_every_shard() {
+        const N: usize = 32;
+        let inner = build_ttl_cache(4);
+        for i in 0..N {
+            inner.insert(format!("k{i:02}"), format!("v{i}"));
+        }
+        thread::sleep(Duration::from_millis(300));
+
+        poll_to_completion(inner.run_pending_tasks());
+
+        for shard in inner.shards.shards() {
+            let st = shard.read();
+            assert_eq!(
+                st.slab.len(),
+                0,
+                "every shard must be empty after run_pending_tasks",
+            );
+        }
+    }
+
+    /// Empty cache: termination check (`idle_run` rolls over to `n` on
+    /// the first full pass) must complete in `n` iterations rather
+    /// than spin forever.
+    #[test]
+    fn run_pending_tasks_returns_promptly_on_empty_cache() {
+        let inner = build_ttl_cache(4);
+        poll_to_completion(inner.run_pending_tasks());
+    }
+
+    /// Some shards have entries to drain, others don't. Round-robin
+    /// must visit empty shards too (advancing `idle_run`) but reset
+    /// the counter as soon as a non-empty shard yields work.
+    #[test]
+    fn run_pending_tasks_handles_mixed_per_shard_workload() {
+        const TARGET_SHARD_KEYS: usize = 80; // > BACKGROUND_DRAIN_BATCH so multiple batches hit one shard
+        let inner = build_ttl_cache(4);
+
+        let target_shard_ptr = std::ptr::from_ref(inner.shard_for(&"anchor".to_string()));
+        let mut placed = 0usize;
+        let mut counter = 0u32;
+        while placed < TARGET_SHARD_KEYS && counter < 100_000 {
+            let candidate = format!("hot-{counter}");
+            if std::ptr::eq(
+                std::ptr::from_ref(inner.shard_for(&candidate)),
+                target_shard_ptr,
+            ) {
+                inner.insert(candidate, "v".into());
+                placed += 1;
+            }
+            counter += 1;
+        }
+        assert_eq!(placed, TARGET_SHARD_KEYS, "could not pack target shard");
+        thread::sleep(Duration::from_millis(300));
+
+        poll_to_completion(inner.run_pending_tasks());
+
+        for shard in inner.shards.shards() {
+            assert_eq!(shard.read().slab.len(), 0, "post-cleanup shard not empty");
+        }
+    }
+}

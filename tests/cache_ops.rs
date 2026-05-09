@@ -2993,3 +2993,148 @@ mod expiry_budget {
         .await;
     }
 }
+
+mod background_cleanup {
+    //! Integration tests for [`Cache::run_pending_tasks`]: full drain
+    //! across every shard, cooperative yields between batches, and
+    //! cancel-safety when the caller drops the future mid-flight.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    fn build_ttl_cache(
+        shards: usize,
+        ttl: Duration,
+        listener: Arc<dyn LifecycleListener<K, V> + Send + Sync>,
+    ) -> Cache<K, V> {
+        let policy: DynPolicy<K, V> = Arc::new(TtlFromWrite::new(ttl, DefaultPolicy));
+        Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(4096))
+                .shards(shards)
+                .policy(policy)
+                .lifecycle_listener(listener)
+                .build(),
+        )
+    }
+
+    /// 64 entries spread across 8 shards expire after 200 ms; one
+    /// `run_pending_tasks().await` must drain every shard, not just
+    /// the one the caller's task happens to be on.
+    #[tokio::test]
+    async fn run_pending_tasks_drains_every_shard() {
+        with_timeout(Duration::from_secs(30), async {
+            const N: u32 = 64;
+            let (listener, log) = RecordingListener::new_pair();
+            let cache = build_ttl_cache(8, Duration::from_millis(200), listener);
+            for i in 0..N {
+                cache.insert(format!("k{i:02}"), format!("v{i}"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            log.lock().unwrap().clear();
+
+            cache.run_pending_tasks().await;
+
+            assert!(cache.is_empty(), "cache must be drained after cleanup");
+            let events = log.lock().unwrap().clone();
+            let expired: usize = events
+                .iter()
+                .filter(|(r, _, _)| *r == LifecycleReason::TimeExpired)
+                .count();
+            assert_eq!(
+                expired, N as usize,
+                "every entry must surface one TimeExpired event; got {events:?}",
+            );
+        })
+        .await;
+    }
+
+    /// Drive `run_pending_tasks` concurrently with a self-rescheduling
+    /// task that flips a flag every time it gets to run. If
+    /// `run_pending_tasks` ever yielded, the flag must flip at least
+    /// once before the future completes.
+    #[tokio::test]
+    async fn run_pending_tasks_yields_between_batches() {
+        with_timeout(Duration::from_secs(30), async {
+            // Pack > BACKGROUND_DRAIN_BATCH (=64) into a single shard
+            // so the future has to do at least two batches and yield
+            // in between them.
+            const N: u32 = 96;
+            let (listener, _log) = RecordingListener::new_pair();
+            let cache = build_ttl_cache(2, Duration::from_millis(200), listener);
+            for i in 0..N {
+                cache.insert(format!("k{i:04}"), format!("v{i}"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let observer_ran = Arc::new(AtomicBool::new(false));
+            let observer_flag = Arc::clone(&observer_ran);
+            let cleanup_done = Arc::new(AtomicBool::new(false));
+            let cleanup_flag = Arc::clone(&cleanup_done);
+
+            let observer = tokio::spawn(async move {
+                while !cleanup_flag.load(Ordering::SeqCst) {
+                    observer_flag.store(true, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            cache.run_pending_tasks().await;
+            cleanup_done.store(true, Ordering::SeqCst);
+            // Let the observer notice the flag and exit.
+            observer.await.unwrap();
+
+            assert!(
+                observer_ran.load(Ordering::SeqCst),
+                "run_pending_tasks must yield at least once so other tasks can run",
+            );
+            assert!(cache.is_empty(), "cache must be empty after cleanup");
+        })
+        .await;
+    }
+
+    /// Drop the cleanup future mid-flight via `tokio::time::timeout`;
+    /// the cache must still be in a valid state and a follow-up call
+    /// must complete the drain without panic or leak.
+    #[tokio::test]
+    async fn run_pending_tasks_cancel_safe() {
+        with_timeout(Duration::from_secs(30), async {
+            const N: u32 = 256;
+            let (listener, log) = RecordingListener::new_pair();
+            let cache = build_ttl_cache(4, Duration::from_millis(200), listener);
+            for i in 0..N {
+                cache.insert(format!("k{i:04}"), format!("v{i}"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            log.lock().unwrap().clear();
+
+            // 0 ns timeout — future is dropped before it can fire its
+            // first batch. Cache must remain consistent (no held lock,
+            // no half-populated TLS buffer).
+            let _ = tokio::time::timeout(Duration::from_nanos(1), cache.run_pending_tasks()).await;
+
+            // Foreground inserts must still succeed; this would block
+            // forever if a shard write lock had been leaked.
+            cache.insert("after-cancel".into(), "v".into());
+            assert!(cache.contains_key("after-cancel"));
+
+            cache.run_pending_tasks().await;
+
+            let events = log.lock().unwrap().clone();
+            let expired: usize = events
+                .iter()
+                .filter(|(r, _, _)| *r == LifecycleReason::TimeExpired)
+                .count();
+            assert_eq!(
+                expired, N as usize,
+                "follow-up cleanup must drain all originally-expired entries; got {events:?}",
+            );
+            assert!(
+                cache.contains_key("after-cancel"),
+                "the post-cancel insert must survive the second cleanup",
+            );
+        })
+        .await;
+    }
+}

@@ -289,6 +289,27 @@ where
         self.inner.clear();
     }
 
+    /// Drains every time-expired entry across all shards, firing `TimeExpired` for
+    /// each. The cache otherwise only reclaims expired entries lazily on the next
+    /// write to the affected shard, so call this from a periodic background task
+    /// on a runtime-of-your-choice timer (e.g. `tokio::time::interval`) when you
+    /// have TTL-bound entries on shards that aren't being written to.
+    ///
+    /// Cooperative: walks shards round-robin one batch at a time, releasing the
+    /// shard write lock and yielding to the executor between batches so no
+    /// foreground caller waits longer than one drain batch.
+    ///
+    /// Cancel-safe: dropping the future stops further batches without leaving
+    /// any shard locked or any partial state behind; already-evicted entries
+    /// stay evicted.
+    pub async fn run_pending_tasks(&self)
+    where
+        K: 'static,
+        V: 'static,
+    {
+        self.inner.run_pending_tasks().await;
+    }
+
     /// Runs the miss initializer for `key` when absent or not yet served, coalescing concurrent waiters.
     ///
     /// # Errors
