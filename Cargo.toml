@@ -9,6 +9,7 @@ clashcore = { git = "https://github.com/conradludgate/clashmap.git", branch = "p
 hashbrown = "0.17"
 pin-project-lite = "0.2"
 slotmap = "1"
+thread_local = "1"
 tokio = { version = "1", features = ["sync"] }
 typesize = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
