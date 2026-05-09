@@ -17,37 +17,43 @@ use super::inner::{
     FREQ_CAP, Inner, Shard, State, deadline_after_write, entries_find, entry_is_served, evict_slot,
     install_ready, update_read_deadline,
 };
-use super::reclaim::{Reclaimed, reclaim};
+use super::reclaim::reclaim;
 use super::slab::CacheEntry;
 use crate::lifecycle::LifecycleReason;
 use crate::policy::Policy;
 
 impl<K, V, P, S> Inner<K, V, P, S>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + Send + 'static,
+    V: Send + 'static,
     P: Policy<K, V>,
     S: BuildHasher,
 {
     /// Installs a fresh `Ready` slot for a leader's miss outcome.
-    /// Returned `displaced` is the prior value when a concurrent
-    /// `Cache::insert` for the same key landed while the leader was
-    /// running its `init`; the caller fires `Updated` for it.
+    /// Pushes time-expired and size-evicted victims into `out` (caller
+    /// fires `TimeExpired` for `out[..expired_end]` and `EvictedSize`
+    /// for `out[expired_end..]`). Returned `displaced` is the prior
+    /// `(K, V)` when a concurrent `Cache::insert` for the same key
+    /// landed while the leader was running its `init`; the caller
+    /// fires `Updated` for it. Captured as `(K, V)` (not just `V`) so
+    /// the displaced K's destructor runs out-of-lock.
     pub(super) fn finish_miss_ok(
         &self,
         st: &mut State<K, V>,
         key: &K,
         v: &V,
         now: Instant,
-    ) -> (Reclaimed<K, V>, Option<V>)
+        out: &mut Vec<(K, V)>,
+    ) -> (usize, Option<(K, V)>)
     where
         K: Clone + 'static,
         V: Clone + 'static,
     {
         let deadline = deadline_after_write(&self.config.policy, key, v, self.start, now);
         let nw = self.config.policy.weight(key, v).get();
-        let reclaimed = reclaim(self, st, nw, key, now);
+        let expired_end = reclaim(self, st, nw, key, now, out);
         let displaced = entries_find(&st.entries, &self.hasher, &st.slab, key)
-            .and_then(|id| evict_slot(st, &self.hasher, id).map(|(_, prev, _)| prev));
+            .and_then(|id| evict_slot(st, &self.hasher, id).map(|(k, prev, _)| (k, prev)));
         install_ready(
             st,
             &self.hasher,
@@ -59,7 +65,7 @@ where
             },
             nw,
         );
-        (reclaimed, displaced)
+        (expired_end, displaced)
     }
 
     /// Hit/expiry pre-check inside one critical section. Drops + retakes
@@ -174,39 +180,47 @@ where
                     };
                     let fut = init();
                     let res = fut.await;
-                    let mut st = guard.inner.shard_for(&key).write();
-                    remove_lane(
-                        &mut st,
-                        &key,
-                        TypeId::of::<MissFlight<V, E>>(),
-                        Arc::as_ptr(&guard.flight).cast::<()>(),
-                    );
+                    self.with_reclaim_buf(|buf| {
+                        let mut st = guard.inner.shard_for(&key).write();
+                        remove_lane(
+                            &mut st,
+                            &key,
+                            TypeId::of::<MissFlight<V, E>>(),
+                            Arc::as_ptr(&guard.flight).cast::<()>(),
+                        );
 
-                    let finish = if let Ok(v) = &res {
-                        let now = Instant::now();
-                        Some(self.finish_miss_ok(&mut st, &key, v, now))
-                    } else {
-                        None
-                    };
+                        let finish = if let Ok(v) = &res {
+                            let now = Instant::now();
+                            Some(self.finish_miss_ok(&mut st, &key, v, now, buf))
+                        } else {
+                            None
+                        };
 
-                    // Publish under the lock: a follower that wakes and
-                    // immediately calls `get(key)` must not observe
-                    // "settled but not yet installed in entries".
-                    guard.flight.publish_result(res.clone());
-                    guard.armed = false;
-                    drop(guard);
-                    drop(st);
+                        // Publish under the lock: a follower that wakes
+                        // and immediately calls `get(key)` must not
+                        // observe "settled but not yet installed in
+                        // entries".
+                        guard.flight.publish_result(res.clone());
+                        guard.armed = false;
+                        drop(guard);
+                        drop(st);
 
-                    if let Some((rec, displaced)) = finish {
-                        if let Some(prev) = displaced {
-                            self.notify_lifecycle(
-                                LifecycleReason::Updated,
-                                key.clone(),
-                                Some(prev),
-                            );
+                        if let Some((expired_end, displaced)) = finish {
+                            if let Some((_displaced_k, prev_v)) = displaced {
+                                self.notify_lifecycle(
+                                    LifecycleReason::Updated,
+                                    key.clone(),
+                                    Some(prev_v),
+                                );
+                            }
+                            for (k, v) in buf.drain(..expired_end) {
+                                self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
+                            }
+                            for (k, v) in buf.drain(..) {
+                                self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
+                            }
                         }
-                        self.fire_reclaim(rec);
-                    }
+                    });
                     return res;
                 }
             }
@@ -243,36 +257,43 @@ where
                         armed: true,
                     };
                     let res = init(&key);
-                    let mut st = guard.inner.shard_for(&key).write();
-                    remove_lane(
-                        &mut st,
-                        &key,
-                        TypeId::of::<SyncMissFlight<V, E>>(),
-                        Arc::as_ptr(&guard.flight).cast::<()>(),
-                    );
+                    self.with_reclaim_buf(|buf| {
+                        let mut st = guard.inner.shard_for(&key).write();
+                        remove_lane(
+                            &mut st,
+                            &key,
+                            TypeId::of::<SyncMissFlight<V, E>>(),
+                            Arc::as_ptr(&guard.flight).cast::<()>(),
+                        );
 
-                    let finish = if let Ok(v) = &res {
-                        let now = Instant::now();
-                        Some(self.finish_miss_ok(&mut st, &key, v, now))
-                    } else {
-                        None
-                    };
+                        let finish = if let Ok(v) = &res {
+                            let now = Instant::now();
+                            Some(self.finish_miss_ok(&mut st, &key, v, now, buf))
+                        } else {
+                            None
+                        };
 
-                    guard.flight.publish_result(res.clone());
-                    guard.armed = false;
-                    drop(guard);
-                    drop(st);
+                        guard.flight.publish_result(res.clone());
+                        guard.armed = false;
+                        drop(guard);
+                        drop(st);
 
-                    if let Some((rec, displaced)) = finish {
-                        if let Some(prev) = displaced {
-                            self.notify_lifecycle(
-                                LifecycleReason::Updated,
-                                key.clone(),
-                                Some(prev),
-                            );
+                        if let Some((expired_end, displaced)) = finish {
+                            if let Some((_displaced_k, prev_v)) = displaced {
+                                self.notify_lifecycle(
+                                    LifecycleReason::Updated,
+                                    key.clone(),
+                                    Some(prev_v),
+                                );
+                            }
+                            for (k, v) in buf.drain(..expired_end) {
+                                self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
+                            }
+                            for (k, v) in buf.drain(..) {
+                                self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
+                            }
                         }
-                        self.fire_reclaim(rec);
-                    }
+                    });
                     return res;
                 }
             }

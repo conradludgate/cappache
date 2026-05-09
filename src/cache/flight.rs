@@ -286,7 +286,7 @@ where
 pub(super) struct LeaderGuard<'a, F, K, V, P, S>
 where
     F: Flight,
-    K: Eq + Hash + 'static,
+    K: Eq + Hash + Send + 'static,
     V: Clone + Send + Sync + 'static,
     P: 'static,
     S: BuildHasher + 'static,
@@ -300,7 +300,7 @@ where
 impl<F, K, V, P, S> Drop for LeaderGuard<'_, F, K, V, P, S>
 where
     F: Flight,
-    K: Eq + Hash + 'static,
+    K: Eq + Hash + Send + 'static,
     V: Clone + Send + Sync + 'static,
     P: 'static,
     S: BuildHasher + 'static,

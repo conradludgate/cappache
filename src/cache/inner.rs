@@ -1,16 +1,18 @@
 use std::any::TypeId;
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
 use clashcore::ClashCollection;
 use clashcore::lock::RwLock;
 use hashbrown::{DefaultHashBuilder, HashMap, HashTable};
+use thread_local::ThreadLocal;
 
 use super::clock;
 use super::expiry::{self, ExpiryBuckets};
 use super::flight::InflightLane;
-use super::reclaim::{Reclaimed, reclaim};
+use super::reclaim::reclaim;
 use super::slab::{CacheEntry, EntrySlab, EntrySlot, Fifo, GhostSet, Queue, SlotKey};
 use crate::config::CacheConfig;
 use crate::lifecycle::LifecycleReason;
@@ -24,7 +26,12 @@ pub(crate) enum RefreshGate {
     AbsentKey,
 }
 
-pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = DefaultHashBuilder> {
+pub(crate) struct Inner<
+    K: Send + 'static,
+    V: Send + 'static,
+    P: 'static,
+    S: 'static = DefaultHashBuilder,
+> {
     pub(crate) config: CacheConfig<K, V, P, S>,
     /// Sharded per-key state. [`ClashCollection`] does the
     /// `(h << 7) >> shift` indexing — left-shift parks the top 7 bits
@@ -42,6 +49,12 @@ pub(crate) struct Inner<K: 'static, V: 'static, P: 'static, S: 'static = Default
     pub(crate) shard_max_weight: u64,
     /// Monotonic anchor for `super::clock` ticks.
     pub(crate) start: Instant,
+    /// Per-thread scratch buffer for reclaim (`drain_expired` +
+    /// size-evictions). Reused across calls so steady-state reclaims
+    /// allocate zero. `Cell` (not `RefCell`) makes nested re-entrant
+    /// calls from a lifecycle listener safe — the inner call simply
+    /// gets a fresh `Vec::new()`.
+    pub(crate) reclaim_buf: ThreadLocal<Cell<Vec<(K, V)>>>,
 }
 
 /// `small_max_weight = shard_max_weight / SMALL_DENOMINATOR`. Yang et
@@ -234,6 +247,8 @@ where
 
 impl<K, V, P, S> Inner<K, V, P, S>
 where
+    K: Send + 'static,
+    V: Send + 'static,
     S: BuildHasher,
 {
     pub(super) fn shard_for<Q>(&self, key: &Q) -> &Shard<K, V>
@@ -263,17 +278,31 @@ where
         }
     }
 
-    pub(super) fn fire_reclaim(&self, r: Reclaimed<K, V>)
+    /// Run `f` with a thread-local reclaim buffer. The closure drains
+    /// the buffer (typically via `buf.drain(..)` into the lifecycle
+    /// dispatch loops) before returning; the helper restores the
+    /// (empty-but-capacious) `Vec` to the TLS slot for the next call.
+    /// Nested re-entrant calls on the same thread (e.g. a lifecycle
+    /// listener calling back into the cache) get a fresh `Vec::new()`
+    /// from `Cell::take` — the outer call's capacity survives, the
+    /// inner's is dropped on close.
+    pub(super) fn with_reclaim_buf<R>(&self, f: impl FnOnce(&mut Vec<(K, V)>) -> R) -> R
     where
-        K: 'static,
-        V: 'static,
+        K: Send,
+        V: Send,
     {
-        for (k, v) in r.expired {
-            self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
-        }
-        for (k, v) in r.evicted {
-            self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
-        }
+        let cell = self.reclaim_buf.get_or_default();
+        let mut buf = cell.take();
+        let r = f(&mut buf);
+        debug_assert!(
+            buf.is_empty(),
+            "reclaim buf must be drained before with_reclaim_buf returns"
+        );
+        // Belt-and-braces: covers a panicking caller that left the
+        // buffer non-empty without poisoning the TLS slot.
+        buf.clear();
+        cell.set(buf);
+        r
     }
 
     pub(super) fn notify_lifecycle(&self, reason: LifecycleReason, key: K, value: Option<V>)
@@ -320,6 +349,7 @@ where
             hasher,
             shard_max_weight,
             start: Instant::now(),
+            reclaim_buf: ThreadLocal::new(),
         }
     }
 
@@ -449,39 +479,51 @@ where
         let now = Instant::now();
         let new_w = self.config.policy.weight(&key, &value).get();
         let key_for_updated = key.clone();
-        let mut st = self.shard_for(&key).write();
+        self.with_reclaim_buf(|buf| {
+            let mut st = self.shard_for(&key).write();
 
-        // Cache `existing_id` once: derive both `prev` and the displaced
-        // eviction from it instead of probing twice.
-        let existing_id = entries_find(&st.entries, &self.hasher, &st.slab, &key);
-        let prev = existing_id.and_then(|id| st.slab.get(id).map(|es| es.entry.value.clone()));
+            let existing_id = entries_find(&st.entries, &self.hasher, &st.slab, &key);
+            let expired_end = reclaim(self, &mut st, new_w, &key, now, buf);
 
-        let reclaimed = reclaim(self, &mut st, new_w, &key, now);
+            // Capture displaced as `(K, V)` so its destructors run
+            // out-of-lock; `reclaim` skipped `skip_key`, so the slot
+            // is still valid here.
+            let displaced = existing_id
+                .and_then(|id| evict_slot(&mut st, &self.hasher, id).map(|(k, v, _)| (k, v)));
 
-        // `reclaim` skips `skip_key`, so `existing_id` is still valid.
-        if let Some(id) = existing_id {
-            let _ = evict_slot(&mut st, &self.hasher, id);
-        }
+            let deadline = deadline_after_write(&self.config.policy, &key, &value, self.start, now);
+            install_ready(
+                &mut st,
+                &self.hasher,
+                key,
+                CacheEntry {
+                    value,
+                    written_at: clock::floor_tick(self.start, now),
+                    deadline,
+                },
+                new_w,
+            );
 
-        let deadline = deadline_after_write(&self.config.policy, &key, &value, self.start, now);
-        install_ready(
-            &mut st,
-            &self.hasher,
-            key,
-            CacheEntry {
-                value,
-                written_at: clock::floor_tick(self.start, now),
-                deadline,
-            },
-            new_w,
-        );
+            drop(st);
 
-        drop(st);
-        if let Some(ref v) = prev {
-            self.notify_lifecycle(LifecycleReason::Updated, key_for_updated, Some(v.clone()));
-        }
-        self.fire_reclaim(reclaimed);
-        prev
+            let prev_v = if let Some((_displaced_k, v)) = displaced {
+                self.notify_lifecycle(
+                    LifecycleReason::Updated,
+                    key_for_updated,
+                    Some(v.clone()),
+                );
+                Some(v)
+            } else {
+                None
+            };
+            for (k, v) in buf.drain(..expired_end) {
+                self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
+            }
+            for (k, v) in buf.drain(..) {
+                self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
+            }
+            prev_v
+        })
     }
 
     pub(crate) fn remove<Q>(&self, key: &Q) -> Option<V>
@@ -525,44 +567,51 @@ where
         K: 'static,
         V: 'static,
     {
-        let mut st = self.shard_for(key).write();
-        // Slot-identity invariant: only the in-flight refresh job
-        // clears `refresh_inflight`, so `false` here means the slot
-        // we started refreshing was removed (or removed-then-replaced)
-        // since the job was scheduled — drop the result instead of
-        // resurrecting a value the user already evicted.
-        let still_ours = entries_find(&st.entries, &self.hasher, &st.slab, key)
-            .and_then(|id| st.slab.get(id))
-            .is_some_and(|es| es.refresh_inflight);
-        if !still_ours {
-            return;
-        }
-        let now = Instant::now();
-        let nw = self.config.policy.weight(key, &v).get();
-        let reclaimed = reclaim(self, &mut st, nw, key, now);
-        let displaced = match entries_find(&st.entries, &self.hasher, &st.slab, key) {
-            Some(id) => evict_slot(&mut st, &self.hasher, id).map(|(_, v, _)| v),
-            None => None,
-        };
-        let deadline = deadline_after_write(&self.config.policy, key, &v, self.start, now);
-        install_ready(
-            &mut st,
-            &self.hasher,
-            key.clone(),
-            CacheEntry {
-                value: v,
-                written_at: clock::floor_tick(self.start, now),
-                deadline,
-            },
-            nw,
-        );
+        self.with_reclaim_buf(|buf| {
+            let mut st = self.shard_for(key).write();
+            // Slot-identity invariant: only the in-flight refresh job
+            // clears `refresh_inflight`, so `false` here means the slot
+            // we started refreshing was removed (or removed-then-replaced)
+            // since the job was scheduled — drop the result instead of
+            // resurrecting a value the user already evicted.
+            let still_ours = entries_find(&st.entries, &self.hasher, &st.slab, key)
+                .and_then(|id| st.slab.get(id))
+                .is_some_and(|es| es.refresh_inflight);
+            if !still_ours {
+                return;
+            }
+            let now = Instant::now();
+            let nw = self.config.policy.weight(key, &v).get();
+            let expired_end = reclaim(self, &mut st, nw, key, now, buf);
+            let displaced = match entries_find(&st.entries, &self.hasher, &st.slab, key) {
+                Some(id) => evict_slot(&mut st, &self.hasher, id).map(|(k, v, _)| (k, v)),
+                None => None,
+            };
+            let deadline = deadline_after_write(&self.config.policy, key, &v, self.start, now);
+            install_ready(
+                &mut st,
+                &self.hasher,
+                key.clone(),
+                CacheEntry {
+                    value: v,
+                    written_at: clock::floor_tick(self.start, now),
+                    deadline,
+                },
+                nw,
+            );
 
-        drop(st);
-        // Mirror `Inner::insert`: emit Updated outside the lock.
-        if let Some(prev) = displaced {
-            self.notify_lifecycle(LifecycleReason::Updated, key.clone(), Some(prev));
-        }
-        self.fire_reclaim(reclaimed);
+            drop(st);
+
+            if let Some((_displaced_k, prev_v)) = displaced {
+                self.notify_lifecycle(LifecycleReason::Updated, key.clone(), Some(prev_v));
+            }
+            for (k, v) in buf.drain(..expired_end) {
+                self.notify_lifecycle(LifecycleReason::TimeExpired, k, Some(v));
+            }
+            for (k, v) in buf.drain(..) {
+                self.notify_lifecycle(LifecycleReason::EvictedSize, k, Some(v));
+            }
+        });
     }
 }
 
@@ -742,8 +791,8 @@ mod typesize_impls {
 
     impl<K, V, P, S> TypeSize for Inner<K, V, P, S>
     where
-        K: TypeSize + Eq + std::hash::Hash,
-        V: TypeSize,
+        K: TypeSize + Eq + std::hash::Hash + Send + 'static,
+        V: TypeSize + Send + 'static,
         P: TypeSize,
         S: TypeSize,
     {
@@ -755,6 +804,7 @@ mod typesize_impls {
                 hasher,
                 shard_max_weight,
                 start: _,
+                reclaim_buf: _,
             } = self;
             shards.extra_size()
                 + config.extra_size()

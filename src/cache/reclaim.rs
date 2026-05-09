@@ -18,27 +18,27 @@ use super::expiry::drain_expired;
 use super::inner::{Inner, SMALL_DENOMINATOR, State, entries_find, evict_slot};
 use super::slab::Queue;
 
-/// Per-phase victim split so the caller fires `TimeExpired` for
-/// `expired` and `EvictedSize` for `evicted`.
-pub(super) struct Reclaimed<K, V> {
-    pub(super) expired: Vec<(K, V)>,
-    pub(super) evicted: Vec<(K, V)>,
-}
-
+/// Push reclaim victims into `out` and return the boundary index:
+/// `out[start..expired_end]` are time-expired (caller fires
+/// `TimeExpired`), `out[expired_end..]` are size-evicted (caller fires
+/// `EvictedSize`). `start` is the buffer's length on entry — supports
+/// reusing a shared TLS buffer across nested calls.
 pub(super) fn reclaim<K, V, P, S>(
     inner: &Inner<K, V, P, S>,
     st: &mut State<K, V>,
     add_w: u64,
     skip_key: &K,
     now: Instant,
-) -> Reclaimed<K, V>
+    out: &mut Vec<(K, V)>,
+) -> usize
 where
-    K: Eq + Hash + 'static,
-    V: 'static,
+    K: Eq + Hash + Send + 'static,
+    V: Send + 'static,
     S: BuildHasher,
 {
     let now_tick = super::clock::floor_tick(inner.start, now);
-    let expired = drain_expired(st, &inner.hasher, now_tick, Some(skip_key));
+    drain_expired(st, &inner.hasher, now_tick, Some(skip_key), out);
+    let expired_end = out.len();
 
     // The skip slot's weight is invariant across iterations (never
     // reclaimed), so look it up once instead of per-loop.
@@ -48,7 +48,6 @@ where
 
     let max = inner.shard_max_weight;
     let small_max = max / SMALL_DENOMINATOR;
-    let mut evicted = Vec::new();
     loop {
         if !projected_weight_over_capacity(st, displaced_weight, add_w, max) {
             break;
@@ -57,23 +56,23 @@ where
         // actionable (Small drained empty mid-pass and friends).
         let small_first = st.small_weight > small_max;
         let primary = if small_first {
-            evict_from_small(inner, st, skip_key, &mut evicted)
+            evict_from_small(inner, st, skip_key, out)
         } else {
-            evict_from_main(inner, st, skip_key, &mut evicted)
+            evict_from_main(inner, st, skip_key, out)
         };
         if primary {
             continue;
         }
         let secondary = if small_first {
-            evict_from_main(inner, st, skip_key, &mut evicted)
+            evict_from_main(inner, st, skip_key, out)
         } else {
-            evict_from_small(inner, st, skip_key, &mut evicted)
+            evict_from_small(inner, st, skip_key, out)
         };
         if !secondary {
             break;
         }
     }
-    Reclaimed { expired, evicted }
+    expired_end
 }
 
 /// Returns `true` when state changed (promotion / eviction / rotation).
@@ -84,8 +83,8 @@ fn evict_from_small<K, V, P, S>(
     evicted: &mut Vec<(K, V)>,
 ) -> bool
 where
-    K: Eq + Hash + 'static,
-    V: 'static,
+    K: Eq + Hash + Send + 'static,
+    V: Send + 'static,
     S: BuildHasher,
 {
     let Some(tail_id) = st.small.tail() else {
@@ -142,8 +141,8 @@ fn evict_from_main<K, V, P, S>(
     evicted: &mut Vec<(K, V)>,
 ) -> bool
 where
-    K: Eq + Hash + 'static,
-    V: 'static,
+    K: Eq + Hash + Send + 'static,
+    V: Send + 'static,
     S: BuildHasher,
 {
     let Some(tail_id) = st.main.tail() else {

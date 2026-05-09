@@ -164,20 +164,20 @@ pub(super) fn reschedule<K, V>(
     push(buckets, slab, slot, new);
 }
 
-/// Drain entries whose deadline is at or before `now_tick`. `skip_key`,
-/// when set, suppresses eviction of that key (the caller is about to
-/// replace the slot and emit its own lifecycle event).
+/// Drain entries whose deadline is at or before `now_tick` into the
+/// caller-supplied buffer. `skip_key`, when set, suppresses eviction
+/// of that key (the caller is about to replace the slot and emit its
+/// own lifecycle event).
 pub(super) fn drain_expired<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
     now_tick: Tick,
     skip_key: Option<&K>,
-) -> Vec<(K, V)>
-where
+    out: &mut Vec<(K, V)>,
+) where
     K: Eq + Hash,
     H: BuildHasher,
 {
-    let mut out = Vec::new();
     while let Some((&tick, _)) = st.expiry.by_tick.first_key_value() {
         if tick > now_tick {
             break;
@@ -205,7 +205,6 @@ where
             cursor = next;
         }
     }
-    out
 }
 
 #[cfg(test)]

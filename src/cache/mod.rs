@@ -53,8 +53,8 @@ impl<Fut: Future> Future for OkIntoResult<Fut> {
 /// handing the flag off to the spawned [`RefreshWork`].
 struct RefreshGuard<'a, K, V, P, S>
 where
-    K: Eq + Hash + 'static,
-    V: 'static,
+    K: Eq + Hash + Send + 'static,
+    V: Send + 'static,
     P: 'static,
     S: BuildHasher + 'static,
 {
@@ -65,8 +65,8 @@ where
 
 impl<K, V, P, S> Drop for RefreshGuard<'_, K, V, P, S>
 where
-    K: Eq + Hash + 'static,
-    V: 'static,
+    K: Eq + Hash + Send + 'static,
+    V: Send + 'static,
     P: 'static,
     S: BuildHasher + 'static,
 {
@@ -87,8 +87,8 @@ where
 /// the result is dropped, matching the `RevalidateScheduled::AbsentKey`
 /// "no promote-to-install" contract.
 pub struct RefreshWork<
-    K: 'static,
-    V: 'static,
+    K: Send + 'static,
+    V: Send + 'static,
     E: 'static,
     P: 'static = DynPolicy<K, V>,
     S: 'static = DefaultHashBuilder,
@@ -130,8 +130,8 @@ where
 
 impl<K, V, E, P, S> Drop for RefreshWork<K, V, E, P, S>
 where
-    K: 'static,
-    V: 'static,
+    K: Send + 'static,
+    V: Send + 'static,
     E: 'static,
     P: 'static,
     S: 'static,
@@ -154,15 +154,15 @@ where
 /// generic-erased; pass a concrete `P: Policy<K, V>` to inline policy
 /// hooks and skip the vtable on every cache operation.
 pub struct Cache<
-    K: 'static,
-    V: 'static,
+    K: Send + 'static,
+    V: Send + 'static,
     P: 'static = DynPolicy<K, V>,
     S: 'static = DefaultHashBuilder,
 > {
     inner: Arc<inner::Inner<K, V, P, S>>,
 }
 
-impl<K: 'static, V: 'static, P: 'static, S: 'static> Clone for Cache<K, V, P, S> {
+impl<K: Send + 'static, V: Send + 'static, P: 'static, S: 'static> Clone for Cache<K, V, P, S> {
     /// Cloning a `Cache` is `Arc`-cheap: both handles refer to the same
     /// shared state. Mutations from one are visible from the other.
     fn clone(&self) -> Self {
@@ -476,8 +476,8 @@ where
 #[cfg(feature = "typesize")]
 impl<K, V, P, S> typesize::TypeSize for Cache<K, V, P, S>
 where
-    K: typesize::TypeSize + Eq + Hash + 'static,
-    V: typesize::TypeSize + 'static,
+    K: typesize::TypeSize + Eq + Hash + Send + 'static,
+    V: typesize::TypeSize + Send + 'static,
     P: typesize::TypeSize + 'static,
     S: typesize::TypeSize + 'static,
 {

@@ -89,7 +89,7 @@ fn snapshot_size_is_stable_with_fixed_seed_hasher() {
     // (hashbrown 0.17, slotmap 1, typesize 0.1.14). If you legitimately
     // change layout, re-run and update — but pause first to confirm
     // the new number reflects an intentional shift, not a regression.
-    const EXPECTED_DEEP_SIZE: usize = 206_744;
+    const EXPECTED_DEEP_SIZE: usize = 207_256;
     assert_eq!(
         cache.get_size(),
         EXPECTED_DEEP_SIZE,
