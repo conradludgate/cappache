@@ -172,9 +172,34 @@ pub(super) fn reschedule<K, V>(
 /// `skip_key`, when set, suppresses eviction of that key (the caller
 /// is about to replace the slot and emit its own lifecycle event).
 ///
-/// Mid-bucket breaks re-insert the truncated `BucketHead` so the
-/// remainder of the intrusive list stays reachable from `by_tick`.
+/// The fast path (no ready bucket) stays inlinable — the cold body is
+/// in [`drain_expired_inner`] so the no-deadline write path doesn't pay
+/// a function call.
+#[inline]
 pub(super) fn drain_expired<K, V, H>(
+    st: &mut State<K, V>,
+    hasher: &H,
+    now_tick: Tick,
+    skip_key: Option<&K>,
+    out: &mut Vec<(K, V)>,
+    budget: usize,
+) -> bool
+where
+    K: Eq + Hash,
+    H: BuildHasher,
+{
+    match st.expiry.by_tick.first_key_value() {
+        Some((&tick, _)) if tick <= now_tick => {
+            drain_expired_inner(st, hasher, now_tick, skip_key, out, budget)
+        }
+        _ => false,
+    }
+}
+
+/// Cold drain body. Mid-bucket breaks re-insert the truncated
+/// `BucketHead` so the remainder of the intrusive list stays
+/// reachable from `by_tick`.
+fn drain_expired_inner<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
     now_tick: Tick,
