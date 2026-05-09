@@ -9,7 +9,6 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::expiry::expiry_push_extend;
 use super::flight::{
     Flight, LeaderGuard, MissFlight, MissStep, NewFlight, SyncMissFlight, install_or_join_lane,
     remove_lane,
@@ -119,9 +118,7 @@ where
                     );
                     (value, update)
                 };
-                if let Some(dl) = update.new_deadline {
-                    expiry_push_extend(&mut st, dl, id, update.superseded_finite);
-                }
+                st.expiry_reschedule(id, update.prev, update.new);
                 hit = Some(value);
             }
         }

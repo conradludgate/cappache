@@ -41,14 +41,15 @@ impl Weight {
 /// Roughly 30 years — the same bound `tokio::time::Instant::far_future` uses,
 /// chosen because larger values overflow `Instant` on some platforms (1000
 /// years on macOS, 100 years on FreeBSD). A hook return `>= TIME_UNBOUNDED`
-/// folds to “no deadline” and skips the expiry heap entirely; any value
-/// strictly less is taken at face value and stored as a finite deadline.
+/// folds to “no deadline” and the entry stays out of the deadline buckets
+/// entirely; any value strictly less is taken at face value and stored as
+/// a finite deadline.
 ///
 /// Policies should return [`TIME_UNBOUNDED`] **exactly** to signal the
 /// no-deadline path. Arithmetic-derived values just below the constant
 /// (e.g. `time_remaining.saturating_sub(small)` on an unbounded entry)
 /// produce real but astronomically distant deadlines that work correctly
-/// but pollute the expiry heap with tuples that will never fire.
+/// but pin a bucket entry that will never fire.
 pub const TIME_UNBOUNDED: Duration = Duration::from_hours(24 * 365 * 30);
 
 /// Per-entry weighting and time limits after read and write events.

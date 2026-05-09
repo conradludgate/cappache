@@ -1,7 +1,7 @@
 //! S3-FIFO size-based eviction.
 //!
 //! Two-phase reclaim called before installing a new entry:
-//! 1. Drain the deadline heap (delegated to [`drain_expired`]).
+//! 1. Drain expired deadline buckets (delegated to [`drain_expired`]).
 //! 2. While projected weight exceeds `shard_max_weight`, drain the
 //!    Small queue while it's over its `max / SMALL_DENOMINATOR` budget,
 //!    otherwise drain Main. Each Small step either promotes

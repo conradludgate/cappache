@@ -8,10 +8,11 @@ use hashbrown::HashTable;
 use slotmap::SlotMap;
 
 slotmap::new_key_type! {
-    /// Versioned slab handle. The version gates stale heap tuples
-    /// (recycled slot → `slab.get` returns `None`); a deadline-equality
-    /// check at the call site additionally rejects tuples superseded by
-    /// a read hook on the same live slot.
+    /// Versioned slab handle. The version is what makes a recycled
+    /// slot observable as a different identity: a stale `SlotKey`
+    /// retained outside the shard lock will fail the version check
+    /// inside `slab.get` and return `None` instead of resolving to
+    /// whatever entry now occupies the same slot.
     pub(crate) struct SlotKey;
 }
 
@@ -49,6 +50,12 @@ pub(super) struct EntrySlot<K, V> {
     pub(super) freq: u8,
     pub(super) fifo_prev: Option<SlotKey>,
     pub(super) fifo_next: Option<SlotKey>,
+    /// Intrusive sibling links for the deadline-bucket list this slot
+    /// belongs to. `None` for slots without a finite deadline.
+    /// Maintained alongside `entry.deadline`, which identifies the
+    /// owning bucket.
+    pub(super) expiry_prev: Option<SlotKey>,
+    pub(super) expiry_next: Option<SlotKey>,
     /// `true` while a `try_revalidate` job for this key is in flight.
     /// Held on the slot to skip a per-revalidate `K::clone() + hash +
     /// insert` into a side set.
@@ -261,9 +268,9 @@ mod typesize_impls {
 
     impl<K: TypeSize, V: TypeSize> TypeSize for EntrySlot<K, V> {
         fn extra_size(&self) -> usize {
-            // `SlotKey` is foreign (slotmap) so `fifo_prev` / `fifo_next`
-            // fall through `_`; they're stack-only and already counted
-            // in `mem::size_of::<Self>()`.
+            // `SlotKey` is foreign (slotmap) so the four sibling-link
+            // fields fall through `_`; they're stack-only and already
+            // counted in `mem::size_of::<Self>()`.
             let Self {
                 key,
                 entry,
@@ -272,6 +279,8 @@ mod typesize_impls {
                 freq,
                 fifo_prev: _,
                 fifo_next: _,
+                expiry_prev: _,
+                expiry_next: _,
                 refresh_inflight,
             } = self;
             key.extra_size()
