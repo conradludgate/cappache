@@ -185,7 +185,11 @@ where
         // Lift the bucket out of the map up front. Per-slot `unlink`
         // calls inside `evict_slot` then no-op on the bucket lookup,
         // confining the bookkeeping to the slab fields.
-        let bucket = st.expiry.by_tick.remove(&tick).expect("first_key_value just yielded this tick");
+        let bucket = st
+            .expiry
+            .by_tick
+            .remove(&tick)
+            .expect("first_key_value just yielded this tick");
         let mut cursor = Some(bucket.head);
         while let Some(slot) = cursor {
             let next = st.slab.get(slot).and_then(|es| es.expiry_next);
@@ -241,22 +245,27 @@ mod tests {
     /// walks agree (modulo reversal), every slot's deadline matches
     /// the bucket tick, and head/tail boundary pointers are `None`.
     /// Returns the bucket size.
-    fn validate_bucket(
-        buckets: &ExpiryBuckets,
-        slab: &EntrySlab<u32, ()>,
-        tick: Tick,
-    ) -> usize {
+    fn validate_bucket(buckets: &ExpiryBuckets, slab: &EntrySlab<u32, ()>, tick: Tick) -> usize {
         let bucket = buckets.by_tick.get(&tick).expect("bucket exists");
         let mut fwd = Vec::new();
         let mut cur = Some(bucket.head);
         while let Some(s) = cur {
-            assert_eq!(slab[s].entry.deadline, tick, "slot deadline matches bucket tick");
+            assert_eq!(
+                slab[s].entry.deadline, tick,
+                "slot deadline matches bucket tick"
+            );
             fwd.push(s);
             cur = slab[s].expiry_next;
         }
         assert_eq!(fwd.last().copied(), Some(bucket.tail), "tail matches");
-        assert_eq!(slab[bucket.head].expiry_prev, None, "head's expiry_prev is None");
-        assert_eq!(slab[bucket.tail].expiry_next, None, "tail's expiry_next is None");
+        assert_eq!(
+            slab[bucket.head].expiry_prev, None,
+            "head's expiry_prev is None"
+        );
+        assert_eq!(
+            slab[bucket.tail].expiry_next, None,
+            "tail's expiry_next is None"
+        );
         let mut bwd = Vec::new();
         let mut cur = Some(bucket.tail);
         while let Some(s) = cur {
@@ -299,7 +308,10 @@ mod tests {
                     "NO_DEADLINE slot must be unlinked",
                 );
             } else {
-                assert!(seen.contains(&slot), "slot {slot:?} (deadline {tick}) missing from buckets");
+                assert!(
+                    seen.contains(&slot),
+                    "slot {slot:?} (deadline {tick}) missing from buckets"
+                );
             }
         }
     }

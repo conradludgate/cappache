@@ -50,9 +50,8 @@ where
 #[test]
 fn refresh_work_forwards_waker_correctly() {
     futures_testing::tests(testcase!(|| {
-        let cache: Cache<String, String> = Cache::new(
-            CacheBuilder::new().max_weight(Weight::new(10_000)).build(),
-        );
+        let cache: Cache<String, String> =
+            Cache::new(CacheBuilder::new().max_weight(Weight::new(10_000)).build());
         cache.insert("k".into(), "v0".into());
 
         let (tx, rx) = mpsc::channel::<()>(4);

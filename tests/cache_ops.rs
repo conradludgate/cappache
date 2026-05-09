@@ -2437,4 +2437,161 @@ mod s3_fifo {
              skip-key check fired in Small or Main",
         );
     }
+
+    /// Targeted variant of [`skip_key_short_circuit_in_main`]: drives
+    /// the cache into a state where Small holds exactly `small_max`
+    /// weight (so reclaim must visit Main first) and the skip key
+    /// sits at the Main tail. Pins the `evict_from_main` `key_eq_skip`
+    /// rotation branch — the existing test happens to satisfy
+    /// `victim` from Small first.
+    #[test]
+    fn skip_key_short_circuit_on_main_tail() {
+        // shard_max=33 (= max/2), small_max = 33 / SMALL_DENOMINATOR(33) = 1.
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(66))
+                .shards(2)
+                .hasher(SingleShardHasher)
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        // Phase 1: fill the shard with 33 weight-1 keys, read each
+        // twice (freq=2) so they qualify for Small→Main promotion.
+        for i in 0..33 {
+            cache.insert(format!("k{i:02}"), "x".into());
+        }
+        for _ in 0..2 {
+            for i in 0..33 {
+                assert!(cache.get(&format!("k{i:02}")).is_some());
+            }
+        }
+        // Phase 2: trigger reclaim that drains Small to Main. k00
+        // (first promoted = first at Main tail) loses its slot to a
+        // same-pass cold-evict; k01 ends up at the new Main tail.
+        // Small now holds only `trigger`, so `small_weight ==
+        // small_max` and the next reclaim picks Main first.
+        cache.insert("trigger".into(), "x".into());
+
+        // Phase 3: replace k01 with a 2-byte value. `displaced=1,
+        // new=2, projected=34>33` forces reclaim; Main is consulted
+        // first, the tail is the skip key, the rotation branch fires.
+        cache.insert("k01".into(), "x".repeat(2));
+        assert_eq!(
+            cache.get("k01"),
+            Some("x".repeat(2)),
+            "k01 must survive its own replacement when it sits at the Main tail",
+        );
+    }
+
+    /// `evict_from_main`'s freq>0 recirculation path: reads after a
+    /// promotion bump Main entries to freq=1, so the next reclaim
+    /// finds a recirculation candidate at the tail instead of a
+    /// cold-evict candidate.
+    #[test]
+    fn main_recirculation_keeps_warm_entries() {
+        // shard_max=33, small_max=1.
+        let cache = small_cache(33);
+
+        // Phase 1: 33 weight-1 keys, each read twice (freq=2).
+        for i in 0..33 {
+            cache.insert(format!("k{i:02}"), "v".into());
+        }
+        for _ in 0..2 {
+            for i in 0..33 {
+                assert!(cache.get(&format!("k{i:02}")).is_some());
+            }
+        }
+
+        // Phase 2: trigger reclaim that drains Small to Main. The
+        // last-inserted key (k32) sits at Small *head* and stays in
+        // Small; the rest promote to Main with freq reset to 0. k00
+        // (first promoted, hence Main tail) is cold-evicted in the
+        // same pass.
+        cache.insert("trigger".into(), "v".into());
+
+        // Phase 3: bump freq on every Main entry to 1.
+        for i in 1..32 {
+            let _ = cache.get(&format!("k{i:02}"));
+        }
+
+        // Phase 4: another over-budget insert. Reclaim:
+        //   iter 1: promote k32 (freq=3 in Small) to Main, freq reset to 0.
+        //   iter 2..=32: recirc k01..=k31 once each (freq 1 → 0).
+        //   iter 33: tail=k32 (freq=0), cold-evict.
+        // The recirculation branch fires 31 times.
+        cache.insert("late".into(), "v".into());
+
+        for i in 1..32 {
+            assert_eq!(
+                cache.get(&format!("k{i:02}")),
+                Some("v".into()),
+                "k{i:02} must survive Main recirculation",
+            );
+        }
+        assert_eq!(cache.get("k00"), None, "k00 was cold-evicted in phase 2");
+        assert_eq!(
+            cache.get("k32"),
+            None,
+            "k32 was promoted in phase 4 iter 1 and cold-evicted at the end of the recirc cycle",
+        );
+    }
+
+    /// Both reclaim phases short-circuit when the only live entry is
+    /// the skip key (Small tail = skip, Main empty). The outer loop's
+    /// `!secondary` guard breaks instead of spinning.
+    #[test]
+    fn reclaim_breaks_when_only_skip_key_remains() {
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(10))
+                .shards(2)
+                .hasher(SingleShardHasher)
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        cache.insert("k".into(), "x".into());
+        // Replace with a value heavy enough that reclaim runs, but
+        // the only candidate is `k` itself (Main is empty), so both
+        // queues short-circuit and the outer loop breaks.
+        cache.insert("k".into(), "x".repeat(6));
+        assert_eq!(cache.get("k"), Some("x".repeat(6)));
+    }
+
+    /// Mirror of [`reclaim_breaks_when_only_skip_key_remains`] for the
+    /// orientation where the lone slot lives in Main: `evict_from_main`
+    /// runs first and hits its own `slab.len() <= 1` short-circuit.
+    #[test]
+    fn reclaim_breaks_when_skip_key_alone_in_main() {
+        let cache = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(10))
+                .shards(2)
+                .hasher(SingleShardHasher)
+                .policy(Arc::new(LenWeightPolicy))
+                .build(),
+        );
+        // Promote k to Main: insert + read 3x, then a cold-scan that
+        // pushes k off the Small tail.
+        cache.insert("k".into(), "x".into());
+        for _ in 0..3 {
+            let _ = cache.get("k");
+        }
+        for i in 0..4 {
+            cache.insert(format!("f{i}"), "x".into());
+        }
+        cache.insert("trigger".into(), "x".into());
+
+        // Strip every other slot so the slab holds only k (in Main)
+        // when reclaim next runs.
+        let _ = cache.remove("trigger");
+        for i in 0..4 {
+            let _ = cache.remove(&format!("f{i}"));
+        }
+
+        // Replace k. `small_weight == 0`, so reclaim picks Main first;
+        // the tail is the skip key, slab.len()==1, short-circuit, and
+        // the secondary (Small) phase has nothing — outer loop breaks.
+        cache.insert("k".into(), "x".repeat(6));
+        assert_eq!(cache.get("k"), Some("x".repeat(6)));
+    }
 }

@@ -125,8 +125,7 @@ mod bug1 {
     use clache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
 
     use super::{
-        Arc, BlockingListener, CapturingExecutor, InitError, LifecycleListener,
-        drive_to_completion,
+        Arc, BlockingListener, CapturingExecutor, InitError, LifecycleListener, drive_to_completion,
     };
 
     /// Bug #1: between `apply_refresh_ok` releasing the shard lock and
@@ -219,9 +218,8 @@ mod bug2 {
     /// Fixed in: `fix: skip refresh install when slot identity changed`.
     #[test]
     fn refresh_does_not_resurrect_removed_entry() {
-        let cache: Cache<String, String> = Cache::new(
-            CacheBuilder::new().max_weight(Weight::new(10_000)).build(),
-        );
+        let cache: Cache<String, String> =
+            Cache::new(CacheBuilder::new().max_weight(Weight::new(10_000)).build());
         let ex = CapturingExecutor::new();
         let k = "k".to_string();
         cache.insert(k.clone(), "old".into());
@@ -252,9 +250,8 @@ mod bug2 {
     /// Fixed in: `fix: skip refresh install when slot identity changed`.
     #[test]
     fn refresh_does_not_overwrite_reinserted_entry() {
-        let cache: Cache<String, String> = Cache::new(
-            CacheBuilder::new().max_weight(Weight::new(10_000)).build(),
-        );
+        let cache: Cache<String, String> =
+            Cache::new(CacheBuilder::new().max_weight(Weight::new(10_000)).build());
         let ex = CapturingExecutor::new();
         let k = "k".to_string();
         cache.insert(k.clone(), "old".into());
