@@ -89,14 +89,19 @@ mod compile_tests {
         let _ = CacheBuilder::<String, String>::new().policy(Arc::new(CustomPolicy));
     }
 
-    /// Vtable-free monomorphic policy path.
+    /// Vtable-free monomorphic policy path. Round-trips an insert and
+    /// a get so the policy's `weight` / `expire_after_write` /
+    /// `expire_after_read` hooks are actually invoked, not just type-
+    /// checked.
     #[test]
     fn cache_accepts_concrete_policy_without_arc() {
         let cfg = CacheBuilder::<String, String>::new()
             .max_weight(Weight::new(1))
             .policy(CustomPolicy)
             .build();
-        let _: Cache<String, String, CustomPolicy> = Cache::new(cfg);
+        let cache: Cache<String, String, CustomPolicy> = Cache::new(cfg);
+        cache.insert("k".into(), "v".into());
+        assert_eq!(cache.get("k"), Some("v".into()));
     }
 
     #[test]
