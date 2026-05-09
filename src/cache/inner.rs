@@ -65,6 +65,14 @@ pub(super) const SMALL_DENOMINATOR: u64 = 33;
 
 pub(super) const FREQ_CAP: u8 = 3;
 
+/// Maximum number of time-expired entries `drain_expired` removes per
+/// write before the caller decides whether to keep going. Caps the
+/// worst-case latency of a single write when many entries co-expire on
+/// the same 250 ms tick. Lifted to unbounded by [`super::reclaim`] when
+/// a write would otherwise have to evict still-served entries to fit
+/// — expired entries are always preferred over size eviction.
+pub(super) const WRITE_EXPIRY_BUDGET: usize = 16;
+
 /// Lookup keyed by `K` against the [`SlotKey`]-only `entries` table.
 /// Equality goes through the slab, so a recycled slot (slotmap version
 /// mismatch) self-cleans here as `slab.get` returning `None`.
@@ -507,11 +515,7 @@ where
             drop(st);
 
             let prev_v = if let Some((_displaced_k, v)) = displaced {
-                self.notify_lifecycle(
-                    LifecycleReason::Updated,
-                    key_for_updated,
-                    Some(v.clone()),
-                );
+                self.notify_lifecycle(LifecycleReason::Updated, key_for_updated, Some(v.clone()));
                 Some(v)
             } else {
                 None

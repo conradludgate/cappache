@@ -2831,3 +2831,165 @@ mod tls_reclaim {
         assert_listener_before_displaced(&events, racer_instance);
     }
 }
+
+mod expiry_budget {
+    //! Coverage for the bounded time-expiry drain on the write path:
+    //! a single write evicts at most `WRITE_EXPIRY_BUDGET` time-expired
+    //! entries unless that leaves the projected weight over the shard
+    //! cap, in which case the budget is lifted so size eviction never
+    //! runs while expired entries are still drainable.
+    //!
+    //! Sizing notes (see plan): `shard_max_weight = max_weight.div_ceil(
+    //! shard_count)`, deadlines round up via `ceil_tick` to a 250 ms
+    //! tick, and `SingleShardHasher` pins every key to shard 0 so the
+    //! per-shard budget is what these tests exercise.
+
+    use std::time::Instant;
+
+    use super::*;
+
+    /// Custom policy: every entry expires 200 ms after write, and the
+    /// `"fresh"` trigger key weighs `cap` while everything else weighs 1.
+    /// Lets the over-capacity test force the unbounded-drain branch without
+    /// relying on the count of expired entries alone.
+    #[derive(Clone, Copy)]
+    struct HeavyFreshPolicy {
+        cap: u64,
+    }
+
+    impl Policy<K, V> for HeavyFreshPolicy {
+        fn weight(&self, k: &K, _v: &V) -> Weight {
+            if k == "fresh" {
+                Weight::new(self.cap)
+            } else {
+                Weight::new(1)
+            }
+        }
+
+        fn expire_after_read(
+            &self,
+            _k: &K,
+            _v: &V,
+            _read_at: Instant,
+            _last_modified_at: Instant,
+            _time_remaining: Duration,
+        ) -> Duration {
+            TIME_UNBOUNDED
+        }
+
+        fn expire_after_write(&self, _k: &K, _v: &V, _written_at: Instant) -> Duration {
+            Duration::from_millis(200)
+        }
+    }
+
+    /// Pre-insert 32 expired entries into a per-shard cap of 64 (well
+    /// over `WRITE_EXPIRY_BUDGET`), trigger one write, observe exactly
+    /// `WRITE_EXPIRY_BUDGET` `TimeExpired` events. The remaining 16
+    /// expired entries stay resident — the next write will pick them
+    /// up.
+    #[tokio::test]
+    async fn write_under_capacity_capped_at_write_expiry_budget() {
+        with_timeout(Duration::from_secs(30), async {
+            const N: u32 = 32;
+            let (listener, log) = RecordingListener::new_pair();
+            let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+            let policy: DynPolicy<K, V> =
+                Arc::new(TtlFromWrite::new(Duration::from_millis(200), DefaultPolicy));
+            // shards(2) with SingleShardHasher pins entries to shard 0;
+            // max_weight 128 / 2 = 64 per-shard cap, comfortably above N.
+            let cache: SingleShardCache<K, V> = Cache::new(
+                CacheBuilder::new()
+                    .max_weight(Weight::new(128))
+                    .shards(2)
+                    .hasher(SingleShardHasher)
+                    .policy(policy)
+                    .lifecycle_listener(listener)
+                    .build(),
+            );
+            for i in 0..N {
+                cache.insert(format!("k{i:02}"), format!("v{i}"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            log.lock().unwrap().clear();
+
+            cache.insert("fresh".into(), "v".into());
+
+            let events = log.lock().unwrap().clone();
+            let expired: usize = events
+                .iter()
+                .filter(|(r, _, _)| *r == LifecycleReason::TimeExpired)
+                .count();
+            let evicted_size: usize = events
+                .iter()
+                .filter(|(r, _, _)| *r == LifecycleReason::EvictedSize)
+                .count();
+            assert_eq!(
+                expired, 16,
+                "WRITE_EXPIRY_BUDGET=16 caps under-capacity drain; got events {events:?}",
+            );
+            assert_eq!(
+                evicted_size, 0,
+                "no size eviction when projected weight is under cap; got events {events:?}",
+            );
+        })
+        .await;
+    }
+
+    /// Pre-insert 24 expired entries into a per-shard cap of 24, then
+    /// insert a trigger key that weighs the full cap. After the budget
+    /// drain (16 expired removed, 8 remain @ weight 8), the over-cap
+    /// check `8 + 24 > 24` lifts the budget; the unbounded drain takes
+    /// the remaining 8. Re-check `0 + 24 = 24` is not strictly `> 24`
+    /// so the loop exits before any S3-FIFO step. Result: all 24
+    /// `TimeExpired` events, zero `EvictedSize`.
+    #[tokio::test]
+    async fn write_over_capacity_drains_until_space() {
+        with_timeout(Duration::from_secs(30), async {
+            const N: u32 = 24;
+            const PER_SHARD_CAP: u64 = 24;
+
+            let (listener, log) = RecordingListener::new_pair();
+            let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
+            let policy: DynPolicy<K, V> = Arc::new(HeavyFreshPolicy { cap: PER_SHARD_CAP });
+            // max_weight = 2 * PER_SHARD_CAP because shards(2) splits
+            // the global cap between the two shards.
+            let cache: SingleShardCache<K, V> = Cache::new(
+                CacheBuilder::new()
+                    .max_weight(Weight::new(2 * PER_SHARD_CAP))
+                    .shards(2)
+                    .hasher(SingleShardHasher)
+                    .policy(policy)
+                    .lifecycle_listener(listener)
+                    .build(),
+            );
+            for i in 0..N {
+                cache.insert(format!("k{i:02}"), format!("v{i}"));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            log.lock().unwrap().clear();
+
+            cache.insert("fresh".into(), "v".into());
+
+            let events = log.lock().unwrap().clone();
+            let expired: usize = events
+                .iter()
+                .filter(|(r, _, _)| *r == LifecycleReason::TimeExpired)
+                .count();
+            let evicted_size: usize = events
+                .iter()
+                .filter(|(r, _, _)| *r == LifecycleReason::EvictedSize)
+                .count();
+            assert_eq!(
+                expired, N as usize,
+                "over-capacity write must lift the budget and drain every expired entry; \
+                 got events {events:?}",
+            );
+            assert_eq!(
+                evicted_size, 0,
+                "expired-first invariant: size eviction must not run while expired entries \
+                 are still drainable; got events {events:?}",
+            );
+        })
+        .await;
+    }
+}

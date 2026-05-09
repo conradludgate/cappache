@@ -165,22 +165,62 @@ pub(super) fn reschedule<K, V>(
 }
 
 /// Drain entries whose deadline is at or before `now_tick` into the
-/// caller-supplied buffer. `skip_key`, when set, suppresses eviction
-/// of that key (the caller is about to replace the slot and emit its
-/// own lifecycle event).
+/// caller-supplied buffer, stopping after `budget` evictions. Returns
+/// `true` iff at least one ready entry remains undrained (the caller
+/// can lift the cap with `budget = usize::MAX` to finish the work).
+///
+/// `skip_key`, when set, suppresses eviction of that key (the caller
+/// is about to replace the slot and emit its own lifecycle event).
+///
+/// The fast path (no ready bucket) stays inlinable — the cold body is
+/// in [`drain_expired_inner`] so the no-deadline write path doesn't pay
+/// a function call.
+#[inline]
 pub(super) fn drain_expired<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
     now_tick: Tick,
     skip_key: Option<&K>,
     out: &mut Vec<(K, V)>,
-) where
+    budget: usize,
+) -> bool
+where
     K: Eq + Hash,
     H: BuildHasher,
 {
+    match st.expiry.by_tick.first_key_value() {
+        Some((&tick, _)) if tick <= now_tick => {
+            drain_expired_inner(st, hasher, now_tick, skip_key, out, budget)
+        }
+        _ => false,
+    }
+}
+
+/// Cold drain body. Mid-bucket breaks re-insert the truncated
+/// `BucketHead` so the remainder of the intrusive list stays
+/// reachable from `by_tick`.
+fn drain_expired_inner<K, V, H>(
+    st: &mut State<K, V>,
+    hasher: &H,
+    now_tick: Tick,
+    skip_key: Option<&K>,
+    out: &mut Vec<(K, V)>,
+    budget: usize,
+) -> bool
+where
+    K: Eq + Hash,
+    H: BuildHasher,
+{
+    let start = out.len();
     while let Some((&tick, _)) = st.expiry.by_tick.first_key_value() {
         if tick > now_tick {
-            break;
+            return false;
+        }
+        // Outer-loop boundary check: a previous inner walk just
+        // finished a bucket and consumed the budget. Don't disturb
+        // `by_tick` — there's still a ready bucket waiting.
+        if out.len() - start >= budget {
+            return true;
         }
         // Lift the bucket out of the map up front. Per-slot `unlink`
         // calls inside `evict_slot` then no-op on the bucket lookup,
@@ -201,10 +241,37 @@ pub(super) fn drain_expired<K, V, H>(
             }
             if let Some((k, v, _)) = evict_slot(st, hasher, slot) {
                 out.push((k, v));
+                if out.len() - start >= budget {
+                    cursor = next;
+                    if let Some(c) = cursor {
+                        // Stale cross-link: when `skip_key` was visited
+                        // earlier in this walk, the prior evict's
+                        // `unlink` propagated `expiry_next` across the
+                        // gap, leaving `slab[c].expiry_prev = Some(skip)`.
+                        // The skip slot's later `evict_slot` call will
+                        // fix its own bucket pointer via the
+                        // `(None, Some(c))` arm of `unlink`.
+                        st.slab[c].expiry_prev = None;
+                        st.expiry.by_tick.insert(
+                            tick,
+                            BucketHead {
+                                head: c,
+                                tail: bucket.tail,
+                            },
+                        );
+                        return true;
+                    }
+                    // Bucket drained to its end on the budget boundary;
+                    // fall through and let the outer loop probe.
+                    break;
+                }
             }
             cursor = next;
         }
     }
+    // Loop exited naturally — either by_tick is empty or the next
+    // bucket is in the future. Either way, no ready entry remains.
+    false
 }
 
 #[cfg(test)]
@@ -450,6 +517,93 @@ mod tests {
         slab[a].entry.deadline = NO_DEADLINE;
         reschedule(&mut buckets, &mut slab, a, 3, NO_DEADLINE);
         assert!(buckets.by_tick.is_empty());
+    }
+
+    /// Build a `State<u32, ()>` with `n` slots all sharing the same
+    /// deadline tick, wiring each through `install_ready` so the
+    /// `entries` table, FIFO queues, slab, and bucket list all stay in
+    /// lockstep — `evict_slot` (called from inside `drain_expired`)
+    /// touches every one of those structures.
+    fn state_with_n_slots_at_tick(
+        n: u32,
+        tick: Tick,
+    ) -> (
+        super::super::inner::State<u32, ()>,
+        std::collections::hash_map::RandomState,
+        Vec<SlotKey>,
+    ) {
+        use super::super::inner::install_ready;
+        use super::super::slab::{Fifo, GhostSet};
+
+        let mut st = super::super::inner::State {
+            entries: hashbrown::HashTable::new(),
+            inflight: hashbrown::HashMap::new(),
+            slab: EntrySlab::with_key(),
+            small: Fifo::default(),
+            main: Fifo::default(),
+            ghost: GhostSet::new(0),
+            small_weight: 0,
+            expiry: ExpiryBuckets::default(),
+            total_weight: 0,
+        };
+        let hasher = std::collections::hash_map::RandomState::new();
+        let mut ids = Vec::with_capacity(n as usize);
+        for k in 0..n {
+            let id = install_ready(
+                &mut st,
+                &hasher,
+                k,
+                CacheEntry {
+                    value: (),
+                    written_at: 0,
+                    deadline: tick,
+                },
+                1,
+            );
+            ids.push(id);
+        }
+        (st, hasher, ids)
+    }
+
+    /// Drains a 32-slot bucket in two budgeted halves and asserts the
+    /// mid-bucket break re-inserts a well-formed tail bucket and the
+    /// resumed call finishes the work.
+    #[test]
+    fn drain_expired_respects_budget_and_resumes() {
+        const N: u32 = 32;
+        const BUCKET_TICK: Tick = 5;
+        const NOW: Tick = 10;
+        const BUDGET: usize = 16;
+
+        let (mut st, hasher, ids) = state_with_n_slots_at_tick(N, BUCKET_TICK);
+        let mut out: Vec<(u32, ())> = Vec::new();
+
+        let more = drain_expired(&mut st, &hasher, NOW, None, &mut out, BUDGET);
+        assert!(more, "first drain should report more entries pending");
+        assert_eq!(out.len(), BUDGET, "first drain capped at BUDGET");
+
+        // Bucket invariants must hold over the surviving N-BUDGET slots.
+        // `ids` includes drained slot keys that are no longer valid;
+        // filter via `slab.get` to skip them safely.
+        let oracle: HashMap<SlotKey, Tick> = ids
+            .iter()
+            .filter(|&&id| st.slab.get(id).is_some())
+            .map(|&id| (id, BUCKET_TICK))
+            .collect();
+        validate_global(&st.expiry, &st.slab, &oracle);
+        assert_eq!(
+            validate_bucket(&st.expiry, &st.slab, BUCKET_TICK),
+            (N as usize) - BUDGET,
+            "re-inserted bucket holds the remaining slots",
+        );
+
+        let more = drain_expired(&mut st, &hasher, NOW, None, &mut out, usize::MAX);
+        assert!(!more, "unbounded resume drains everything ready");
+        assert_eq!(out.len(), N as usize, "all N slots ended up in `out`");
+        assert!(
+            st.expiry.by_tick.is_empty(),
+            "by_tick is empty once every ready bucket is drained"
+        );
     }
 
     /// Random-op fuzz: drives `push` / `unlink` / `reschedule` over a
