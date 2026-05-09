@@ -15,7 +15,9 @@ use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
 use super::expiry::drain_expired;
-use super::inner::{Inner, SMALL_DENOMINATOR, State, WRITE_EXPIRY_BUDGET, entries_find, evict_slot};
+use super::inner::{
+    Inner, SMALL_DENOMINATOR, State, WRITE_EXPIRY_BUDGET, entries_find, evict_slot,
+};
 use super::slab::Queue;
 
 /// Push reclaim victims into `out` and return the boundary index:
@@ -63,14 +65,8 @@ where
         // still-served entries. Expired entries are free to drop; size
         // eviction must always be the last resort.
         if more_pending {
-            more_pending = drain_expired(
-                st,
-                &inner.hasher,
-                now_tick,
-                Some(skip_key),
-                out,
-                usize::MAX,
-            );
+            more_pending =
+                drain_expired(st, &inner.hasher, now_tick, Some(skip_key), out, usize::MAX);
             expired_end = out.len();
             continue;
         }

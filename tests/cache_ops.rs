@@ -2950,9 +2950,7 @@ mod expiry_budget {
 
             let (listener, log) = RecordingListener::new_pair();
             let listener: Arc<dyn LifecycleListener<K, V> + Send + Sync> = listener;
-            let policy: DynPolicy<K, V> = Arc::new(HeavyFreshPolicy {
-                cap: PER_SHARD_CAP,
-            });
+            let policy: DynPolicy<K, V> = Arc::new(HeavyFreshPolicy { cap: PER_SHARD_CAP });
             // max_weight = 2 * PER_SHARD_CAP because shards(2) splits
             // the global cap between the two shards.
             let cache: SingleShardCache<K, V> = Cache::new(

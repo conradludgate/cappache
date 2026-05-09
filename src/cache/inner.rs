@@ -515,11 +515,7 @@ where
             drop(st);
 
             let prev_v = if let Some((_displaced_k, v)) = displaced {
-                self.notify_lifecycle(
-                    LifecycleReason::Updated,
-                    key_for_updated,
-                    Some(v.clone()),
-                );
+                self.notify_lifecycle(LifecycleReason::Updated, key_for_updated, Some(v.clone()));
                 Some(v)
             } else {
                 None
