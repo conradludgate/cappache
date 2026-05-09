@@ -494,6 +494,93 @@ mod tests {
         assert!(buckets.by_tick.is_empty());
     }
 
+    /// Build a `State<u32, ()>` with `n` slots all sharing the same
+    /// deadline tick, wiring each through `install_ready` so the
+    /// `entries` table, FIFO queues, slab, and bucket list all stay in
+    /// lockstep — `evict_slot` (called from inside `drain_expired`)
+    /// touches every one of those structures.
+    fn state_with_n_slots_at_tick(
+        n: u32,
+        tick: Tick,
+    ) -> (
+        super::super::inner::State<u32, ()>,
+        std::collections::hash_map::RandomState,
+        Vec<SlotKey>,
+    ) {
+        use super::super::inner::install_ready;
+        use super::super::slab::{Fifo, GhostSet};
+
+        let mut st = super::super::inner::State {
+            entries: hashbrown::HashTable::new(),
+            inflight: hashbrown::HashMap::new(),
+            slab: EntrySlab::with_key(),
+            small: Fifo::default(),
+            main: Fifo::default(),
+            ghost: GhostSet::new(0),
+            small_weight: 0,
+            expiry: ExpiryBuckets::default(),
+            total_weight: 0,
+        };
+        let hasher = std::collections::hash_map::RandomState::new();
+        let mut ids = Vec::with_capacity(n as usize);
+        for k in 0..n {
+            let id = install_ready(
+                &mut st,
+                &hasher,
+                k,
+                CacheEntry {
+                    value: (),
+                    written_at: 0,
+                    deadline: tick,
+                },
+                1,
+            );
+            ids.push(id);
+        }
+        (st, hasher, ids)
+    }
+
+    /// Drains a 32-slot bucket in two budgeted halves and asserts the
+    /// mid-bucket break re-inserts a well-formed tail bucket and the
+    /// resumed call finishes the work.
+    #[test]
+    fn drain_expired_respects_budget_and_resumes() {
+        const N: u32 = 32;
+        const BUCKET_TICK: Tick = 5;
+        const NOW: Tick = 10;
+        const BUDGET: usize = 16;
+
+        let (mut st, hasher, ids) = state_with_n_slots_at_tick(N, BUCKET_TICK);
+        let mut out: Vec<(u32, ())> = Vec::new();
+
+        let more = drain_expired(&mut st, &hasher, NOW, None, &mut out, BUDGET);
+        assert!(more, "first drain should report more entries pending");
+        assert_eq!(out.len(), BUDGET, "first drain capped at BUDGET");
+
+        // Bucket invariants must hold over the surviving N-BUDGET slots.
+        // `ids` includes drained slot keys that are no longer valid;
+        // filter via `slab.get` to skip them safely.
+        let oracle: HashMap<SlotKey, Tick> = ids
+            .iter()
+            .filter(|&&id| st.slab.get(id).is_some())
+            .map(|&id| (id, BUCKET_TICK))
+            .collect();
+        validate_global(&st.expiry, &st.slab, &oracle);
+        assert_eq!(
+            validate_bucket(&st.expiry, &st.slab, BUCKET_TICK),
+            (N as usize) - BUDGET,
+            "re-inserted bucket holds the remaining slots",
+        );
+
+        let more = drain_expired(&mut st, &hasher, NOW, None, &mut out, usize::MAX);
+        assert!(!more, "unbounded resume drains everything ready");
+        assert_eq!(out.len(), N as usize, "all N slots ended up in `out`");
+        assert!(
+            st.expiry.by_tick.is_empty(),
+            "by_tick is empty once every ready bucket is drained"
+        );
+    }
+
     /// Random-op fuzz: drives `push` / `unlink` / `reschedule` over a
     /// small slot pool with a small tick range (forces same-bucket
     /// collisions) and asserts every invariant after each step.
