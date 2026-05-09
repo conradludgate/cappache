@@ -87,12 +87,9 @@ trait CacheUnderTest {
 struct ClacheAdapter(Clache<String, String, TtlFromWrite<DefaultPolicy>>);
 
 impl ClacheAdapter {
-    fn new() -> Self {
-        // Capacity 4x the keyspace so the workload never triggers
-        // size-driven eviction; we want to measure the resting cost,
-        // not S3-FIFO recirculation.
+    fn new(cap: usize) -> Self {
         let cfg = CacheBuilder::<String, String>::new()
-            .max_weight(Weight::new(KEYSPACE as u64 * 4))
+            .max_weight(Weight::new(cap as u64))
             .policy(TtlFromWrite::new(TTL, DefaultPolicy))
             .build();
         Self(Clache::new(cfg))
@@ -121,10 +118,10 @@ impl CacheUnderTest for ClacheAdapter {
 struct MokaAdapter(MokaCache<String, String>);
 
 impl MokaAdapter {
-    fn new() -> Self {
+    fn new(cap: usize) -> Self {
         Self(
             MokaCache::builder()
-                .max_capacity((KEYSPACE as u64) * 4)
+                .max_capacity(cap as u64)
                 .time_to_live(TTL)
                 .build(),
         )
@@ -155,8 +152,8 @@ impl CacheUnderTest for MokaAdapter {
 struct QuickCacheAdapter(QuickCache<String, (Instant, String)>);
 
 impl QuickCacheAdapter {
-    fn new() -> Self {
-        Self(QuickCache::new(KEYSPACE * 4))
+    fn new(cap: usize) -> Self {
+        Self(QuickCache::new(cap))
     }
 }
 
@@ -224,18 +221,18 @@ fn measure(
     }
 }
 
-fn measure_clache(keyspace: &[String], trace: &[Op], value: &str) -> PhaseResult {
-    let cache = ClacheAdapter::new();
+fn measure_clache(keyspace: &[String], trace: &[Op], value: &str, cap: usize) -> PhaseResult {
+    let cache = ClacheAdapter::new(cap);
     measure(&cache, keyspace, trace, value)
 }
 
-fn measure_moka(keyspace: &[String], trace: &[Op], value: &str) -> PhaseResult {
-    let cache = MokaAdapter::new();
+fn measure_moka(keyspace: &[String], trace: &[Op], value: &str, cap: usize) -> PhaseResult {
+    let cache = MokaAdapter::new(cap);
     measure(&cache, keyspace, trace, value)
 }
 
-fn measure_quick_cache(keyspace: &[String], trace: &[Op], value: &str) -> PhaseResult {
-    let cache = QuickCacheAdapter::new();
+fn measure_quick_cache(keyspace: &[String], trace: &[Op], value: &str, cap: usize) -> PhaseResult {
+    let cache = QuickCacheAdapter::new(cap);
     measure(&cache, keyspace, trace, value)
 }
 
@@ -254,6 +251,20 @@ fn print_row(r: &PhaseResult) {
     );
 }
 
+fn run_phase_for_cap(label: &str, cap: usize, keyspace: &[String], trace: &[Op], value: &str) {
+    println!("phase: {label} (cap={cap})");
+    print_header();
+    let results = [
+        measure_clache(keyspace, trace, value, cap),
+        measure_moka(keyspace, trace, value, cap),
+        measure_quick_cache(keyspace, trace, value, cap),
+    ];
+    for r in &results {
+        print_row(r);
+    }
+    println!();
+}
+
 fn main() {
     println!(
         "memory_overhead: keyspace={KEYSPACE}, ops={OPS}, key={KEY_LEN}B, value={VAL_LEN}B, ttl={TTL:?} (carry_only)"
@@ -264,13 +275,13 @@ fn main() {
     let payload_floor = (KEY_LEN + VAL_LEN) * KEYSPACE;
     println!("payload floor (key + value bytes per slot * keyspace) = {payload_floor} bytes");
     println!();
-    print_header();
-    let results = [
-        measure_clache(&keyspace, &trace, &value),
-        measure_moka(&keyspace, &trace, &value),
-        measure_quick_cache(&keyspace, &trace, &value),
-    ];
-    for r in &results {
-        print_row(r);
-    }
+
+    // Phase 1: cap >> keyspace, no size-driven eviction. Measures the
+    // resting overhead of the deadline machinery.
+    run_phase_for_cap("no_eviction", KEYSPACE * 4, &keyspace, &trace, &value);
+
+    // Phase 2: cap << keyspace, size-driven eviction fires on most
+    // inserts. Exercises the reclaim path and surfaces the alloc-count
+    // delta of the TLS reclaim buffer optimisation.
+    run_phase_for_cap("evict_heavy", KEYSPACE / 4, &keyspace, &trace, &value);
 }
