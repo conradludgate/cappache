@@ -26,6 +26,8 @@ moka = { version = "0.12", default-features = false, features = ["sync"] }
 quick_cache = { version = "0.6", default-features = false }
 fastrand = "2"
 futures-testing = "0.1"
+stats_alloc = { version = "0.1", features = ["nightly"] }
+peak_alloc = "0.3"
 
 [[bench]]
 name = "compare_cache"
@@ -33,4 +35,8 @@ harness = false
 
 [[bench]]
 name = "concurrent"
+harness = false
+
+[[bench]]
+name = "memory_overhead"
 harness = false
