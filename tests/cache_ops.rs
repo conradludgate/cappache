@@ -2595,3 +2595,239 @@ mod s3_fifo {
         assert_eq!(cache.get("k"), Some("x".repeat(6)));
     }
 }
+
+mod tls_reclaim {
+    //! Coverage for the TLS reclaim buffer + drop-out-of-lock cleanup:
+    //! - re-entrant lifecycle listener safety (the `Cell::take` /
+    //!   `Cell::set` pattern must not panic when a listener calls back
+    //!   into the cache on the same thread the eviction fired on),
+    //! - drop-order witness for the displaced-K out-of-lock fix across
+    //!   `insert`, `apply_refresh_ok`, and the miss-leader path —
+    //!   `listener:Updated` must precede the displaced K's `Drop`.
+
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    use super::*;
+
+    type DropLog = Arc<Mutex<Vec<String>>>;
+
+    struct ReenterListener {
+        cache: OnceLock<Cache<String, String>>,
+        events: AtomicUsize,
+    }
+
+    impl LifecycleListener<String, String> for ReenterListener {
+        fn on_event(&self, _reason: LifecycleReason, _k: String, _v: Option<String>) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            if let Some(c) = self.cache.get() {
+                let _ = c.get("__never_present__");
+            }
+        }
+    }
+
+    #[test]
+    fn reentrant_listener_during_eviction_does_not_panic() {
+        let listener = Arc::new(ReenterListener {
+            cache: OnceLock::new(),
+            events: AtomicUsize::new(0),
+        });
+        let listener_dyn: Arc<dyn LifecycleListener<String, String> + Send + Sync> =
+            listener.clone();
+        let policy: DynPolicy<String, String> = Arc::new(DefaultPolicy);
+        let cache: Cache<String, String> = Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(8))
+                .lifecycle_listener(listener_dyn)
+                .policy(policy)
+                .build(),
+        );
+        listener
+            .cache
+            .set(cache.clone())
+            .map_err(|_| "already set")
+            .unwrap();
+
+        for i in 0..64u32 {
+            cache.insert(format!("k{i:02}"), "v".to_string());
+        }
+        assert!(
+            listener.events.load(Ordering::Relaxed) > 0,
+            "evictions must have fired the listener"
+        );
+    }
+
+    /// Equality / hashing use `name + id`; `instance` is a per-call
+    /// monotonic stamp that propagates through `#[derive(Clone)]` so
+    /// every clone tree is identifiable. `Drop` records
+    /// `drop:K(instance)` — the displaced slab K shows up under the
+    /// instance assigned to the racer's `lk()` call, distinguishing
+    /// it from in-lock destructors of other key copies (e.g. the
+    /// inflight lane's leader K, leader-side `key.clone()` copies).
+    #[derive(Clone)]
+    struct LoggingKey {
+        name: &'static str,
+        id: u32,
+        instance: u32,
+        log: DropLog,
+    }
+
+    impl PartialEq for LoggingKey {
+        fn eq(&self, o: &Self) -> bool {
+            self.name == o.name && self.id == o.id
+        }
+    }
+    impl Eq for LoggingKey {}
+    impl std::hash::Hash for LoggingKey {
+        fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+            self.name.hash(h);
+            self.id.hash(h);
+        }
+    }
+    impl Drop for LoggingKey {
+        fn drop(&mut self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("drop:K({})", self.instance));
+        }
+    }
+
+    struct OrderListener {
+        log: DropLog,
+    }
+
+    impl LifecycleListener<LoggingKey, String> for OrderListener {
+        fn on_event(&self, reason: LifecycleReason, _k: LoggingKey, _v: Option<String>) {
+            let tag = match reason {
+                LifecycleReason::Updated => "listener:Updated",
+                _ => "listener:other",
+            };
+            self.log.lock().unwrap().push(tag.to_string());
+        }
+    }
+
+    fn build_logging_cache(log: DropLog) -> Cache<LoggingKey, String> {
+        let listener = Arc::new(OrderListener { log });
+        let listener_dyn: Arc<dyn LifecycleListener<LoggingKey, String> + Send + Sync> = listener;
+        let policy: DynPolicy<LoggingKey, String> = Arc::new(DefaultPolicy);
+        Cache::new(
+            CacheBuilder::new()
+                .max_weight(Weight::new(64))
+                .lifecycle_listener(listener_dyn)
+                .policy(policy)
+                .build(),
+        )
+    }
+
+    static INSTANCE_SEQ: AtomicU32 = AtomicU32::new(1);
+
+    fn lk(name: &'static str, id: u32, log: &DropLog) -> (LoggingKey, u32) {
+        let instance = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        (
+            LoggingKey {
+                name,
+                id,
+                instance,
+                log: log.clone(),
+            },
+            instance,
+        )
+    }
+
+    /// `listener:Updated` must precede the displaced K's `drop:K(instance)`.
+    /// Pre-fix behaviour dropped the displaced slab K in-lock (via
+    /// `evict_slot`), so the witness for the displaced instance shows
+    /// up *before* the lifecycle event.
+    fn assert_listener_before_displaced(events: &[String], displaced_instance: u32) {
+        let upd = events
+            .iter()
+            .position(|s| s == "listener:Updated")
+            .unwrap_or_else(|| panic!("Updated event missing in {events:?}"));
+        let displaced_marker = format!("drop:K({displaced_instance})");
+        let drop = events
+            .iter()
+            .position(|s| s == &displaced_marker)
+            .unwrap_or_else(|| {
+                panic!("displaced K instance {displaced_instance} must drop in {events:?}")
+            });
+        assert!(
+            upd < drop,
+            "listener:Updated must precede {displaced_marker}, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn insert_overwrite_drops_displaced_k_after_listener() {
+        let log: DropLog = Arc::new(Mutex::new(Vec::new()));
+        let cache = build_logging_cache(log.clone());
+        let (k_old, old_instance) = lk("k", 1, &log);
+        cache.insert(k_old, "v_old".into());
+        log.lock().unwrap().clear();
+
+        let (k_new, _) = lk("k", 1, &log);
+        cache.insert(k_new, "v_new".into());
+
+        let events = log.lock().unwrap().clone();
+        assert_listener_before_displaced(&events, old_instance);
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_ok_drops_displaced_k_after_listener() {
+        let log: DropLog = Arc::new(Mutex::new(Vec::new()));
+        let cache = build_logging_cache(log.clone());
+        let (k_old, old_instance) = lk("k", 1, &log);
+        cache.insert(k_old, "v_old".into());
+        log.lock().unwrap().clear();
+
+        let (k_for_revalidate, _) = lk("k", 1, &log);
+        let scheduled = cache
+            .try_revalidate(k_for_revalidate, &TokioSpawnExecutor, |_k| async {
+                Ok::<_, InitError>("v_new".to_string())
+            })
+            .expect("revalidate scheduled");
+        assert_eq!(scheduled, RevalidateScheduled::Submitted);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let events = log.lock().unwrap().clone();
+        assert_listener_before_displaced(&events, old_instance);
+    }
+
+    #[tokio::test]
+    async fn miss_leader_drops_displaced_k_after_listener() {
+        let log: DropLog = Arc::new(Mutex::new(Vec::new()));
+        let cache = Arc::new(build_logging_cache(log.clone()));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let (k_leader, _) = lk("k", 1, &log);
+        let cache_for_leader = Arc::clone(&cache);
+        let leader = tokio::spawn(async move {
+            let _ = cache_for_leader
+                .try_get_with::<_, _, InitError>(k_leader, || async move {
+                    rx.await.unwrap();
+                    Ok::<_, InitError>("v_leader".to_string())
+                })
+                .await;
+        });
+
+        // Yield until the leader has installed its lane and parked
+        // on `rx.await`.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Race in: this insert lands a Ready entry while the leader
+        // is suspended; finish_miss_ok will then displace it.
+        let (k_racer, racer_instance) = lk("k", 1, &log);
+        cache.insert(k_racer, "v_racer".into());
+        log.lock().unwrap().clear();
+
+        tx.send(()).unwrap();
+        leader.await.unwrap();
+
+        let events = log.lock().unwrap().clone();
+        assert_listener_before_displaced(&events, racer_instance);
+    }
+}
