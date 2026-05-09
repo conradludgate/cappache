@@ -165,22 +165,37 @@ pub(super) fn reschedule<K, V>(
 }
 
 /// Drain entries whose deadline is at or before `now_tick` into the
-/// caller-supplied buffer. `skip_key`, when set, suppresses eviction
-/// of that key (the caller is about to replace the slot and emit its
-/// own lifecycle event).
+/// caller-supplied buffer, stopping after `budget` evictions. Returns
+/// `true` iff at least one ready entry remains undrained (the caller
+/// can lift the cap with `budget = usize::MAX` to finish the work).
+///
+/// `skip_key`, when set, suppresses eviction of that key (the caller
+/// is about to replace the slot and emit its own lifecycle event).
+///
+/// Mid-bucket breaks re-insert the truncated `BucketHead` so the
+/// remainder of the intrusive list stays reachable from `by_tick`.
 pub(super) fn drain_expired<K, V, H>(
     st: &mut State<K, V>,
     hasher: &H,
     now_tick: Tick,
     skip_key: Option<&K>,
     out: &mut Vec<(K, V)>,
-) where
+    budget: usize,
+) -> bool
+where
     K: Eq + Hash,
     H: BuildHasher,
 {
+    let start = out.len();
     while let Some((&tick, _)) = st.expiry.by_tick.first_key_value() {
         if tick > now_tick {
-            break;
+            return false;
+        }
+        // Outer-loop boundary check: a previous inner walk just
+        // finished a bucket and consumed the budget. Don't disturb
+        // `by_tick` — there's still a ready bucket waiting.
+        if out.len() - start >= budget {
+            return true;
         }
         // Lift the bucket out of the map up front. Per-slot `unlink`
         // calls inside `evict_slot` then no-op on the bucket lookup,
@@ -201,10 +216,37 @@ pub(super) fn drain_expired<K, V, H>(
             }
             if let Some((k, v, _)) = evict_slot(st, hasher, slot) {
                 out.push((k, v));
+                if out.len() - start >= budget {
+                    cursor = next;
+                    if let Some(c) = cursor {
+                        // Stale cross-link: when `skip_key` was visited
+                        // earlier in this walk, the prior evict's
+                        // `unlink` propagated `expiry_next` across the
+                        // gap, leaving `slab[c].expiry_prev = Some(skip)`.
+                        // The skip slot's later `evict_slot` call will
+                        // fix its own bucket pointer via the
+                        // `(None, Some(c))` arm of `unlink`.
+                        st.slab[c].expiry_prev = None;
+                        st.expiry.by_tick.insert(
+                            tick,
+                            BucketHead {
+                                head: c,
+                                tail: bucket.tail,
+                            },
+                        );
+                        return true;
+                    }
+                    // Bucket drained to its end on the budget boundary;
+                    // fall through and let the outer loop probe.
+                    break;
+                }
             }
             cursor = next;
         }
     }
+    // Loop exited naturally — either by_tick is empty or the next
+    // bucket is in the future. Either way, no ready entry remains.
+    false
 }
 
 #[cfg(test)]

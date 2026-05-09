@@ -15,7 +15,7 @@ use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
 use super::expiry::drain_expired;
-use super::inner::{Inner, SMALL_DENOMINATOR, State, entries_find, evict_slot};
+use super::inner::{Inner, SMALL_DENOMINATOR, State, WRITE_EXPIRY_BUDGET, entries_find, evict_slot};
 use super::slab::Queue;
 
 /// Push reclaim victims into `out` and return the boundary index:
@@ -37,8 +37,15 @@ where
     S: BuildHasher,
 {
     let now_tick = super::clock::floor_tick(inner.start, now);
-    drain_expired(st, &inner.hasher, now_tick, Some(skip_key), out);
-    let expired_end = out.len();
+    let mut more_pending = drain_expired(
+        st,
+        &inner.hasher,
+        now_tick,
+        Some(skip_key),
+        out,
+        WRITE_EXPIRY_BUDGET,
+    );
+    let mut expired_end = out.len();
 
     // The skip slot's weight is invariant across iterations (never
     // reclaimed), so look it up once instead of per-loop.
@@ -51,6 +58,21 @@ where
     loop {
         if !projected_weight_over_capacity(st, displaced_weight, add_w, max) {
             break;
+        }
+        // Lift the budget — drain remaining expired before touching
+        // still-served entries. Expired entries are free to drop; size
+        // eviction must always be the last resort.
+        if more_pending {
+            more_pending = drain_expired(
+                st,
+                &inner.hasher,
+                now_tick,
+                Some(skip_key),
+                out,
+                usize::MAX,
+            );
+            expired_end = out.len();
+            continue;
         }
         // Fall back to the other queue if the prescribed one had nothing
         // actionable (Small drained empty mid-pass and friends).
