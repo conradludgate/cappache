@@ -228,7 +228,6 @@ where
 
     /// Removes and returns the value for `key`. See [`Self::get`] for the
     /// `Borrow<Q>` lookup contract.
-    #[must_use]
     pub fn remove<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
