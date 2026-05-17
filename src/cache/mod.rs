@@ -176,7 +176,7 @@ impl<K, V, P, S> Cache<K, V, P, S>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    P: Policy<K, V> + Clone + Send + Sync + 'static,
+    P: Policy<K, V> + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
     #[must_use]
@@ -189,14 +189,6 @@ where
     #[must_use]
     pub fn max_weight(&self) -> Weight {
         self.inner.config.max_weight
-    }
-
-    /// Returns a clone of the policy. For the default `DynPolicy`
-    /// (`Arc<dyn Policy>`) this is an `Arc::clone`; for a concrete `P` it
-    /// invokes `P: Clone`.
-    #[must_use]
-    pub fn policy(&self) -> P {
-        self.inner.config.policy.clone()
     }
 
     /// Returns a borrow of the policy. Cheap regardless of `P`.
@@ -490,6 +482,26 @@ where
             Ok(scheduled) => scheduled,
             Err(e) => match e {},
         }
+    }
+}
+
+/// `Cache::policy` lives on its own impl because cloning the policy is the
+/// only operation that needs `P: Clone`; everything else on `Cache` runs
+/// against `&P`. Splitting the bound off `Cache::new` lets callers with a
+/// non-`Clone` policy still construct and use the cache.
+impl<K, V, P, S> Cache<K, V, P, S>
+where
+    K: Send + 'static,
+    V: Send + 'static,
+    P: Clone + 'static,
+    S: 'static,
+{
+    /// Returns a clone of the policy. For the default `DynPolicy`
+    /// (`Arc<dyn Policy>`) this is an `Arc::clone`; for a concrete `P` it
+    /// invokes `P: Clone`.
+    #[must_use]
+    pub fn policy(&self) -> P {
+        self.inner.config.policy.clone()
     }
 }
 

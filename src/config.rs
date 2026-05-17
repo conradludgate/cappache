@@ -109,7 +109,7 @@ impl<K, V, P, S> CacheBuilder<K, V, P, S>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
-    P: Policy<K, V> + Clone + Send + Sync + 'static,
+    P: Policy<K, V> + Send + Sync + 'static,
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
     #[must_use]
@@ -125,7 +125,7 @@ where
     #[must_use]
     pub fn policy<P2>(self, policy: P2) -> CacheBuilder<K, V, P2, S>
     where
-        P2: Policy<K, V> + Clone + Send + Sync + 'static,
+        P2: Policy<K, V> + Send + Sync + 'static,
     {
         CacheBuilder {
             max_weight: self.max_weight,

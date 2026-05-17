@@ -123,6 +123,50 @@ mod compile_tests {
         );
     }
 
+    /// `Cache::new` and `CacheBuilder::policy` accept a non-`Clone` `P`.
+    /// Only `Cache::policy()` requires `P: Clone`; `policy_ref()` and the
+    /// hot paths do not.
+    #[test]
+    fn cache_accepts_non_clone_policy() {
+        struct NotClonePolicy;
+
+        impl Policy<String, String> for NotClonePolicy {
+            fn weight(&self, _: &String, _: &String) -> Weight {
+                Weight::new(1)
+            }
+
+            fn expire_after_read(
+                &self,
+                _: &String,
+                _: &String,
+                _: std::time::Instant,
+                _: std::time::Instant,
+                _: std::time::Duration,
+            ) -> std::time::Duration {
+                TIME_UNBOUNDED
+            }
+
+            fn expire_after_write(
+                &self,
+                _: &String,
+                _: &String,
+                _: std::time::Instant,
+            ) -> std::time::Duration {
+                TIME_UNBOUNDED
+            }
+        }
+
+        let cache: Cache<String, String, NotClonePolicy> = Cache::new(
+            CacheBuilder::<String, String>::new()
+                .max_weight(Weight::new(1))
+                .policy(NotClonePolicy)
+                .build(),
+        );
+        cache.insert("k".into(), "v".into());
+        assert_eq!(cache.get("k"), Some("v".into()));
+        assert_eq!(cache.policy_ref().weight(&"k".into(), &"v".into()), Weight::new(1));
+    }
+
     /// Confirms `S` threads through builder → config → cache without
     /// erasure.
     #[test]
