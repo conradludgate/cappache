@@ -78,8 +78,9 @@ where
 }
 
 /// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by
-/// [`Cache::try_revalidate`]. `cleanup` clears `refresh_inflight` if
-/// the executor drops the job without polling it to `Ready`.
+/// [`Cache::try_revalidate`]. Dropping the job before it polls to
+/// `Ready` clears the per-slot `refresh_inflight` flag so a subsequent
+/// `try_revalidate` is not permanently locked out.
 ///
 /// On `Ready(Ok)` the refreshed value is installed only when the slot
 /// the job was scheduled against still has its `refresh_inflight` flag
@@ -87,16 +88,15 @@ where
 /// the result is dropped, matching the `RevalidateScheduled::AbsentKey`
 /// "no promote-to-install" contract.
 pub struct RefreshWork<
-    K: Send + 'static,
+    K: Eq + Hash + Send + 'static,
     V: Send + 'static,
     E: 'static,
     P: 'static = DynPolicy<K, V>,
-    S: 'static = DefaultHashBuilder,
+    S: BuildHasher + 'static = DefaultHashBuilder,
 > {
     pub(crate) inner: Arc<inner::Inner<K, V, P, S>>,
     pub(crate) key: K,
     pub(crate) fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>>,
-    pub(crate) cleanup: fn(&inner::Inner<K, V, P, S>, &K),
     pub(crate) cleaned: bool,
 }
 
@@ -130,15 +130,15 @@ where
 
 impl<K, V, E, P, S> Drop for RefreshWork<K, V, E, P, S>
 where
-    K: Send + 'static,
+    K: Eq + Hash + Send + 'static,
     V: Send + 'static,
     E: 'static,
     P: 'static,
-    S: 'static,
+    S: BuildHasher + 'static,
 {
     fn drop(&mut self) {
         if !self.cleaned {
-            (self.cleanup)(&self.inner, &self.key);
+            self.inner.refresh_inflight_remove(&self.key);
         }
     }
 }
@@ -448,7 +448,6 @@ where
             inner: Arc::clone(&self.inner),
             key,
             fut,
-            cleanup: |inner, key| inner.refresh_inflight_remove(key),
             cleaned: false,
         });
         Ok(RevalidateScheduled::Submitted)
