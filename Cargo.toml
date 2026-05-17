@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [dependencies]
-clashcore = { git = "https://github.com/conradludgate/clashmap.git", branch = "phase-2/hashbrown-0.17" }
+clashcore = "1"
 hashbrown = "0.17"
 pin-project-lite = "0.2"
 slotmap = "1"

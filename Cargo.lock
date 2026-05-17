@@ -174,7 +174,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "clashcore"
 version = "1.0.0"
-source = "git+https://github.com/conradludgate/clashmap.git?branch=phase-2%2Fhashbrown-0.17#71cf4eaaabd929529fc59324f71523cfe093884f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "facfbc410a385e0b0cbca8179dd9e363ed70e8455960bf7545137e90ca753b66"
 dependencies = [
  "crossbeam-utils",
  "lock_api",
