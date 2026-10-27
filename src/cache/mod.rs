@@ -9,6 +9,9 @@ mod miss;
 mod reclaim;
 mod slab;
 
+#[cfg(test)]
+mod refresh_tests;
+
 use std::borrow::Borrow;
 use std::convert::Infallible;
 use std::future::Future;
@@ -60,6 +63,7 @@ where
 {
     inner: &'a Arc<inner::Inner<K, V, P, S>>,
     key: &'a K,
+    slot: slab::SlotKey,
     armed: bool,
 }
 
@@ -72,21 +76,21 @@ where
 {
     fn drop(&mut self) {
         if self.armed {
-            self.inner.refresh_inflight_remove(self.key);
+            self.inner.refresh_inflight_remove(self.key, self.slot);
         }
     }
 }
 
 /// Job handed to [`Executor::execute`](crate::rt::Executor::execute) by
 /// [`Cache::try_revalidate`]. Dropping the job before it polls to
-/// `Ready` clears the per-slot `refresh_inflight` flag so a subsequent
-/// `try_revalidate` is not permanently locked out.
+/// `Ready` clears the original slot's `refresh_inflight` flag, if that slot
+/// still exists, so a subsequent `try_revalidate` is not permanently locked out.
 ///
 /// On `Ready(Ok)` the refreshed value is installed only when the slot
-/// the job was scheduled against still has its `refresh_inflight` flag
-/// set. If the user has removed or replaced the entry in the meantime
-/// the result is dropped, matching the `RevalidateScheduled::AbsentKey`
-/// "no promote-to-install" contract.
+/// the job was scheduled against still has the same versioned identity
+/// and its `refresh_inflight` flag set. If the user has removed or replaced
+/// the entry in the meantime the result is dropped, matching the
+/// `RevalidateScheduled::AbsentKey` "no promote-to-install" contract.
 pub struct RefreshWork<
     K: Eq + Hash + Send + 'static,
     V: Send + 'static,
@@ -96,6 +100,7 @@ pub struct RefreshWork<
 > {
     pub(crate) inner: Arc<inner::Inner<K, V, P, S>>,
     pub(crate) key: K,
+    pub(crate) slot: slab::SlotKey,
     pub(crate) fut: Pin<Box<dyn Future<Output = Result<V, E>> + Send>>,
     pub(crate) cleaned: bool,
 }
@@ -112,15 +117,20 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        // A completed job no longer owns a refresh, even if a later job
+        // starts against the same entry after an error.
+        if this.cleaned {
+            return Poll::Ready(());
+        }
         match this.fut.as_mut().poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(v)) => {
-                this.inner.apply_refresh_ok(&this.key, v);
+                this.inner.apply_refresh_ok(&this.key, this.slot, v);
                 this.cleaned = true;
                 Poll::Ready(())
             }
             Poll::Ready(Err(_)) => {
-                this.inner.refresh_inflight_remove(&this.key);
+                this.inner.refresh_inflight_remove(&this.key, this.slot);
                 this.cleaned = true;
                 Poll::Ready(())
             }
@@ -138,7 +148,7 @@ where
 {
     fn drop(&mut self) {
         if !self.cleaned {
-            self.inner.refresh_inflight_remove(&self.key);
+            self.inner.refresh_inflight_remove(&self.key, self.slot);
         }
     }
 }
@@ -412,19 +422,20 @@ where
         Fut: Future<Output = Result<V, E>> + Send + 'static,
         K: Unpin,
     {
-        match self.inner.try_mark_refresh_inflight(&key) {
-            inner::RefreshGate::Submit => {}
+        let slot = match self.inner.try_mark_refresh_inflight(&key) {
+            inner::RefreshGate::Submit(slot) => slot,
             inner::RefreshGate::SkipInFlight => {
                 return Ok(RevalidateScheduled::SkippedInFlight);
             }
             inner::RefreshGate::AbsentKey => {
                 return Ok(RevalidateScheduled::AbsentKey);
             }
-        }
+        };
 
         let mut guard = RefreshGuard {
             inner: &self.inner,
             key: &key,
+            slot,
             armed: true,
         };
 
@@ -447,6 +458,7 @@ where
         executor.execute(RefreshWork {
             inner: Arc::clone(&self.inner),
             key,
+            slot,
             fut,
             cleaned: false,
         });
