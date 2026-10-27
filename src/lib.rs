@@ -164,7 +164,10 @@ mod compile_tests {
         );
         cache.insert("k".into(), "v".into());
         assert_eq!(cache.get("k"), Some("v".into()));
-        assert_eq!(cache.policy_ref().weight(&"k".into(), &"v".into()), Weight::new(1));
+        assert_eq!(
+            cache.policy_ref().weight(&"k".into(), &"v".into()),
+            Weight::new(1)
+        );
     }
 
     /// Confirms `S` threads through builder → config → cache without

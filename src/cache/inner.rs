@@ -24,7 +24,7 @@ use crate::policy::Policy;
 pub(super) type Shard<K, V> = clashcore::CachePadded<RwLock<State<K, V>>>;
 
 pub(crate) enum RefreshGate {
-    Submit,
+    Submit(SlotKey),
     SkipInFlight,
     AbsentKey,
 }
@@ -302,16 +302,15 @@ where
         &self.shards.shards()[idx]
     }
 
-    /// Best-effort clear of `refresh_inflight`. On the bound-free impl
+    /// Clear `refresh_inflight` only on the original versioned slot.
+    /// On the bound-free impl
     /// so `RefreshGuard::drop` can call it without `Policy<K, V>`.
-    pub(crate) fn refresh_inflight_remove(&self, key: &K)
+    pub(crate) fn refresh_inflight_remove(&self, key: &K, slot: SlotKey)
     where
         K: Eq + Hash,
     {
         let mut st = self.shard_for(key).write();
-        if let Some(id) = entries_find(&st.entries, &self.hasher, &st.slab, key)
-            && let Some(es) = st.slab.get_mut(id)
-        {
+        if let Some(es) = st.slab.get_mut(slot) {
             es.refresh_inflight = false;
         }
     }
@@ -634,8 +633,8 @@ where
         Some(v)
     }
 
-    /// On `Submit`, flips `refresh_inflight = true`; subsequent calls
-    /// return `SkipInFlight` until `refresh_inflight_remove`.
+    /// On `Submit`, returns the versioned slot and sets `refresh_inflight`.
+    /// Subsequent calls skip until that job clears the flag or the slot is replaced.
     pub(crate) fn try_mark_refresh_inflight(&self, key: &K) -> RefreshGate
     where
         K: Eq + Hash,
@@ -651,25 +650,20 @@ where
             RefreshGate::SkipInFlight
         } else {
             es.refresh_inflight = true;
-            RefreshGate::Submit
+            RefreshGate::Submit(id)
         }
     }
 
-    pub(crate) fn apply_refresh_ok(&self, key: &K, v: V)
+    pub(crate) fn apply_refresh_ok(&self, key: &K, slot: SlotKey, v: V)
     where
         K: 'static,
         V: 'static,
     {
         self.with_reclaim_buf(|buf| {
             let mut st = self.shard_for(key).write();
-            // Slot-identity invariant: only the in-flight refresh job
-            // clears `refresh_inflight`, so `false` here means the slot
-            // we started refreshing was removed (or removed-then-replaced)
-            // since the job was scheduled — drop the result instead of
-            // resurrecting a value the user already evicted.
-            let still_ours = entries_find(&st.entries, &self.hasher, &st.slab, key)
-                .and_then(|id| st.slab.get(id))
-                .is_some_and(|es| es.refresh_inflight);
+            // Match the original versioned slot, not a replacement entry's
+            // flag. Removal, clear, eviction and insert invalidate this handle.
+            let still_ours = st.slab.get(slot).is_some_and(|es| es.refresh_inflight);
             if !still_ours {
                 return;
             }
