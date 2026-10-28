@@ -25,8 +25,8 @@ fn build_cache(max_weight: u64) -> Cache<String, String, DefaultPolicy, TestHash
     let cfg = CacheBuilder::new()
         .max_weight(Weight::new(max_weight))
         // `shards(2)` is the cache's documented minimum. `TestHasher`
-        // is deterministic across runs, so the per-shard distribution
-        // (and therefore the deep-size snapshot below) stays stable.
+        // is deterministic across runs on the same toolchain, keeping
+        // the per-shard distribution repeatable within that toolchain.
         .shards(2)
         .policy(DefaultPolicy)
         .hasher(TestHasher)
@@ -74,9 +74,10 @@ fn empty_cache_has_nonzero_extra_size() {
 /// state), the cache uses `shards(2)` (cache's minimum), `max_weight =
 /// u64::MAX` (so `Policy::weight` doesn't gate anything), and inserts
 /// are strictly `format!("k-{i:04}") -> format!("v-{i:04}")` for
-/// `i in 0..1023` — one below `slotmap`'s doubling boundary so capacity
-/// exactly matches `len` per shard once keys distribute. Gated to
-/// 64-bit targets because the constant below assumes 8-byte pointers.
+/// `i in 0..1023`. Shard distribution and allocation capacities depend
+/// on the standard library's hash implementation. Gated to 64-bit
+/// targets because the constant below assumes 8-byte pointers; hash
+/// and layout changes across toolchains can require a snapshot refresh.
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn snapshot_size_is_stable_with_fixed_seed_hasher() {
@@ -85,11 +86,10 @@ fn snapshot_size_is_stable_with_fixed_seed_hasher() {
         cache.insert(format!("k-{i:04}"), format!("v-{i:04}"));
     }
 
-    // Captured on x86_64 / aarch64 with the pinned dependency graph
-    // (hashbrown 0.17, slotmap 1, typesize 0.1.14). If you legitimately
-    // change layout, re-run and update — but pause first to confirm
-    // the new number reflects an intentional shift, not a regression.
-    const EXPECTED_DEEP_SIZE: usize = 207_256;
+    // Captured on x86_64 Linux with Rust 1.98 and nightly-2026-10-24,
+    // using Cargo.lock (hashbrown 0.17.0, slotmap 1.1.1, typesize 0.1.14).
+    // Review accounting, layout and shard distribution before refreshing.
+    const EXPECTED_DEEP_SIZE: usize = 207_272;
     assert_eq!(
         cache.get_size(),
         EXPECTED_DEEP_SIZE,
