@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic)]
 
-//! Clache (Conrad Ludgate cache): a safe Rust concurrent cache API.
+//! Cappache: a safe Rust concurrent cache API.
 //!
 //! This crate is **`#![deny(unsafe_code)]`**. The in-memory [`Cache`](crate::Cache) implements
 //! synchronous `get` / `insert` / `remove`, async miss helpers, and executor-driven refresh.

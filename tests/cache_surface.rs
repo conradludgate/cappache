@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use clache::{
+use cappache::{
     Cache, CacheBuilder, DefaultPolicy, DynPolicy, IdleTimeout, LifecycleListener, LifecycleReason,
     Policy, TIME_UNBOUNDED, TtlFromWrite, Weight,
 };

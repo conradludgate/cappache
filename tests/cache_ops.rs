@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clache::{
+use cappache::{
     Cache, CacheBuilder, DefaultPolicy, DynPolicy, Executor, IdleTimeout, LifecycleListener,
     LifecycleReason, Policy, RevalidateScheduled, TIME_UNBOUNDED, TtlFromWrite, Weight,
 };

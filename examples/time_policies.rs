@@ -12,8 +12,8 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clache::policy::{IdleTimeout, Policy, TIME_UNBOUNDED, TtlFromWrite, Weight};
-use clache::{Cache, CacheBuilder};
+use cappache::policy::{IdleTimeout, Policy, TIME_UNBOUNDED, TtlFromWrite, Weight};
+use cappache::{Cache, CacheBuilder};
 
 /// Custom `Policy`: weight equals the value's UTF-8 byte length.
 /// Time hooks delegate to the cache's running deadline (no extra

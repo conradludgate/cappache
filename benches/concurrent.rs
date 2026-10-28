@@ -1,4 +1,4 @@
-//! Multi-threaded comparative benchmarks across clache / moka / quick_cache.
+//! Multi-threaded comparative benchmarks across cappache / moka / quick_cache.
 //!
 //! Bench crates here use `Arc<Cache<...>>` and a small barrier-driven worker
 //! pool so all worker threads start the timed loop together; this lets
@@ -11,7 +11,7 @@ use std::hint::black_box;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use clache::{Cache, CacheBuilder, Weight};
+use cappache::{Cache, CacheBuilder, Weight};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// Working set sized to keep things in-cache for the read-heavy workloads.
@@ -25,7 +25,7 @@ const OPS_PER_THREAD: u64 = 4_096;
 /// laptop-sized hosts that run the bench locally.
 const WORKERS: usize = 8;
 
-fn build_clache(capacity: u64) -> Cache<u64, u64> {
+fn build_cappache(capacity: u64) -> Cache<u64, u64> {
     Cache::new(
         CacheBuilder::<u64, u64>::new()
             .max_weight(Weight::new(capacity))
@@ -41,7 +41,7 @@ fn build_quick_cache(capacity: u64) -> quick_cache::sync::Cache<u64, u64> {
     quick_cache::sync::Cache::new(capacity as usize)
 }
 
-fn fill_clache(cache: &Cache<u64, u64>, n: u64) {
+fn fill_cappache(cache: &Cache<u64, u64>, n: u64) {
     for k in 0..n {
         cache.insert(k, k);
     }
@@ -96,11 +96,11 @@ fn bench_get_hit_concurrent(c: &mut Criterion) {
 
     let probe_key: u64 = CAPACITY / 2;
 
-    let clache_cache = Arc::new(build_clache(CAPACITY));
-    fill_clache(&clache_cache, CAPACITY);
-    group.bench_function(BenchmarkId::new("clache", workers), |b| {
+    let cappache_cache = Arc::new(build_cappache(CAPACITY));
+    fill_cappache(&cappache_cache, CAPACITY);
+    group.bench_function(BenchmarkId::new("cappache", workers), |b| {
         b.iter(|| {
-            let cache = Arc::clone(&clache_cache);
+            let cache = Arc::clone(&cappache_cache);
             run_workers(workers, move |_tid, _i| {
                 black_box(cache.get(black_box(&probe_key)));
             });
@@ -142,11 +142,11 @@ fn bench_mixed_concurrent(c: &mut Criterion) {
     let total_ops = OPS_PER_THREAD * workers as u64;
     group.throughput(Throughput::Elements(total_ops));
 
-    let clache_cache = Arc::new(build_clache(CAPACITY));
-    fill_clache(&clache_cache, CAPACITY);
-    group.bench_function(BenchmarkId::new("clache", workers), |b| {
+    let cappache_cache = Arc::new(build_cappache(CAPACITY));
+    fill_cappache(&cappache_cache, CAPACITY);
+    group.bench_function(BenchmarkId::new("cappache", workers), |b| {
         b.iter(|| {
-            let cache = Arc::clone(&clache_cache);
+            let cache = Arc::clone(&cappache_cache);
             run_workers(workers, move |tid, i| {
                 if i % 10 == 0 {
                     let k = (tid as u64).wrapping_mul(1_000_003).wrapping_add(i);

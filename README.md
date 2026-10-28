@@ -1,4 +1,4 @@
-# clache
+# Cappache
 
 A concurrent in-memory cache for Rust. Sharded under the hood, S3-FIFO
 eviction, sync and async miss-coalescing, caller-driven background
@@ -26,11 +26,12 @@ refresh, all behind a `#![deny(unsafe_code)]` boundary.
 
 ## Install
 
-`clache` is not yet on crates.io. Pull it as a git dependency:
+`cappache` (formerly `clache`) is not yet on crates.io. The source repository
+is still named `clache`; pull it as a git dependency:
 
 ```toml
 [dependencies]
-clache = { git = "https://github.com/conradludgate/clache.git" }
+cappache = { git = "https://github.com/conradludgate/clache.git" }
 ```
 
 MSRV: Rust **1.95**.
@@ -43,7 +44,7 @@ an eviction fire.
 ```rust
 use std::sync::Arc;
 
-use clache::{Cache, CacheBuilder, LifecycleListener, LifecycleReason, Weight};
+use cappache::{Cache, CacheBuilder, LifecycleListener, LifecycleReason, Weight};
 
 struct StdoutListener;
 impl LifecycleListener<String, String> for StdoutListener {
@@ -105,7 +106,7 @@ flag. `TtlFromWrite` and `IdleTimeout` wrap an inner policy and apply
 
 ```rust
 use std::time::Duration;
-use clache::policy::{IdleTimeout, TtlFromWrite, DefaultPolicy};
+use cappache::policy::{IdleTimeout, TtlFromWrite, DefaultPolicy};
 
 let policy = IdleTimeout::new(
     Duration::from_secs(60),
@@ -130,7 +131,7 @@ Full example (with a custom `Policy`):
 
 ```rust
 use std::future::Future;
-use clache::Executor;
+use cappache::Executor;
 
 #[derive(Clone, Copy)]
 struct TokioSpawn;
@@ -195,8 +196,8 @@ API documentation: `cargo doc --open --no-deps`.
 | Surface | Where |
 | --- | --- |
 | Public API | `Cache`, `CacheBuilder`, `Weight`, `Policy`, `LifecycleListener`, `Executor` re-exported from the crate root |
-| Built-in policies | `clache::policy::{DefaultPolicy, TtlFromWrite, IdleTimeout}` |
-| Refresh executor | `clache::rt::{Executor, RevalidateScheduled}` |
+| Built-in policies | `cappache::policy::{DefaultPolicy, TtlFromWrite, IdleTimeout}` |
+| Refresh executor | `cappache::rt::{Executor, RevalidateScheduled}` |
 | Test suites | `cargo test --test cache_surface` (builder + introspection), `cargo test --test cache_ops` (data paths, concurrency, refresh) |
 | Microbenchmarks | `cargo bench --bench compare_cache` (vs `moka`, `quick_cache`), `cargo bench --bench concurrent` |
 

@@ -8,7 +8,7 @@
 //! refresh is in flight for a given key, further `revalidate` calls
 //! for the same key return `SkippedInFlight` so duplicate refreshes
 //! never overlap. A refresh on a key with no `Ready` entry is a
-//! no-op (`AbsentKey`) — clache deliberately does not promote
+//! no-op (`AbsentKey`) — cappache deliberately does not promote
 //! refresh into an install; that is the miss path's job.
 //!
 //! Run with: `cargo run --example refresh`
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use clache::{Cache, CacheBuilder, Executor, LifecycleListener, LifecycleReason, Weight};
+use cappache::{Cache, CacheBuilder, Executor, LifecycleListener, LifecycleReason, Weight};
 
 /// Forwards every refresh job to `tokio::spawn`. The blanket impl
 /// covers both `Executor<RefreshWork<…, MyError, …>>` and

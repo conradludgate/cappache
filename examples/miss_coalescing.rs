@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use clache::{Cache, CacheBuilder, Weight};
+use cappache::{Cache, CacheBuilder, Weight};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NotFound;

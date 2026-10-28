@@ -5,8 +5,8 @@
 
 use std::hash::BuildHasher;
 
-use clache::policy::DefaultPolicy;
-use clache::{Cache, CacheBuilder, Weight};
+use cappache::policy::DefaultPolicy;
+use cappache::{Cache, CacheBuilder, Weight};
 use typesize::TypeSize;
 
 #[derive(Clone)]
