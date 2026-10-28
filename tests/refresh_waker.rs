@@ -18,7 +18,7 @@ use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use clache::{Cache, CacheBuilder, Executor, Weight};
+use cappache::{Cache, CacheBuilder, Executor, Weight};
 use futures_testing::{drive_fn, testcase};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 

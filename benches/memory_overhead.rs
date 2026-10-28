@@ -1,4 +1,4 @@
-//! Memory-overhead benchmark: clache vs moka vs quick_cache.
+//! Memory-overhead benchmark: cappache vs moka vs quick_cache.
 //!
 //! Runs a deterministic mokabench-style trace (1M ops over 100K keys,
 //! ~80/20 read/write split, Pareto-skewed access) on each cache and
@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use clache::{Cache as Clache, CacheBuilder, DefaultPolicy, TtlFromWrite, Weight};
+use cappache::{Cache as Cappache, CacheBuilder, DefaultPolicy, TtlFromWrite, Weight};
 use moka::sync::Cache as MokaCache;
 use peak_alloc::PeakAlloc;
 use quick_cache::sync::Cache as QuickCache;
@@ -84,21 +84,21 @@ trait CacheUnderTest {
     fn settle(&self);
 }
 
-struct ClacheAdapter(Clache<String, String, TtlFromWrite<DefaultPolicy>>);
+struct CappacheAdapter(Cappache<String, String, TtlFromWrite<DefaultPolicy>>);
 
-impl ClacheAdapter {
+impl CappacheAdapter {
     fn new(cap: usize) -> Self {
         let cfg = CacheBuilder::<String, String>::new()
             .max_weight(Weight::new(cap as u64))
             .policy(TtlFromWrite::new(TTL, DefaultPolicy))
             .build();
-        Self(Clache::new(cfg))
+        Self(Cappache::new(cfg))
     }
 }
 
-impl CacheUnderTest for ClacheAdapter {
+impl CacheUnderTest for CappacheAdapter {
     fn name(&self) -> &'static str {
-        "clache"
+        "cappache"
     }
     fn get_or_insert(&self, key: &str, value: &str) {
         if self.0.get(key).is_some() {
@@ -221,8 +221,8 @@ fn measure(
     }
 }
 
-fn measure_clache(keyspace: &[String], trace: &[Op], value: &str, cap: usize) -> PhaseResult {
-    let cache = ClacheAdapter::new(cap);
+fn measure_cappache(keyspace: &[String], trace: &[Op], value: &str, cap: usize) -> PhaseResult {
+    let cache = CappacheAdapter::new(cap);
     measure(&cache, keyspace, trace, value)
 }
 
@@ -255,7 +255,7 @@ fn run_phase_for_cap(label: &str, cap: usize, keyspace: &[String], trace: &[Op],
     println!("phase: {label} (cap={cap})");
     print_header();
     let results = [
-        measure_clache(keyspace, trace, value, cap),
+        measure_cappache(keyspace, trace, value, cap),
         measure_moka(keyspace, trace, value, cap),
         measure_quick_cache(keyspace, trace, value, cap),
     ];

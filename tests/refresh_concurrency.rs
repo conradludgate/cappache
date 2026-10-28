@@ -23,7 +23,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use clache::{Executor, LifecycleListener, LifecycleReason};
+use cappache::{Executor, LifecycleListener, LifecycleReason};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -122,7 +122,7 @@ struct InitError(u32);
 mod bug1 {
     use std::thread;
 
-    use clache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
+    use cappache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
 
     use super::{
         Arc, BlockingListener, CapturingExecutor, InitError, LifecycleListener, drive_to_completion,
@@ -202,7 +202,7 @@ mod bug1 {
 }
 
 mod bug2 {
-    use clache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
+    use cappache::{Cache, CacheBuilder, RevalidateScheduled, Weight};
 
     use super::{CapturingExecutor, InitError, drive_to_completion};
 

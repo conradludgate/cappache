@@ -78,6 +78,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "cappache"
+version = "0.1.0"
+dependencies = [
+ "clashcore",
+ "criterion",
+ "fastrand",
+ "futures-testing",
+ "hashbrown 0.17.0",
+ "moka",
+ "peak_alloc",
+ "pin-project-lite",
+ "quick_cache",
+ "slotmap",
+ "stats_alloc",
+ "thread_local",
+ "tokio",
+ "typesize",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -124,26 +144,6 @@ checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
 dependencies = [
  "ciborium-io",
  "half",
-]
-
-[[package]]
-name = "clache"
-version = "0.1.0"
-dependencies = [
- "clashcore",
- "criterion",
- "fastrand",
- "futures-testing",
- "hashbrown 0.17.0",
- "moka",
- "peak_alloc",
- "pin-project-lite",
- "quick_cache",
- "slotmap",
- "stats_alloc",
- "thread_local",
- "tokio",
- "typesize",
 ]
 
 [[package]]

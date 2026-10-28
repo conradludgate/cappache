@@ -1,4 +1,4 @@
-//! Three-way comparative microbenchmarks across clache / moka / quick_cache.
+//! Three-way comparative microbenchmarks across cappache / moka / quick_cache.
 //!
 //! Identical workloads on identical configs so Criterion can diff the impls
 //! directly. Each scenario uses `BenchmarkId::new("<impl>", <param>)` inside
@@ -7,7 +7,7 @@
 
 use std::hint::black_box;
 
-use clache::{Cache, CacheBuilder, Weight};
+use cappache::{Cache, CacheBuilder, Weight};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// Working set used for `get_hit` and the warm path of `insert_churn`.
@@ -17,7 +17,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 const GET_HIT_CAPACITY: u64 = 4096;
 const INSERT_CHURN_CAPACITY: u64 = 4096;
 
-fn build_clache(capacity: u64) -> Cache<u64, u64> {
+fn build_cappache(capacity: u64) -> Cache<u64, u64> {
     Cache::new(
         CacheBuilder::<u64, u64>::new()
             .max_weight(Weight::new(capacity))
@@ -33,7 +33,7 @@ fn build_quick_cache(capacity: u64) -> quick_cache::sync::Cache<u64, u64> {
     quick_cache::sync::Cache::new(capacity as usize)
 }
 
-fn fill_clache(cache: &Cache<u64, u64>, n: u64) {
+fn fill_cappache(cache: &Cache<u64, u64>, n: u64) {
     for k in 0..n {
         cache.insert(k, k);
     }
@@ -59,10 +59,10 @@ fn bench_get_hit(c: &mut Criterion) {
 
     let probe_key: u64 = GET_HIT_CAPACITY / 2;
 
-    let clache_cache = build_clache(GET_HIT_CAPACITY);
-    fill_clache(&clache_cache, GET_HIT_CAPACITY);
-    group.bench_function(BenchmarkId::new("clache", GET_HIT_CAPACITY), |b| {
-        b.iter(|| black_box(clache_cache.get(black_box(&probe_key))));
+    let cappache_cache = build_cappache(GET_HIT_CAPACITY);
+    fill_cappache(&cappache_cache, GET_HIT_CAPACITY);
+    group.bench_function(BenchmarkId::new("cappache", GET_HIT_CAPACITY), |b| {
+        b.iter(|| black_box(cappache_cache.get(black_box(&probe_key))));
     });
 
     let moka_cache = build_moka(GET_HIT_CAPACITY);
@@ -90,9 +90,9 @@ fn bench_insert_churn(c: &mut Criterion) {
     for &n in &[1_024u64, 4_096, 16_384, 65_536] {
         group.throughput(Throughput::Elements(n));
 
-        group.bench_with_input(BenchmarkId::new("clache", n), &n, |b, &n| {
-            let cache = build_clache(cap);
-            fill_clache(&cache, cap);
+        group.bench_with_input(BenchmarkId::new("cappache", n), &n, |b, &n| {
+            let cache = build_cappache(cap);
+            fill_cappache(&cache, cap);
             let mut counter: u64 = cap;
             b.iter(|| {
                 for _ in 0..n {
@@ -139,9 +139,9 @@ fn bench_insert_cold(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n));
         let capacity = n * 2;
 
-        group.bench_with_input(BenchmarkId::new("clache", n), &n, |b, &n| {
+        group.bench_with_input(BenchmarkId::new("cappache", n), &n, |b, &n| {
             b.iter_batched(
-                || build_clache(capacity),
+                || build_cappache(capacity),
                 |cache| {
                     for k in 0..n {
                         cache.insert(black_box(k), k);

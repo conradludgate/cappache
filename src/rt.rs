@@ -24,7 +24,7 @@
 ///
 /// Prior art: [`hyper::rt::Executor`](https://docs.rs/hyper/latest/hyper/rt/trait.Executor.html).
 ///
-/// If this name clashes with another `Executor` in scope, qualify as **`clache::rt::Executor`**.
+/// If this name clashes with another `Executor` in scope, qualify as **`cappache::rt::Executor`**.
 pub trait Executor<Fut> {
     /// Schedules `fut` to run to completion on the underlying runtime.
     fn execute(&self, fut: Fut);

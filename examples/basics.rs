@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use clache::{Cache, CacheBuilder, LifecycleListener, LifecycleReason, Weight};
+use cappache::{Cache, CacheBuilder, LifecycleListener, LifecycleReason, Weight};
 
 struct StdoutListener;
 
