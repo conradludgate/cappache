@@ -271,12 +271,12 @@ where
         self.inner.is_empty()
     }
 
-    /// Sum of [`Policy::weight`] over all `Ready` entries.
+    /// Sum of [`Policy::weight`] over all `Ready` entries, saturating at [`u64::MAX`].
     ///
-    /// With `shards == 1` the result is bounded by [`Self::max_weight`].
-    /// With more shards each one rounds its local cap up, so the sum may
-    /// exceed `max_weight` by up to `shards - 1` units of slack. Like
-    /// [`Self::len`], the sum is not snapshot-consistent across shards.
+    /// Each shard rounds its local cap up, adding up to `shards - 1`
+    /// units of slack. An entry heavier than its shard's cap is still retained,
+    /// so oversized entries can exceed that bound. Like [`Self::len`], the sum
+    /// is not snapshot-consistent across shards.
     #[must_use]
     pub fn weight(&self) -> u64 {
         self.inner.weight()
