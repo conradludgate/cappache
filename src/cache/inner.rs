@@ -467,7 +467,7 @@ where
             .shards()
             .iter()
             .map(|s| s.read().total_weight)
-            .sum()
+            .fold(0, u64::saturating_add)
     }
 
     pub(crate) fn clear(&self)
